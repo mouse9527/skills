@@ -4,6 +4,7 @@ Personal agent skills, shared across Claude Code, Codex and Pi via symlinks.
 
 | skill | what |
 |---|---|
+| [workspace](workspace/SKILL.md) | Workspace (`~/workspaces/<name>/`) skeleton, task flow, worktree lifecycle, merge discipline (Chinese) |
 | [herdr-workers](herdr-workers/SKILL.md) | Dispatch, lay out, monitor and verify worker agents with [herdr](https://herdr.dev) (Chinese) |
 
 ## Install
