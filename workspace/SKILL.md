@@ -33,6 +33,9 @@ ws 是**工作台**，不是事实源。一个 ws 对应一条交付线，放在
 
 `<issue-id>` 是 README 里约定的「Issue 所在 repo」的 Issue 号。**没有 Issue 就不建目录**：先开 Issue，再开工。
 
+**迁移期**：已有 ws 的 README 若仍用别的目录名（如 `stories/`），在迁移完成前以 README 为准，「号一致」的规则不变；
+新建 ws 用 `issues/`。迁移由 Owner 安排，不在普通任务里顺手改名。
+
 ## 2. README.md 必须回答的问题
 
 建 ws 时逐项填，不知道就写「待定」，不要猜：
@@ -81,24 +84,35 @@ git -C repos/<repo> fetch
 git -C repos/<repo> branch -r --contains <线上 commit>
 git -C repos/<repo> worktree add ../../issues/<issue-id>/<repo> -b <分支> origin/<基底>
 
-# 回收：两条都为空才回收
-git -C issues/<issue-id>/<repo> status --porcelain
-git -C issues/<issue-id>/<repo> log --oneline @{u}..
+# 回收：逐条执行并看结果，任何一条报错就停下
+git -C issues/<issue-id>/<repo> fetch
+git -C issues/<issue-id>/<repo> status --porcelain --ignored   # 应无需要保留的内容
+git -C issues/<issue-id>/<repo> log --oneline @{u}..           # 应为空，且命令本身成功
 git -C repos/<repo> worktree remove "$PWD/issues/<issue-id>/<repo>"
 git -C repos/<repo> worktree prune
 ```
+
+- **检查失败不等于检查通过**：没有上游、引用不存在、命令报错时，空输出不代表「没有未推送提交」。别用 `[ -z "$(… 2>/dev/null)" ] && remove` 这类写法。
+- 默认不用 `--force`；只有已核清剩下的都是可丢弃内容时才用。
 
 - 删 `issues/<issue-id>/` 前，先把要留的结论移到 `notes/<issue-id>/` 或 Issue 评论；不要连同唯一的报告一起删。
 - 搬 ws：推分支后重新 clone，**不要 `mv`**（worktree 记的是绝对路径）。
 - push 永远显式写 `refs/heads/<源>:refs/heads/<目标>`，杜绝误推默认分支。
 - 多个 Issue 并行时禁用 `git stash` —— 它是仓库级的，会串到别的 worktree。
 
-## 5. 合并纪律（交付类 ws）
+## 5. 合并纪律
+
+**合并一律通过 PR**（在托管平台上合并），不在本地 merge 后直接推目标分支；要把别的分支带进目标，也开 PR。
 
 两个条件同时满足才合并：
 
-1. **PR checks 全绿。**「存量失败」「本地跑过了」「只改了文档」都不是豁免。`no checks reported` 是没跑，不是通过。
+1. **PR checks 全绿。**「存量失败」「本地跑过了」「只改了文档」都不是豁免。
+   `no checks reported` 是没跑，不是通过：先查清触发条件和缺失原因，优先让检查在这个 PR 的候选提交上跑起来；不为拿到绿灯改 PR 目标。
 2. **源分支包含最新的目标分支**：`git merge-base --is-ancestor origin/<目标> <源>`。落后就在 PR 分支里 `git merge origin/<目标>`（用 merge 不用 rebase，冲突逐段解）。push 前、合并前各重读一次目标分支，不用早先记下的 SHA。
+
+确实拿不到 CI 时，停在 PR，交给 Owner 决定。Owner 接受这次无 CI 合并时，PR 里写明：候选 HEAD、目标 SHA、为什么没有 CI、
+在干净 worktree 实跑的命令与结果、没覆盖到的部分，以及 Owner 针对这个版本的同意。这只批准这一次，不等于 CI 通过；版本变了要重来。
+本来就没有 CI 的仓库（如配置、运维类），由 Owner 事先在 README 写定验证门槛和合并授权，lead 照 README 执行，不在每个 PR 重复请示。
 
 不在本地跑完整 CI 当门槛，让 PR 的 CI 去验；本地只跑和改动相关的部分用于定位。
 并行的几个 PR 各自绿 ≠ 合起来绿：合并后看目标分支的 CI，并和合并前的失败集合逐条比对。
@@ -126,7 +140,8 @@ git -C repos/<repo> worktree prune
 ## 8. 防膨胀
 
 - **不为这套流程写工具**：不建 CLI、状态机、本地 backlog、证据库、跨 ws 注册表。Issue 状态从 Issue + PR + checks 现算，不落盘。
-- 规则只写一处：通用的在 skill，ws 特有的在它的 README；不复制，只指向。
+- 规则只写一处：通用的在 skill，ws 特有的（参数、目录映射、验收命令、Owner 确认的例外）在它的 README；不复制，只指向。
+- 评价一条规则看它有没有改变判断、防住具体错误，不看短期内被加载了几次。
 - 一条规则连续几个 Issue 都没帮你做出不同决定，删掉。
 - 停掉 herdr / 结束 session / 换 agent CLI，任何一个让交付无法继续，说明耦合过强。
 

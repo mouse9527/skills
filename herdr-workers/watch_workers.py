@@ -9,6 +9,9 @@ import sys
 import time
 
 names = sys.argv[1:]
+if not names or any(n.startswith("-") for n in names):
+    print("usage: watch_workers.py <name> [<name>...]", file=sys.stderr)
+    sys.exit(2)
 last = {}
 
 def snapshot():
