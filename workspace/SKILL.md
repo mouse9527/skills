@@ -92,8 +92,7 @@ git -C repos/<repo> worktree remove "$PWD/issues/<issue-id>/<repo>"
 git -C repos/<repo> worktree prune
 ```
 
-- **检查失败不等于检查通过**：没有上游、引用不存在、命令报错时，空输出不代表「没有未推送提交」。别用 `[ -z "$(… 2>/dev/null)" ] && remove` 这类写法。
-- 默认不用 `--force`；只有已核清剩下的都是可丢弃内容时才用。
+- **检查失败不等于检查通过**：没有上游、引用不存在、命令报错时，空输出不代表「没有未推送提交」，别用 `[ -z "$(… 2>/dev/null)" ] && remove`；默认不用 `--force`，核清剩下的都可丢弃才用。
 
 - 删 `issues/<issue-id>/` 前，先把要留的结论移到 `notes/<issue-id>/` 或 Issue 评论；不要连同唯一的报告一起删。
 - 搬 ws：推分支后重新 clone，**不要 `mv`**（worktree 记的是绝对路径）。

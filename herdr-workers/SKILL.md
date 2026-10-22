@@ -1,6 +1,6 @@
 ---
 name: herdr-workers
-description: 用 herdr 把任务交给另一个 agent（worker）时的布局、启动、派发、监控、验收、回收规则。凡是要 herdr agent start/prompt 一个 worker、整理 herdr 里 lead 与 worker 的 tab/pane、或核实 worker 交回的结果时，先读本 skill。委派子任务用 herdr worker，不用 Agent 工具子代理。
+description: 用 herdr 把任务交给另一个 agent（worker）时的布局、启动、派发、监控、验收、回收规则。凡是要 herdr agent start/prompt 一个 worker、整理 herdr 里 lead 与 worker 的 tab/pane、或核实 worker 交回的结果时，先读本 skill。委派子任务（包括「和 codex 聊聊」这类）一律用 herdr worker，不用 Agent 工具子代理或 codex exec / claude -p 后台进程。
 ---
 
 # herdr worker
@@ -9,6 +9,10 @@ description: 用 herdr 把任务交给另一个 agent（worker）时的布局、
 worker 能写哪些文件、交付物怎么验、谁能授权什么，由调用方的规则决定，写进任务书。
 
 术语：**lead** = 派活、读产物的 agent（通常是用户直接对话的那个）；**worker** = 被派活的 agent。
+
+- **委派给另一个 agent 一律走 herdr worker**：不用 `codex exec`、`claude -p`、`nohup` / 后台 shell 或 Agent 工具子代理代替。
+  这些在 herdr 里看不见、没有状态，用户和后继 lead 找不到，断线后无法核对做到哪。用户说「和 X 聊聊 / 让 X 看看」也是起一个 worker。
+- **本 skill 会更新，会话里读到的是加载那一刻的快照。** 每次起 worker、派新任务书之前，以及会话压缩 / 恢复之后、用户提到 skill 改了时，先重新加载本 skill；不凭记忆写启动参数和监控。
 
 ## 1. 布局：一个 lead 配一个 worker tab
 
@@ -53,7 +57,7 @@ herdr agent start <name> --kind <kind> --pane <pane> -- <该 CLI 的 yolo 参数
 
 | kind | yolo 参数 | 底栏 / 确认方式 |
 |---|---|---|
-| `claude` | `--dangerously-skip-permissions` | `bypass permissions on` |
+| `claude` | `--dangerously-skip-permissions`（等价：`--permission-mode bypassPermissions`） | `bypass permissions on` |
 | `codex` | `--dangerously-bypass-approvals-and-sandbox` | 启动后不再弹审批 |
 | `pi` | 无需参数，默认就不审批 | — |
 
@@ -66,12 +70,12 @@ herdr agent start <name> --kind <kind> --pane <pane> -- <该 CLI 的 yolo 参数
 - **默认跳过审批（yolo）启动，参数显式写在启动命令里**，不靠 shell 别名或全局配置隐式生效。
   理由：受限模式下 worker 每读一个目录、写一个文件都要停下等 lead 批，lead 被频繁打断，监控也容易漏掉卡住的 worker。
   代价：没有了事前拦截，写边界只靠任务书 + 事后核对。所以：
-  - 任务书必须写清能写哪些路径、哪些只读、哪些操作（push、部署、改远端、删除）禁止；
-  - 验收时核对实际改动范围（`git status` / `git diff --stat` / 文件时间戳），越界单独报告；
+  - 任务书必须写清能写哪些路径、哪些只读、哪些操作（push、部署、改远端、删除）禁止，验收时按 §5 核对；
   - 涉及生产、远端资源、不可逆删除的任务，用户可要求改用受限模式（claude：不加 yolo 参数；codex：`-c sandbox_mode=workspace-write -c approval_policy=on-request`；pi 默认不审批，要受限只能换 CLI）。
 - 启动后 `herdr agent read <name>` 确认权限模式与预期一致（见上表）。
-- 新目录首次启动 claude 会先弹「是否信任此目录」，`agent start` 会报 `agent_not_ready`：读屏确认后选信任，或换到已信任过的目录。
-- 启动后看一眼屏幕：首次进目录或某些 CLI 会卡在信任 / hook 审核界面，第一条 prompt 会被吃掉。读清当前选项，选「不信任继续」类的那一项（编号随版本变，别背）；要不要信任交给用户。
+- **信任 / hook 审核界面**：首次进新目录，claude 会先弹「是否信任此目录」（`agent start` 报 `agent_not_ready`）；codex 等可能弹 hook 审核。第一条 prompt 会被吃掉。
+  读屏看清选项后问用户：同意信任就选信任；没表态前选「不信任继续」类的那一项或先不动。选项编号随版本变，读屏再选，别背。
+  更省事：在已信任过的目录起 worker。
 - `agent start` 失败时 pane 里可能留着一个无名 agent —— 它会在侧栏伪装成 lead，关掉或命名。
 
 **同一件事的后续任务继续派给原 worker**（它读过的上下文就是资产）；换一件事、换目录就新建 worker。
@@ -112,13 +116,13 @@ sleep 8; herdr agent get <name>                          # 必须变 working
 - 单个 worker：后台跑 `herdr agent wait <name> --until idle --until blocked --until done --timeout <ms>`，状态一变就返回，能抓到短暂的 blocked。
 - 多个 worker：后台跑本 skill 目录下的 `watch_workers.py <name> [<name>...]`（只收名字，不收选项），任一状态变化或**消失**都打一行，全部停下后退出。
 - 「没有事件」必须能区分「还在跑」和「已经没了」：agent 从列表消失要当终止事件。
-- 监控脚本别用 macOS 自带 bash 写（3.2，没有 `declare -A`，开头就死而 stderr 不报）。起监控后读一次它的输出，确认活着。
+- 手写监控用 python，别用 macOS 自带 bash（3.2，开头就死而 stderr 不报）。起监控后读一次它的输出，确认活着。
 - `working` 不代表还没产出：出结果了可能没转 idle，隔一段时间 `herdr agent read <name> --source recent-unwrapped` 看一眼。
 - `blocked` = 在等输入（提问框、卡在 fork、权限审批）。先读清它在等什么再处理；该用户决定的转给用户。
 - **卡在命令审批框**（受限模式下）：读完整命令和实际目标。在任务书已授权范围内、效果可判断的，lead 可放行（含已授权的本地编辑与测试）；
   效果不清的让 worker 解释或拆小；越界的拒绝并告诉它原因；需要新授权的交给用户。不凭命令前缀或「看起来只读」放行。
 - **监控会失效**：宿主工具的超时到期、lead 会话重启 / 恢复后，监控可能已经没了，这不代表 worker 结束。
-  收到过期通知或刚恢复会话时，先 `herdr agent list` 看现场，再给仍在 working / blocked 的 worker 补监控。
+  收到过期通知或刚恢复会话时，先 `herdr agent list` 看现场，再给仍在 working / blocked 的 worker 补监控。宿主工具支持更长超时就用最大值。
 - worker 没活时停掉对它的监控，否则空闲 worker 会被周期性重复报。
 
 ## 5. 验收：只信产物
@@ -137,6 +141,7 @@ sleep 8; herdr agent get <name>                          # 必须变 working
 
 ## 6. 回收
 
-- 某个 worker 的事已交付且无后续 → 关它的 pane（不是每次 prompt 返回 done 就关，那会丢掉可复用的上下文）。
+- 某个 worker 的事已交付且无后续 → 关它的 pane（不是每次 prompt 返回 done 就关，那会丢掉可复用的上下文）：
+  `herdr pane close <pane_id>`（位置参数，没有 `--pane`）；pane_id 用 `herdr agent get <name>` 取。
 - lead 结束 → 关它的 `W·` tab。
 - 只关自己建的 pane / tab；别人的先问。lead 的 tab 永远不由别的 agent 关。
