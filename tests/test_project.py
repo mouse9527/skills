@@ -190,6 +190,28 @@ class LinkTest(unittest.TestCase):
         pj.link(self.dest, {})
         self.assertEqual(sorted(os.listdir(self.dest)), ['.skills-project.json', '.system', 'delta', 'mine'])
 
+    def test_release_with_link_keeps_client_dirs_in_step(self):
+        repo = str(self.r.dir)
+        root = Path(tempfile.mkdtemp(prefix='skills-root-'))
+        argv = ['release', '--repo', repo, '--ref', 'main', '--groups', 'assistant', '--root', str(root),
+                '--link', str(self.dest)]
+        self.assertEqual(pj.main(argv), 0)
+        self.assertEqual(sorted(x for x in os.listdir(self.dest) if not x.startswith('.')), ['alpha', 'beta'])
+        self.assertEqual(os.readlink(self.dest / 'alpha'), os.path.join(str(root), 'current', 'view', 'alpha'))
+        self.r.remove('skills/assistant/beta')
+        self.r.groups['assistant'] = ['alpha']
+        self.r.write_manifest()
+        self.r.commit()
+        self.assertEqual(pj.main(argv), 0)
+        self.assertEqual(sorted(x for x in os.listdir(self.dest) if not x.startswith('.')), ['alpha'])
+        (self.dest / 'beta').mkdir()  # someone else's entry with a name we will want again
+        self.r.groups['assistant'] = ['alpha', 'beta']
+        self.r.write('skills/assistant/beta/SKILL.md', skill_md('beta'))
+        self.r.write_manifest()
+        self.r.commit()
+        self.assertEqual(pj.main(argv), 1)  # conflict: release done, links refused, nothing overwritten
+        self.assertTrue((self.dest / 'beta').is_dir() and not (self.dest / 'beta').is_symlink())
+
     def test_maintainer_mode_links_into_worktree(self):
         out = pj.link(self.dest, pj.worktree_targets(str(self.r.dir), ['dev']))
         self.assertEqual(out['linked'], ['gamma'])

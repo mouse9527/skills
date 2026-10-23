@@ -19,6 +19,9 @@ mouse9527 的 agent skill，**所有 skill 的唯一来源**（Claude Code / Cod
 python3 scripts/project.py release --github mouse9527/skills --ref <sha|main> --groups assistant --root /opt/llm-skills
 #   → /opt/llm-skills/current/view/<id>/ ；客户端的 skill 目录链到 current/view
 python3 scripts/project.py rollback --root /opt/llm-skills
+# CLI（Claude Code 读 ~/.claude/skills；Codex / Pi 读 ~/.agents/skills）：release 后把叶目录链到 current，循环里保持同步
+python3 scripts/project.py release --github mouse9527/skills --ref main --groups dev,assistant \
+  --root ~/.local/share/agent-skills --link ~/.agents/skills --link ~/.claude/skills --loop 300
 
 # 维护者模式（本地 checkout，改动立即可见，不固定 SHA）：每个 skill 一条叶目录软链
 python3 scripts/project.py link --repo ~/workspaces/skills --groups dev --dest ~/.claude/skills

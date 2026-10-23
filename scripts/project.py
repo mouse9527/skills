@@ -2,10 +2,11 @@
 """Project skills of selected groups into the flat layout clients discover (<id>/SKILL.md). Stdlib only; it is a
 set projector, not a package manager.
 
-  release   --root DIR (--repo GITDIR | --github OWNER/REPO) --ref REF --groups g1,g2 [--loop SECONDS]
+  release   --root DIR (--repo GITDIR | --github OWNER/REPO) --ref REF --groups g1,g2 [--loop SECONDS] [--link DEST]…
             Immutable release of one full commit SHA: DIR/releases/<sha12>-<groups>/view/<id>/…, then DIR/current is
             switched atomically. REF = full SHA (pinned) or a branch (resolved to its SHA every run).
             DIR itself is never replaced (it may be a shared volume); only releases/, current, .project.json inside.
+            --link DEST (repeatable): after every run, DEST/<id> -> DIR/current/view/<id> for each skill (as `link`)
   rollback  --root DIR        current <-> previous release
   link      --dest DIR (--view VIEWDIR | --repo WORKTREE --groups g1,g2)
             One leaf symlink per skill in DIR (a client's skills directory): DIR/<id> -> VIEWDIR/<id>, or in maintainer
@@ -305,6 +306,7 @@ def main(argv=None) -> int:
     r.add_argument('--ref', required=True)
     r.add_argument('--groups', required=True)
     r.add_argument('--loop', type=float)
+    r.add_argument('--link', action='append', default=[], help='client skills directory to keep linked to current')
     rb = sub.add_parser('rollback')
     rb.add_argument('--root', required=True)
     lk = sub.add_parser('link')
@@ -333,6 +335,17 @@ def main(argv=None) -> int:
                     log(error=f'{type(e).__name__}: {e}'[:300], t=time.strftime('%Y-%m-%dT%H:%M:%S'))
                     if not a.loop:
                         return 1
+                for dest in a.link:  # also after a failed run: links follow whatever release is current
+                    try:
+                        view = os.path.join(a.root, 'current', 'view')
+                        if os.path.isdir(view):
+                            out = link(Path(os.path.expanduser(dest)), view_targets(view))
+                            if out['changed'] or out['removed']:
+                                log(**out)
+                    except (ProjectError, OSError) as e:
+                        log(error=f'link {dest}: {type(e).__name__}: {e}'[:300])
+                        if not a.loop:
+                            return 1
                 if not a.loop:
                     return 0
                 time.sleep(a.loop)
