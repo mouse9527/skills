@@ -105,6 +105,17 @@ class ReleaseTest(unittest.TestCase):
         self.assertIn('v2', (self.root / 'current' / 'view' / 'alpha' / 'SKILL.md').read_text())
         self.assertNotIn('pinned_after_rollback', json.loads((self.root / '.project.json').read_text()))
 
+    def test_manual_release_of_the_current_commit_also_unpins(self):
+        self.r.commit()
+        self.rel()
+        self.r.write('skills/assistant/alpha/SKILL.md', skill_md('alpha', 'v2\n'))
+        sha2 = self.r.commit()
+        self.rel()
+        pj.rollback(self.root)
+        self.rel(ref=pj.resolve_repo(str(self.r.dir), 'HEAD~1'))  # = what rollback switched to: unchanged
+        self.assertNotIn('pinned_after_rollback', json.loads((self.root / '.project.json').read_text()))
+        self.assertEqual(self.rel()['sha'], sha2)
+
     def test_root_must_exist_and_is_never_replaced(self):
         self.r.commit()
         marker = self.root / 'keep-me'

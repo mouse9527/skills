@@ -199,6 +199,8 @@ def release(root: Path, resolve, fetch, ref: str, groups: list[str]) -> dict:
     if not root.is_dir():
         raise ProjectError(f'{root} does not exist (the root is never created or replaced here)')
     st = _state(root)
+    if st.pop('pinned_after_rollback', None):  # a manual release resumes the loop, even if nothing changes
+        _write_json(root / STATE, st)
     sha = resolve(ref)
     if not SHA_RE.match(sha):
         raise ProjectError(f'not a full commit SHA: {sha!r}')
