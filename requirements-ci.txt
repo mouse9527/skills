@@ -1,0 +1,8 @@
+# CI only (scripts/project.py needs nothing beyond the standard library). Exact versions; bump deliberately.
+click==8.5.0
+python-dateutil==3.0.0
+PyYAML==6.0.3
+six==1.17.0
+skills-ref==0.1.1
+strictyaml==1.7.3
+tzdata==2026.5

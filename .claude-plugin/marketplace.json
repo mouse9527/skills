@@ -1,0 +1,44 @@
+{
+  "name": "mouse9527-skills",
+  "owner": {
+    "name": "mouse9527"
+  },
+  "plugins": [
+    {
+      "name": "assistant",
+      "description": "生活助理：手机 App、购物、外卖、位置、日程等场景规则",
+      "source": "./",
+      "strict": false,
+      "skills": [
+        "./skills/assistant/browser-general",
+        "./skills/assistant/dianping",
+        "./skills/assistant/food-delivery",
+        "./skills/assistant/icloud-assistant",
+        "./skills/assistant/jd",
+        "./skills/assistant/jd-miaosong",
+        "./skills/assistant/location",
+        "./skills/assistant/meituan",
+        "./skills/assistant/meituan-waimai",
+        "./skills/assistant/meituan-xiaoxiang",
+        "./skills/assistant/phone-general",
+        "./skills/assistant/pinduoduo",
+        "./skills/assistant/shopping",
+        "./skills/assistant/taobao",
+        "./skills/assistant/taobao-flash",
+        "./skills/assistant/weibo",
+        "./skills/assistant/xianyu",
+        "./skills/assistant/xiaohongshu"
+      ]
+    },
+    {
+      "name": "dev",
+      "description": "开发协作：工作区（ws）流程与 herdr worker 委派",
+      "source": "./",
+      "strict": false,
+      "skills": [
+        "./skills/dev/herdr-workers",
+        "./skills/dev/workspace"
+      ]
+    }
+  ]
+}

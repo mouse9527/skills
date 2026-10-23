@@ -1,0 +1,11 @@
+#!/bin/bash
+# Refuse a push unless scripts/preflight.sh passed for exactly the commit being pushed.
+#   install: git config core.hooksPath scripts/hooks
+ok="$(git rev-parse --git-dir)/preflight-ok"
+while read -r _ local_sha _ _; do
+  [ "$local_sha" = 0000000000000000000000000000000000000000 ] && continue   # branch deletion
+  if [ ! -f "$ok" ] || [ "$(cat "$ok")" != "$local_sha" ]; then
+    echo "pre-push: run scripts/preflight.sh for $local_sha first (this repository is public)" >&2
+    exit 1
+  fi
+done
