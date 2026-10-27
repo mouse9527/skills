@@ -58,11 +58,13 @@ ws 是**工作台**，不是事实源。一个 ws 对应一条交付线，放在
 5. **权限边界**：能部署到哪、谁授权、哪些环境 / 数据只读。
 6. **本 ws 的验收判据**：什么才算 done（checks 绿？页面验收？运行态检查？）。
 7. **本 ws 追加的规则**：只写和通用规则不同的地方，事故原因一句话。
-8. **审查**：各 repo 有没有根目录 `REVIEW.md`；风险表里和第 5 节默认不同的地方（本 ws 哪些路径算高档）。没有差异就写「按 skill 默认」。
+8. **审查**：第 11 节接入检查的结果（日期 + 每个 repo 的缺项和补它的 Issue）；风险表里和第 5 节默认不同的地方（本 ws 哪些路径算高档）。没有差异就写「按 skill 默认」。
 
 README 超过约 300 行就体检：每段问「是纪律还是操作手册」，操作手册拆出去或删。
 
 ## 3. 一个 Issue 的流程
+
+开工前先看 README 第 8 项：没有接入检查记录、或仓库表里有 repo 不在记录里，先按第 11 节查一遍。
 
 ```
 1. 开 GitHub Issue（按 .templates/issue.md），拿到 <issue-id>
@@ -202,6 +204,22 @@ git -C repos/<repo> worktree prune
    ln -s README.md "$W/CLAUDE.md"
    ```
 
-3. 按第 2 节写 `README.md`（含第 8 项审查），按第 3 节写 `.templates/issue.md`，建空的 `NOW.md`。
-   repo 还没有 `REVIEW.md` 的，记成待办：在那个 repo 开 Issue、走 PR 加上，不在建 ws 时顺手提交。
-4. clone 只读还是可写的 repo 由用户决定；创建步骤本身不 clone、不拉 worktree、不起 agent。
+3. 按第 2 节写 `README.md`，按第 3 节写 `.templates/issue.md`，建空的 `NOW.md`。
+4. repo clone 好之后按第 11 节做接入检查，结果写进 README 第 8 项。
+5. clone 只读还是可写的 repo 由用户决定；创建步骤本身不 clone、不拉 worktree、不起 agent。
+
+## 11. repo 接入检查
+
+ws 里每个可写的 repo 都要满足下面几条，第 5 节的审查和第 6 节的合并才能照常工作。
+什么时候查：新建 ws、仓库表加 repo、README 第 8 项没有记录时。只读 repo 不查。
+
+| 查什么 | 怎么查（读默认分支，不看工作区） | 缺了会怎样 |
+|---|---|---|
+| 根目录 `REVIEW.md` | `git -C repos/<repo> show origin/<默认>:REVIEW.md` | 审查者只能按通用标准审，漏掉这个 repo 特有的风险 |
+| `AGENTS.md` 或 `CLAUDE.md`，且里面引用的文件还在 | `git show` 读出来，对每个引用路径 `git ls-tree origin/<默认> -- <路径>` | agent 按失效引用加载规范，找不到就凭猜 |
+| PR 会触发 CI | 读 `.github/workflows/*.yml` 的 `on:`，看 PR 目标分支是否在触发范围；没有 CI 的 repo，README 要写明 Owner 定的验证门槛 | 第 6 节条件 1 无法满足 |
+| 不跟踪 agent 配置和本地设置 | `git -C repos/<repo> ls-tree -r --name-only origin/<默认> -- .agents .claude .codex .roll` 和 `… \| grep -E '\.local\.json$'` 应为空 | 个人设置和凭据进了仓库 |
+
+- 结果写进 README 第 8 项：查的日期、每个 repo 满足哪几条、缺项各对应哪个 Issue。
+- 缺项一律在那个 repo 开 Issue、走 PR 补上，不在接入检查时顺手提交。
+- 发现已提交的凭据：不要打印它的值，只记文件和行号，告诉 Owner 作废。删文件不能把它从历史里去掉。
