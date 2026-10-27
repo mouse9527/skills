@@ -1,6 +1,6 @@
 ---
 name: herdr-workers
-description: 用 herdr 把任务交给另一个 agent（worker）时的布局、启动、派发、监控、验收、回收规则。凡是要 herdr agent start/prompt 一个 worker、整理 herdr 里 lead 与 worker 的 tab/pane、或核实 worker 交回的结果时，先读本 skill。委派子任务（包括「和 codex 聊聊」这类）一律用 herdr worker，不用 Agent 工具子代理或 codex exec / claude -p 后台进程。
+description: 用 herdr 把任务交给另一个 agent（worker）时的布局、启动、派发、监控、验收、回收规则。凡是要 herdr agent start/prompt 一个 worker、整理 herdr 里 lead 与 worker 的 tab/pane、派审查 worker、或核实 worker 交回的结果时，先读本 skill。委派子任务（包括「和 codex 聊聊」这类）一律用 herdr worker，不用 Agent 工具子代理或 codex exec / claude -p 后台进程。
 ---
 
 # herdr worker
@@ -80,6 +80,18 @@ herdr agent start <name> --kind <kind> --pane <pane> -- <该 CLI 的 yolo 参数
 
 **同一件事的后续任务继续派给原 worker**（它读过的上下文就是资产）；换一件事、换目录就新建 worker。
 上下文撑爆要 `/clear` 前，先让它把结论写进文件。
+
+### 审查 worker
+
+审查别人产出的 worker（代码审查、独立复核）要的是**没被实现过程影响的眼睛**，所以起法和上面的复用规则不同：
+
+- **新起，不复用实现者**，也不复用审过别的 PR / 别的任务的审查者。名字带上角色，如 `rv-<号>-<kind>`。
+- **同一个审查对象的后续轮次，续派给原审查者**：它记得上轮看过什么，适合只审增量。
+- **kind 尽量和实现者不同**（实现是 claude 就派 codex 或 pi 审，反之亦然），档位不低于实现者。这条为了减少同源盲区，效果未验证。
+- 审查者是只读角色：任务书写明只能写报告文件和自己的分离 worktree，禁止 commit / push / 在托管平台上评论或审批。验收时照 §5 核对它真的没写别处。
+- 任务书要求它**先独立写出结论，再读实现者的报告**，避免被对方的说法带着走。
+- 审查者可以用自己 CLI 自带的审查命令辅助，但交付物格式以任务书为准（未验证各 CLI 的审查命令在 herdr pane 里的表现）。
+- 审什么、交什么格式、发现怎么处置，由调用方规则决定（如 skill `workspace` 第 5 节和它的 `review-task.md`），本 skill 不管。
 
 ## 3. 派发
 
