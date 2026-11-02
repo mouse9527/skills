@@ -4,6 +4,7 @@
 退出码：0 成功；1 参数或内容不合法；3 状态不允许（已撤回 / 被替换 / 版本不符）；4 身份不符。
 """
 import argparse
+import fcntl
 import os
 import re
 import sys
@@ -57,17 +58,17 @@ def cmd_receive(args):
 
 
 def cmd_resolve(args):
-    qstore.resolve(args.id, args.answer_rev, args.note)
+    qstore.resolve(args.id, args.answer_rev, args.note, caller(args))
     print(f'{args.id} 已闭环（Rev {args.answer_rev}）')
 
 
 def cmd_withdraw(args):
-    qstore.withdraw(args.id, args.reason)
+    qstore.withdraw(args.id, args.reason, caller(args))
     print(f'{args.id} 已撤回')
 
 
 def cmd_erratum(args):
-    rev = qstore.erratum(args.id, args.note, [q.strip().upper() for q in args.drop or []])
+    rev = qstore.erratum(args.id, args.note, caller(args), [q.strip().upper() for q in args.drop or []])
     print(f'{args.id} 已补勘误，content_rev = {rev}（Owner 若正在填写，提交时会收到冲突提示，输入不会丢）')
 
 
@@ -117,6 +118,20 @@ def cmd_doctor(_args):
     return 1 if problems else 0
 
 
+def server_running():
+    """服务进程锁被占着就是服务在跑：这时 sending 是正常的进行中状态。"""
+    path = qstore.state_dir() / 'server.lock'
+    if not path.exists():
+        return False
+    with open(path, 'a') as f:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return True
+        fcntl.flock(f, fcntl.LOCK_UN)
+        return False
+
+
 def doctor():
     out = []
     allq = qstore.all_questions()
@@ -134,6 +149,11 @@ def doctor():
                 out.append(f'{qid}: {k} 不是数字')
         lead, sp = qstore.split_body(body)
         n = qstore.geti(m, 'answer_rev')
+        if n > 0:
+            try:
+                qstore.current_slots(m, body)
+            except qstore.QError as e:
+                out.append(f'{qid}: {e.message}')
         revs = [r['rev'] for r in qstore.answer_revs(sp)]
         if revs != list(range(1, n + 1)):
             out.append(f'{qid}: 回答里的 Rev {revs} 与 answer_rev {n} 对不上（rev 回退或缺失）')
@@ -147,8 +167,8 @@ def doctor():
             out.append(f'{qid}: delivery=received 但 received_rev ≠ delivery_rev')
         if m.get('status') == 'resolved' and qstore.geti(m, 'resolved_rev') != qstore.geti(m, 'received_rev'):
             out.append(f'{qid}: resolved_rev ≠ received_rev')
-        if m.get('delivery') == 'sending' or m.get('withdraw_notice') == 'sending':
-            out.append(f'{qid}: 停在 sending（服务重启会改为 uncertain）')
+        if (m.get('delivery') == 'sending' or m.get('withdraw_notice') == 'sending') and not server_running():
+            out.append(f'{qid}: 停在 sending 且服务没在运行（服务启动时会改为 uncertain）')
         sup = m.get('supersedes')
         if sup:
             if sup not in allq:
@@ -210,6 +230,8 @@ def main(argv=None):
     r.add_argument('id')
     add('doctor', cmd_doctor, '一致性检查')
     args = p.parse_args(argv)
+    for stream in (sys.stdout, sys.stderr):  # Owner 原话要逐字输出，不受 locale 影响
+        stream.reconfigure(encoding='utf-8')
     try:
         return args.fn(args) or 0
     except qstore.QError as e:

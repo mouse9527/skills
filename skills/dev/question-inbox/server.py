@@ -218,7 +218,7 @@ def detail_view(qid):
         'not_executed': (f'这条回答不会被执行，原因：{invalid}' if invalid and n > 0 else ''),
         'resolution': meta.get('resolution') if meta.get('status') == 'resolved' else '',
         'body_html': md(lead), 'errata_html': md(sp.get('勘误', '')),
-        'timeline': [l[2:] for l in sp.get('时间线', '').splitlines() if l.startswith('- ')],
+        'timeline': [l[2:] for l in sp.get('时间线', '').split('\n') if l.startswith('- ')],
         'questions': [{'q': q, 'text': t, 'options': opts.get(q, []), 'suggestion': sugg.get(q, ''),
                        'withdrawn': q in dropped} for q, t in qstore.questions(lead)],
         'draft': qstore.draft(sp), 'revs': qstore.answer_revs(sp),
@@ -416,6 +416,8 @@ button.pri{background:var(--acc);color:#fff;border-color:var(--acc)}
 const TOKEN = document.querySelector('meta[name=qi-token]').content;
 const TYPES = {free:'自由回答', suggested:'按建议', need_context:'需要更多上下文', defer:'暂不决定'};
 let cur = null, detail = null, dirty = false, msg = null;
+// 异步回包都要对得上发起时的视图：gen 每次切题 +1；formGen 每次表单输入 +1；seq 只认最新的一次读取
+let gen = 0, formGen = 0, listSeq = 0, loadSeq = 0, loadApplied = 0;
 
 function el(tag, attrs, ...kids) {
   const e = document.createElement(tag);
@@ -437,8 +439,9 @@ async function api(path, body) {
 }
 
 async function refreshList() {
+  const seq = ++listSeq;
   const {status, j} = await api('/api/list');
-  if (status !== 200) return;
+  if (seq !== listSeq || status !== 200) return;  // 迟到的旧列表不覆盖新的
   document.title = (j.open_count ? `(${j.open_count}) ` : '') + '问题收件箱';
   const side = document.getElementById('side'); side.replaceChildren();
   const names = {todo: '待答', waiting: '已答，lead 未接收', received: 'lead 已接收，未闭环', closed: '最近已闭环 / 撤回'};
@@ -453,35 +456,73 @@ async function refreshList() {
   }
 }
 
-function slotsFromForm() {
+function markDirty() { dirty = true; formGen++; }
+function checkedValue(q) { const r = document.querySelector(`input[name="t_${q}"]:checked`); return r ? r.value : null; }
+function textOf(q) { const t = document.getElementById('x_' + q); return t ? t.value : ''; }
+
+// 「已填」只在这里判定：选了类型，或者没选类型但写了非空文字（算自由回答）。按钮和提交共用
+function slotFor(q) {
+  if (q.withdrawn) return null;
+  const v = checkedValue(q.q), text = textOf(q.q);
+  if (!v) return text.trim() ? {type: 'free', text} : null;
+  if (v.startsWith('opt:')) return {type: 'option', choice: q.options[+v.slice(4)], text};
+  return {type: v, text};
+}
+
+function slotsFromForm(d) {
   const slots = {};
-  for (const q of detail.questions) {
-    if (q.withdrawn) continue;
-    const r = document.querySelector(`input[name="t_${q.q}"]:checked`);
-    const text = document.getElementById('x_' + q.q).value;
-    if (!r) { if (text.trim()) slots[q.q] = {type: 'free', text}; continue; }
-    const v = r.value;
-    if (v.startsWith('opt:')) slots[q.q] = {type: 'option', choice: q.options[+v.slice(4)], text};
-    else slots[q.q] = {type: v, text};
-  }
+  for (const q of d.questions) { const s = slotFor(q); if (s) slots[q.q] = s; }
   return slots;
 }
 
-function fillForm(slots) {
-  for (const q of detail.questions) {
-    const s = slots[q.q]; if (!s || q.withdrawn) continue;
-    let v = s.type;
-    if (v === 'option') { const i = q.options.indexOf(s.choice); if (i < 0) continue; v = 'opt:' + i; }
-    const r = document.querySelector(`input[name="t_${q.q}"][value="${v}"]`); if (r) r.checked = true;
-    document.getElementById('x_' + q.q).value = s.text || '';
+// 「其余按建议」：只填真正的空槽，不提交。返回填了几个
+function fillSuggested(d) {
+  if (d !== detail) return 0;
+  let n = 0;
+  for (const q of d.questions) {
+    if (q.withdrawn || !q.suggestion || slotFor(q)) continue;
+    const r = document.querySelector(`input[name="t_${q.q}"][value="suggested"]`);
+    if (r) { r.checked = true; n++; }
   }
+  if (n) markDirty();
+  return n;
 }
 
-async function post(action, body) {
-  const {status, j} = await api(`/api/q/${encodeURIComponent(cur)}/${action}`, body);
-  if (status === 200) { msg = {cls: 'ok', text: j.note || ({save: '已保存草稿（不投递）', submit: `已提交 Rev ${j.answer_rev}，将发回 lead`}[action] || '完成')}; dirty = false; await load(true); }
-  else { msg = {cls: 'bad', text: (status === 409 ? '版本冲突：' : '') + (j.error || ('错误 ' + status))}; renderMsg(); }
+// 回填草稿 / 上一版回答；选项已不在当前列表里（有勘误）的，返回提示，原话照样填回
+function fillForm(d, slots) {
+  const stale = [];
+  for (const q of d.questions) {
+    const s = slots[q.q]; if (!s || q.withdrawn) continue;
+    const t = document.getElementById('x_' + q.q); if (t) t.value = s.text || '';
+    let v = s.type;
+    if (v === 'option') {
+      const i = q.options.indexOf(s.choice);
+      if (i < 0) { stale.push(`${q.q} 原来选的「${s.choice}」已不在当前选项里`); continue; }
+      v = 'opt:' + i;
+    }
+    const r = document.querySelector(`input[name="t_${q.q}"][value="${v}"]`); if (r) r.checked = true;
+  }
+  return stale;
+}
+
+// d 是发起操作时屏幕上的那题；切题后不再发，回包也不再改当前视图
+async function post(d, action, body) {
+  const id = d.id, g = gen, fg = formGen;
+  if (d !== detail || id !== cur) {
+    msg = {cls: 'bad', text: '页面已经切到别的问题，这次操作没有发出；请确认当前显示的问题后再操作。'}; renderMsg();
+    return false;
+  }
+  const {status, j} = await api(`/api/q/${encodeURIComponent(id)}/${action}`, body);
   refreshList();
+  if (g !== gen || id !== cur) return status === 200;
+  if (status === 200) {
+    const text = j.note || ({save: '已保存草稿（不投递）', submit: `已提交 Rev ${j.answer_rev}，将发回 lead`}[action] || '完成');
+    if (fg === formGen) { dirty = false; msg = {cls: 'ok', text}; await load(true); }
+    else { msg = {cls: 'warn', text: text + '。你在请求期间又改了表单，改动还在，先别刷新。'}; renderMsg(); }
+    return true;
+  }
+  msg = {cls: 'bad', text: (status === 409 ? '版本冲突：' : '') + (j.error || ('错误 ' + status))}; renderMsg();
+  return false;
 }
 
 function renderMsg() {
@@ -497,33 +538,36 @@ function render() {
   if (d.invalid) main.append(el('div', {class: 'bar bad'}, `已失效：${d.invalid}`));
   if (d.not_executed) main.append(el('div', {class: 'bar bad'}, d.not_executed));
   for (const w of d.warnings) main.append(el('div', {class: 'bar warn'}, '提示：' + w));
-  if (d.status === 'answered' || d.status === 'resolved') {
+  const notice = d.status === 'withdrawn' && d.delivery && d.delivery !== '已撤回';
+  if (d.status === 'answered' || d.status === 'resolved' || notice) {
     const st = d.received ? 'lead 已接收' : (d.delivery || '');
-    main.append(el('div', {class: 'bar ' + (d.received ? 'ok' : 'warn'), id: 'dstate'}, `投递：${st}${d.delivery_detail && !d.received ? '（' + d.delivery_detail + '）' : ''}`,
-      d.renotify ? el('button', {style: 'margin-left:12px', onclick: () => post('renotify', {})}, '重新通知') : null,
+    main.append(el('div', {class: 'bar ' + (d.received ? 'ok' : (d.renotify ? 'bad' : 'warn')), id: 'dstate'}, `投递：${st}${d.delivery_detail && !d.received ? '（' + d.delivery_detail + '）' : ''}`,
+      d.renotify ? el('button', {style: 'margin-left:12px', onclick: () => post(d, 'renotify', {})}, '重新通知') : null,
       d.renotify ? el('div', {class: 'sugg'}, '重新通知会重新核对 lead 身份后再发；这条可能已经在 lead 的队列里。') : null));
   }
   if (d.resolution) main.append(el('div', {class: 'bar ok'}, '已闭环：' + d.resolution));
   main.append(el('div', {class: 'card'}, html(d.body_html)));
   if (d.errata_html) main.append(el('div', {class: 'card'}, el('h3', {}, '勘误'), html(d.errata_html)));
+  let staleBox = null, draftBox = null;
   if (d.editable) {
-    const form = el('div', {class: 'card'}, el('h3', {}, d.answer_rev ? `更正回答（当前 Rev ${d.answer_rev}，提交后生成 Rev ${d.answer_rev + 1}）` : '回答'));
+    staleBox = el('div', {}); draftBox = el('div', {class: 'sugg'});
+    const form = el('div', {class: 'card'}, el('h3', {}, d.answer_rev ? `更正回答（当前 Rev ${d.answer_rev}，提交后生成 Rev ${d.answer_rev + 1}）` : '回答'), draftBox, staleBox);
     for (const q of d.questions) {
       const box = el('div', {class: 'slot'}, el('strong', {}, `${q.q}. ${q.text}`));
       if (q.withdrawn) { box.append(el('div', {class: 'sugg'}, 'lead 已撤回这个子问题（算已填）')); form.append(box); continue; }
-      q.options.forEach((o, i) => box.append(el('label', {}, el('input', {type: 'radio', name: 't_' + q.q, value: 'opt:' + i, onchange: () => dirty = true}), ' ', o)));
+      q.options.forEach((o, i) => box.append(el('label', {}, el('input', {type: 'radio', name: 't_' + q.q, value: 'opt:' + i, onchange: markDirty}), ' ', o)));
       for (const [t, name] of Object.entries(TYPES)) {
         if (t === 'suggested' && !q.suggestion) continue;
-        box.append(el('label', {}, el('input', {type: 'radio', name: 't_' + q.q, value: t, onchange: () => dirty = true}), ' ', name, t === 'suggested' ? `：${q.suggestion}` : ''));
+        box.append(el('label', {}, el('input', {type: 'radio', name: 't_' + q.q, value: t, onchange: markDirty}), ' ', name, t === 'suggested' ? `：${q.suggestion}` : ''));
       }
-      box.append(el('textarea', {id: 'x_' + q.q, placeholder: '补充 / 原话（自由回答必填）', oninput: () => dirty = true}));
+      box.append(el('textarea', {id: 'x_' + q.q, placeholder: '补充 / 原话（不选类型直接写，就算自由回答）', oninput: markDirty}));
       form.append(box);
     }
     form.append(el('div', {},
-      el('button', {onclick: () => post('save', {content_rev: d.content_rev, slots: slotsFromForm()})}, '保存草稿'),
-      el('button', {onclick: () => { for (const q of d.questions) { if (q.withdrawn || !q.suggestion) continue; if (!document.querySelector(`input[name="t_${q.q}"]:checked`)) { document.querySelector(`input[name="t_${q.q}"][value="suggested"]`).checked = true; dirty = true; } } }}, '其余按建议'),
-      el('button', {class: 'pri', onclick: () => post('submit', {content_rev: d.content_rev, answer_rev: d.answer_rev, slots: slotsFromForm()})}, d.answer_rev ? '提交更正并发回 lead' : '提交并发回 lead'),
-      el('div', {class: 'sugg'}, '「其余按建议」只填进表单，你可以再改；只有点提交才算回答。')));
+      el('button', {onclick: () => post(d, 'save', {content_rev: d.content_rev, slots: slotsFromForm(d)})}, '保存草稿'),
+      el('button', {onclick: () => fillSuggested(d)}, '其余按建议'),
+      el('button', {class: 'pri', onclick: () => post(d, 'submit', {content_rev: d.content_rev, answer_rev: d.answer_rev, slots: slotsFromForm(d)})}, d.answer_rev ? '提交更正并发回 lead' : '提交并发回 lead'),
+      el('div', {class: 'sugg'}, '「其余按建议」只填还空着的子问题，你可以再改；只有点提交才算回答。')));
     main.append(form);
   }
   for (const r of [...d.revs].reverse()) {
@@ -534,23 +578,28 @@ function render() {
   main.append(el('details', {class: 'card'}, el('summary', {}, '时间线'), ...d.timeline.map(t => el('div', {class: 'meta'}, t))));
   if (d.editable) {
     const latest = d.revs.find(r => r.rev === d.answer_rev);
-    fillForm(Object.keys(d.draft.slots).length ? d.draft.slots : (latest ? latest.slots : {}));
-    if (d.draft.note) main.querySelector('.card h3').after(el('div', {class: 'sugg'}, '草稿：' + d.draft.note));
+    const stale = fillForm(d, Object.keys(d.draft.slots).length ? d.draft.slots : (latest ? latest.slots : {}));
+    if (d.draft.note) draftBox.append('草稿：' + d.draft.note);
+    for (const s of stale) staleBox.append(el('div', {class: 'bar warn'}, s + '（问题有勘误），请重新选择。'));
   }
   renderMsg();
 }
 
 async function load(force) {
-  if (!cur) return;
-  const {status, j} = await api('/api/q/' + encodeURIComponent(cur));
+  const id = cur, g = gen, seq = ++loadSeq;
+  if (!id) return;
+  const {status, j} = await api('/api/q/' + encodeURIComponent(id));
+  if (g !== gen || id !== cur || seq < loadApplied) return;  // 发起后切了题，或已有更新的读取生效
+  loadApplied = seq;
   if (status !== 200) { document.getElementById('main').replaceChildren(el('div', {class: 'bar bad'}, j.error || '加载失败')); detail = null; return; }
+  if (j.id !== id) return;
   const changed = !detail || detail.id !== j.id || detail.content_rev !== j.content_rev || detail.answer_rev !== j.answer_rev || detail.status !== j.status;
   if (!force && !dirty && JSON.stringify(detail) === JSON.stringify(j)) return;
   if (force || !dirty) { const keep = force ? msg : null; detail = j; render(); msg = keep; renderMsg(); return; }
   if (changed) { msg = {cls: 'warn', text: '问题或回答已在别处更新：你填的内容还在表单里，提交会提示冲突并自动保留为草稿，然后刷新页面。'}; renderMsg(); }
 }
 
-function route() { cur = decodeURIComponent(location.hash.slice(1)) || null; detail = null; dirty = false; msg = null; load(true); refreshList(); }
+function route() { gen++; cur = decodeURIComponent(location.hash.slice(1)) || null; detail = null; dirty = false; msg = null; load(true); refreshList(); }
 window.addEventListener('hashchange', route);
 route();
 setInterval(() => { refreshList(); load(false); }, 3000);

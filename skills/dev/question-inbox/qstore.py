@@ -124,7 +124,7 @@ def parse(text):
     if text.startswith('---\n'):
         end = text.find('\n---\n', 4)
         if end != -1:
-            for line in text[4:end].splitlines():
+            for line in text[4:end].split('\n'):
                 if ':' in line:
                     k, v = line.split(':', 1)
                     meta[k.strip()] = v.strip()
@@ -142,10 +142,22 @@ def render(meta, body):
     return f'---\n{head}\n---\n{body}'
 
 
+def fenced(lines):
+    """每行是否在代码围栏里（围栏行本身也算）。只按 `\\n` 分行的结果传进来。"""
+    out, fence = [], False
+    for line in lines:
+        is_fence = line.lstrip().startswith('```')
+        out.append(fence or is_fence)
+        if is_fence:
+            fence = not fence
+    return out
+
+
 def split_body(body):
-    """(lead 写的正文, {系统段名: 内容})。系统段从第一个 `## <系统段名>` 行开始。"""
+    """(lead 写的正文, {系统段名: 内容})。系统段从第一个围栏外的 `## <系统段名>` 行开始。"""
     lines = body.split('\n')
-    start = next((i for i, l in enumerate(lines) if _sys_heading(l)), len(lines))
+    infence = fenced(lines)
+    start = next((i for i, l in enumerate(lines) if not infence[i] and _sys_heading(l)), len(lines))
     lead = '\n'.join(lines[:start]).strip('\n')
     sys_parts, cur = {}, None
     for line in lines[start:]:
@@ -173,11 +185,10 @@ def join_body(lead, sys_parts):
 
 def sections(lead):
     """lead 正文里的二级段 {标题: 内容}；代码块里的 ## 不算标题。"""
-    out, cur, fence = {}, None, False
-    for line in lead.split('\n'):
-        if line.lstrip().startswith('```'):
-            fence = not fence
-        m = None if fence else re.match(r'^##\s+(.+?)\s*$', line)
+    out, cur = {}, None
+    lines = lead.split('\n')
+    for line, infence in zip(lines, fenced(lines)):
+        m = None if infence else re.match(r'^##\s+(.+?)\s*$', line)
         if m:
             cur = m.group(1)
             out.setdefault(cur, [])
@@ -189,7 +200,7 @@ def sections(lead):
 def questions(lead):
     """[(qid, 文本)]，来自 `## 问题`。"""
     out = []
-    for line in sections(lead).get('问题', '').splitlines():
+    for line in sections(lead).get('问题', '').split('\n'):
         m = Q_LINE_RE.match(line.strip())
         if m:
             out.append((f'Q{int(m.group(1))}', m.group(2).strip()))
@@ -199,7 +210,7 @@ def questions(lead):
 def options(lead):
     """{qid: [选项行]}，来自 `## 选项` 下的 `### Qn` 子段。"""
     out, cur = {}, None
-    for line in sections(lead).get('选项', '').splitlines():
+    for line in sections(lead).get('选项', '').split('\n'):
         m = re.match(r'^###\s+Q(\d+)\b', line.strip())
         if m:
             cur = f'Q{int(m.group(1))}'
@@ -213,7 +224,7 @@ def options(lead):
 
 def suggestions(lead):
     out = {}
-    for line in sections(lead).get('建议', '').splitlines():
+    for line in sections(lead).get('建议', '').split('\n'):
         m = SUGGEST_RE.match(line)
         if m:
             out.setdefault(f'Q{int(m.group(1))}', m.group(2).strip())
@@ -227,7 +238,7 @@ def slot_lines(slots):
 
 def parse_slots(text):
     slots = {}
-    for line in text.splitlines():
+    for line in text.split('\n'):
         m = SLOT_LINE_RE.match(line.strip())
         if m:
             try:
@@ -240,7 +251,7 @@ def parse_slots(text):
 def answer_revs(sys_parts):
     """[{rev, at, corrected_by, slots}]，来自 `## 回答`。"""
     revs, cur = [], None
-    for line in sys_parts.get('回答', '').splitlines():
+    for line in sys_parts.get('回答', '').split('\n'):
         m = REV_HEAD_RE.match(line.strip())
         if m:
             cur = {'rev': int(m.group(1)), 'at': m.group(2), 'corrected_by': int(m.group(3) or 0), 'lines': []}
@@ -254,7 +265,7 @@ def answer_revs(sys_parts):
 
 def draft(sys_parts):
     text = sys_parts.get('草稿回答', '')
-    return {'slots': parse_slots(text), 'note': text.splitlines()[0] if text else ''}
+    return {'slots': parse_slots(text), 'note': text.split('\n')[0] if text else ''}
 
 
 # ---------- 读写 ----------
@@ -374,15 +385,20 @@ def validate(fields, lead):
         errors.append('issue 必须形如 owner/repo#123，或写 none')
     if fields.get('blocking') not in ('yes', 'no'):
         errors.append('blocking 只能是 yes / no')
-    for name in SYSTEM_SECTIONS:
-        if re.search(rf'^##\s+{name}\s*$', lead, re.M):
-            errors.append(f'`## {name}` 由系统写入，正文里不能有')
+    lines = lead.split('\n')
+    infence = fenced(lines)
+    if lines and sum(1 for l in lines if l.lstrip().startswith('```')) % 2:
+        errors.append('代码围栏 ``` 没有闭合')
+    for i, line in enumerate(lines):
+        name = None if infence[i] else _sys_heading(line)
+        if name:
+            errors.append(f'第 {i + 1} 行 `## {name}` 由系统写入，正文里不能有（引用请放进 ``` 代码块）')
     sec = sections(lead)
     for name in LEAD_SECTIONS:
         if not sec.get(name):
             errors.append(f'缺少 `## {name}` 段或内容为空')
     qs = questions(lead)
-    raw_q = [l for l in sec.get('问题', '').splitlines() if l.strip()]
+    raw_q = [l for l in sec.get('问题', '').split('\n') if l.strip()]
     if len(raw_q) != len(qs):
         errors.append('`## 问题` 每行必须是一条 `Qn. ……？`')
     nums = [int(q[1:]) for q, _ in qs]
@@ -402,9 +418,9 @@ def validate(fields, lead):
     ev = sec.get('证据', '')
     if ev and not re.search(r'\S+:\d+|`[^`]+`|https?://|\d', ev):
         warnings.append('证据里看不到 文件:行号、命令、URL 或数字')
-    if len(sec.get('背景', '').splitlines()) > 12:
+    if len(sec.get('背景', '').split('\n')) > 12:
         warnings.append('背景超过 12 行')
-    if len(lead.splitlines()) > 200:
+    if len(lead.split('\n')) > 200:
         warnings.append('全文超过 200 行')
     if not sec.get('答完之后'):
         warnings.append('缺少 `## 答完之后`')
@@ -451,6 +467,7 @@ def publish(fields, lead, identity, supersedes=None):
                 raise QError(400, f'{supersedes} 状态是 {a.get("status")}，只能替换 open / answered 的题')
             if a.get('ws') != fields['ws']:
                 raise QError(400, f'{supersedes} 属于 ws {a.get("ws")}，不能跨 ws 替换')
+            check_owner(a, identity)  # 没有显式交接，替换不能改归属
         if any(m.get('issue') == fields['issue'] != 'none' and m.get('status') == 'open' and i != supersedes
                for i, (m, _) in allq.items()):
             warnings.append(f'issue {fields["issue"]} 下已经有 open 的题')
@@ -492,24 +509,35 @@ def _withdraw(meta, body, reason, superseded_by=''):
     _save(meta, body, f'撤回：{reason}')
 
 
-def withdraw(qid, reason):
+def check_owner(meta, ident):
+    """调用者 (herdr_session, lead_session) 必须等于记录里的值，否则 QError(403)。"""
+    want = (meta.get('herdr_session'), meta.get('lead_session'))
+    got = ((ident or {}).get('herdr_session'), (ident or {}).get('lead_session'))
+    if not all(got) or got != want:
+        raise QError(403, f'{meta.get("id")} 不属于你这个 lead 会话（身份不符）：只有发题的原 lead 能领取、闭环、'
+                          f'撤回、勘误或替换它。如果你是接手的新 lead，请让 Owner 知道')
+
+
+def withdraw(qid, reason, ident):
     if not (reason or '').strip():
         raise QError(400, '必须写 --reason')
     with locked():
         allq = all_questions()
         meta, body = _load_checked(qid, allq)
+        check_owner(meta, ident)
         if meta.get('status') not in ('open', 'answered'):
             raise QError(409, f'{qid} 状态是 {meta.get("status")}，不能撤回')
         _withdraw(meta, body, reason.strip())
 
 
-def erratum(qid, note, drop_qs=()):
+def erratum(qid, note, ident, drop_qs=()):
     """open 状态下补勘误（content_rev + 1），可顺带撤回部分子问题。"""
     if not (note or '').strip():
         raise QError(400, '勘误内容不能为空')
     with locked():
         allq = all_questions()
         meta, body = _load_checked(qid, allq)
+        check_owner(meta, ident)
         if meta.get('status') != 'open':
             raise QError(409, f'{qid} 状态是 {meta.get("status")}：只有 open 的题能补勘误，实质修改请 supersede')
         lead, sp = split_body(body)
@@ -525,7 +553,7 @@ def erratum(qid, note, drop_qs=()):
         rev = geti(meta, 'content_rev') + 1
         meta['content_rev'] = str(rev)
         meta['withdrawn_qs'] = ','.join(sorted(dropped, key=lambda q: int(q[1:])))
-        text = '\n  '.join(note.strip().splitlines())
+        text = '\n  '.join(note.strip().split('\n'))
         extra = f'（撤回子问题 {", ".join(drop_qs)}）' if drop_qs else ''
         sp['勘误'] = (sp.get('勘误', '') + f'\n- {now()}（content_rev {rev}）{extra}{text}').strip('\n')
         _save(meta, join_body(lead, sp), f'勘误 content_rev {rev}{extra}')
@@ -630,16 +658,33 @@ def submit(qid, content_rev, answer_rev, slots):
         return n
 
 
+def _append_error(old, new):
+    """last_error 只保留一行：旧原因在前、新记录在后，超长时截掉最旧的部分。"""
+    text = f'{old}；{new}' if old else new
+    return one_line(text)[-300:]
+
+
 def renotify(qid):
-    """网页「重新通知」：uncertain / 已投未领取 / held 的题重新排队，投递时会重新核对身份。"""
+    """网页「重新通知」：回答 / 更正投递（uncertain、已投未领取、held）或撤回通知（uncertain、held）重新排队。
+    投递时会重新核对身份；原来的失败原因保留在 last_error 和时间线里。"""
     with locked():
         allq = all_questions()
+        if qid in allq and allq[qid][0].get('status') == 'withdrawn':
+            meta, body = allq[qid]
+            if meta.get('withdraw_notice') not in ('uncertain', 'held'):
+                raise QError(409, f'{qid} 的撤回通知当前不需要重新通知（{meta.get("withdraw_notice") or "无"}）')
+            old = meta.get('last_error') or ''
+            meta.update({'withdraw_notice': 'pending', 'next_try_at': now(), 'hold_count': '0',
+                         'last_error': _append_error(old, '重新通知撤回：这条可能已经在 lead 的队列里')})
+            _save(meta, body, f'Owner 点了重新通知撤回（之前：{old or "无记录"}）')
+            return
         meta, body = _load_checked(qid, allq)
         if meta.get('status') != 'answered' or meta.get('delivery') not in ('uncertain', 'sent', 'held'):
             raise QError(409, f'{qid} 当前不需要重新通知（status {meta.get("status")}，delivery {meta.get("delivery")}）')
+        old = meta.get('last_error') or ''
         meta.update({'delivery': 'pending', 'next_try_at': now(), 'hold_count': '0',
-                     'last_error': '重新通知：这条可能已经在 lead 的队列里'})
-        _save(meta, body, f'Owner 点了重新通知（Rev {meta.get("answer_rev")}）')
+                     'last_error': _append_error(old, '重新通知：这条可能已经在 lead 的队列里')})
+        _save(meta, body, f'Owner 点了重新通知（Rev {meta.get("answer_rev")}，之前：{old or "无记录"}）')
 
 
 # ---------- lead 侧：receive / resolve ----------
@@ -649,21 +694,33 @@ def receive(qid, ident):
     with locked():
         allq = all_questions()
         meta, body = _load_checked(qid, allq)
-        if (meta.get('herdr_session'), meta.get('lead_session')) != (ident.get('herdr_session'),
-                                                                     ident.get('lead_session')):
-            raise QError(403, f'{qid} 不是发给你这个会话的（身份不符）：不要消费这条回答。'
-                              f'如果你是接手的新 lead，请让 Owner 知道，由原 lead 处理或另开一题')
+        check_owner(meta, ident)
         n = geti(meta, 'answer_rev')
         if n <= 0:
             raise QError(409, f'{qid} 还没有回答')
         if meta.get('status') not in ('answered', 'resolved'):
             raise QError(409, f'{qid} 状态是 {meta.get("status")}')
+        current_slots(meta, body)  # 回答解析不完整就报错，不标 received
         if meta.get('status') == 'answered' and not (meta.get('delivery') == 'received' and geti(meta, 'received_rev') == n):
             t = now()
             meta.update({'delivery': 'received', 'delivery_rev': str(n), 'received_rev': str(n), 'received_at': t,
                          'pane_id': ident.get('pane_id') or meta.get('pane_id')})
             _save(meta, body, f'lead 领取 Rev {n}')
         return format_for_lead(meta, body)
+
+
+def current_slots(meta, body):
+    """当前 Rev 的回答槽；槽和问题对不上（记录损坏、解析丢槽）时抛 QError(500)，不能当成完整回答。"""
+    lead, sp = split_body(body)
+    n = geti(meta, 'answer_rev')
+    cur = next((r for r in answer_revs(sp) if r['rev'] == n), None)
+    want = {q for q, _ in questions(lead)}
+    got = set((cur or {}).get('slots', {}))
+    if cur is None or got != want:
+        missing = ', '.join(sorted(want - got, key=lambda q: int(q[1:]))) or '无'
+        raise QError(500, f'{meta.get("id")} 的 Rev {n} 回答记录不完整（缺 {missing}），不能领取：'
+                          f'请让 Owner 知道，并运行 doctor')
+    return cur['slots']
 
 
 def format_for_lead(meta, body):
@@ -695,12 +752,13 @@ def format_for_lead(meta, body):
     return '\n'.join(out)
 
 
-def resolve(qid, answer_rev, note):
+def resolve(qid, answer_rev, note, ident):
     if not (note or '').strip():
         raise QError(400, '必须写 --note：决定了什么，记在哪里')
     with locked():
         allq = all_questions()
         meta, body = _load_checked(qid, allq)
+        check_owner(meta, ident)
         n = geti(meta, 'answer_rev')
         if meta.get('status') != 'answered':
             raise QError(409, f'{qid} 状态是 {meta.get("status")}，不能 resolve')
@@ -855,6 +913,18 @@ def socket_exists(session):
     return bool(session) and (socket_root() / session / 'herdr.sock').exists()
 
 
+def _parse_json(text):
+    """整段是 JSON 就用整段，否则取最后一个非空行（前面可能有日志行）；都不是返回 None。"""
+    text = (text or '').strip()
+    for cand in (text, text.split('\n')[-1].strip()):
+        if cand:
+            try:
+                return json.loads(cand)
+            except ValueError:
+                continue
+    return None
+
+
 def herdr(session, *args, timeout=None):
     """{'ok', 'kind', 'code', 'message', 'data'}；kind: ok / no_socket / timeout / bad_output / error / exec_error。"""
     if not socket_exists(session):
@@ -866,9 +936,13 @@ def herdr(session, *args, timeout=None):
         return {'ok': False, 'kind': 'timeout', 'code': 'timeout', 'message': 'herdr 调用超时'}
     except OSError as e:
         return {'ok': False, 'kind': 'exec_error', 'code': 'exec_error', 'message': f'无法执行 herdr：{e}'}
-    try:
-        data = json.loads(res.stdout)
-    except ValueError:
+    data = _parse_json(res.stdout)
+    if not (isinstance(data, dict) and (data.get('error') or res.returncode == 0)):
+        # 真实 herdr 出错时 stdout 为空、错误 JSON 写在 stderr、rc=1
+        alt = _parse_json(res.stderr)
+        if isinstance(alt, dict) and alt.get('error'):
+            data = alt
+    if data is None:
         return {'ok': False, 'kind': 'bad_output', 'code': 'bad_output',
                 'message': f'herdr 输出无法解析（rc={res.returncode}）：{(res.stderr or res.stdout).strip()[:200]}'}
     if isinstance(data, dict) and data.get('error'):
@@ -940,7 +1014,16 @@ def delivery_view(meta, at=None):
     d, n = meta.get('delivery'), geti(meta, 'answer_rev')
     err = meta.get('last_error') or ''
     if meta.get('status') == 'withdrawn':
-        return '已撤回', meta.get('withdraw_reason') or '', False
+        note = meta.get('withdraw_notice') or ''
+        why = meta.get('withdraw_reason') or ''
+        if note in ('uncertain', 'held'):
+            state = '不确定是否送达' if note == 'uncertain' else f'暂缓，下次尝试 {meta.get("next_try_at")}'
+            return '已撤回，撤回通知未送达', f'{why}；撤回通知{state}：{err}', True
+        if note in ('pending', 'sending'):
+            return '已撤回，撤回通知投递中', why, False
+        if note == 'sent':
+            return '已撤回，撤回通知已投进 pane', why, False
+        return '已撤回', why, False
     if d == 'received' and geti(meta, 'received_rev') == n:
         return 'lead 已接收', f'Rev {n}，{meta.get("received_at")}', False
     if d == 'sent':

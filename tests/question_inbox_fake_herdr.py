@@ -5,6 +5,8 @@ State: JSON file at $FAKE_HERDR_STATE, re-read on every call so a test can chang
    "prompt": "ok" | "blocked" | "gone" | "timeout" | "garbage" | "error:<code>",
    "sleep": <seconds for "timeout">}
 Every call is appended to $FAKE_HERDR_LOG as one JSON line (the argv).
+Like the real herdr: success JSON goes to stdout with rc=0; an error leaves stdout empty, writes the error JSON to
+stderr and exits 1 (observed on a real agent_blocked).
 Supports: --session S pane list ; --session S agent prompt <pane> <text>.
 """
 import json
@@ -13,9 +15,14 @@ import sys
 import time
 
 
-def out(obj, rc=0):
+def out(obj):
     print(json.dumps(obj, ensure_ascii=False))
-    sys.exit(rc)
+    sys.exit(0)
+
+
+def fail(code, message, cmd='cli'):
+    print(json.dumps({'error': {'code': code, 'message': message}, 'id': cmd}, ensure_ascii=False), file=sys.stderr)
+    sys.exit(1)
 
 
 def main(argv):
@@ -27,7 +34,7 @@ def main(argv):
     rest = [a for i, a in enumerate(argv) if a != '--session' and (i == 0 or argv[i - 1] != '--session')]
     panes = state.get('panes', {})
     if session not in panes:
-        out({'id': 'cli', 'error': {'code': 'server_not_running', 'message': f'no herdr server for {session}'}}, 1)
+        fail('server_not_running', f'no herdr server for {session}')
     if rest[:2] == ['pane', 'list']:
         out({'id': 'cli:pane:list', 'result': {'panes': panes[session], 'type': 'pane_list'}})
     if rest[:2] == ['agent', 'prompt']:
@@ -40,13 +47,13 @@ def main(argv):
             print('not json at all')
             sys.exit(0)
         if mode == 'gone' or not any(p.get('pane_id') == target for p in panes[session]):
-            out({'error': {'code': 'pane_not_found', 'message': f'pane {target} not found'}, 'id': 'cli:agent:prompt'}, 1)
+            fail('agent_not_found', f'agent {target} not found', 'cli:agent:prompt')
         if mode == 'blocked':
-            out({'error': {'code': 'agent_blocked', 'message': 'agent is blocked'}, 'id': 'cli:agent:prompt'}, 1)
+            fail('agent_blocked', f'agent {target} is blocked and requires interactive input', 'cli:agent:prompt')
         if mode.startswith('error:'):
-            out({'error': {'code': mode[6:], 'message': 'fake error'}, 'id': 'cli:agent:prompt'}, 1)
+            fail(mode[6:], 'fake error', 'cli:agent:prompt')
         out({'id': 'cli:agent:prompt', 'result': {'type': 'agent_prompt', 'pane_id': target}})
-    out({'error': {'code': 'unsupported', 'message': 'fake herdr: unsupported command'}}, 2)
+    fail('unsupported', 'fake herdr: unsupported command')
 
 
 if __name__ == '__main__':

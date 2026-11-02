@@ -3,10 +3,12 @@
 Covers the acceptance scenarios 1, 2, 4, 5, 6, 7, 8 of the spec (3 and 9 need a real herdr / launchd).
 Fictional data only: ws `demo`, herdr session `demo`, lead sessions `lead-a` / `lead-b`.
 """
+import fcntl
 import http.client
 import importlib.util
 import json
 import os
+import plistlib
 import re
 import shutil
 import signal
@@ -106,7 +108,7 @@ class Base(unittest.TestCase):
 
     # ----- CLI -----
     def q(self, *args, env=None, cwd=None):
-        return subprocess.run([sys.executable, str(QI / 'q.py'), *args], capture_output=True, text=True,
+        return subprocess.run([sys.executable, str(QI / 'q.py'), *args], capture_output=True, text=True, encoding='utf-8',
                               env={**os.environ, **(env or {})}, cwd=cwd or str(self.tmp / 'ws' / 'demo' / 'sub'),
                               timeout=60)
 
@@ -505,6 +507,471 @@ class DeliveryTest(Base):
         self.assertEqual(code, 200)
         self.wait_for(lambda: self.meta(qid)['delivery'] == 'sent', msg='sent after renotify')
         self.assertEqual(len(self.herdr_calls()), calls + 1)
+
+
+SEPARATORS = {'U+2028': ' ', 'U+2029': ' ', 'U+0085': '\u0085'}
+
+
+class HerdrResultTest(Base):
+    """A：真实 herdr 出错时 stdout 为空、错误 JSON 在 stderr、rc=1；假 herdr 按同样方式输出。"""
+
+    def answered(self):
+        qid = self.ask()
+        qstore.submit(qid, 1, 0, self.answer_all(qid))
+        return qid
+
+    def test_error_json_on_stderr_is_structured(self):
+        self.set_herdr(panes={'demo': [pane()]}, prompt='blocked')
+        r = qstore.herdr('demo', 'agent', 'prompt', 'w1:p1', 'x')
+        self.assertEqual((r['kind'], r['code']), ('error', 'agent_blocked'))
+        r = qstore.herdr('demo', 'agent', 'prompt', 'w9:p9', 'x')
+        self.assertEqual((r['kind'], r['code']), ('error', 'agent_not_found'))
+        self.set_herdr(panes={})
+        r = qstore.pane_list('demo')
+        self.assertEqual((r['kind'], r['code']), ('error', 'server_not_running'))
+
+    def test_blocked_on_stderr_is_held_not_uncertain(self):
+        qid = self.answered()
+        self.set_herdr(panes={'demo': [pane()]}, prompt='blocked')
+        server.scan_once()
+        m = self.meta(qid)
+        self.assertEqual(m['delivery'], 'held')
+        self.assertIn('agent_blocked', m['last_error'])
+
+    def test_agent_not_found_is_held(self):
+        qid = self.answered()
+        self.set_herdr(panes={'demo': [pane()]}, prompt='gone')
+        server.scan_once()
+        self.assertEqual(self.meta(qid)['delivery'], 'held')
+        self.assertIn('agent_not_found', self.meta(qid)['last_error'])
+
+    def test_unknown_error_code_stays_uncertain(self):
+        qid = self.answered()
+        self.set_herdr(panes={'demo': [pane()]}, prompt='error:something_new')
+        server.scan_once()
+        self.assertEqual(self.meta(qid)['delivery'], 'uncertain')
+
+
+class UncertainExitTest(Base):
+    """B：每种 uncertain（回答、更正、撤回通知，含 repair 改出来的）都能在页面上看到并「重新通知」。"""
+
+    def delivered(self):
+        qid = self.ask()
+        qstore.submit(qid, 1, 0, self.answer_all(qid))
+        server.scan_once()
+        self.assertEqual(self.meta(qid)['delivery'], 'sent')
+        return qid
+
+    def test_withdraw_notice_uncertain_can_be_renotified(self):
+        qid = self.delivered()
+        self.set_herdr(panes={'demo': [pane()]}, prompt='garbage')
+        self.assertEqual(self.q('withdraw', qid, '--reason', '需求取消').returncode, 0)
+        server.scan_once()
+        m = self.meta(qid)
+        self.assertEqual(m['withdraw_notice'], 'uncertain')
+        d = server.detail_view(qid)
+        self.assertTrue(d['renotify'])
+        self.assertIn('撤回通知', d['delivery'])
+        calls = len(self.herdr_calls())
+        server.scan_once()
+        self.assertEqual(len(self.herdr_calls()), calls)  # 不自动重发
+        old_error = m['last_error']
+        qstore.renotify(qid)
+        m = self.meta(qid)
+        self.assertEqual(m['withdraw_notice'], 'pending')
+        self.assertIn(old_error, m['last_error'])  # N3：原失败原因还在
+        self.set_herdr(panes={'demo': [pane()]}, prompt='ok')
+        server.scan_once()
+        self.assertEqual(self.meta(qid)['withdraw_notice'], 'sent')
+        self.assertIn('已撤回', self.herdr_calls()[-1][-1])
+        self.assertFalse(server.detail_view(qid)['renotify'])
+
+    def test_repaired_withdraw_notice_can_be_renotified(self):
+        qid = self.delivered()
+        self.assertEqual(self.q('withdraw', qid, '--reason', '需求取消').returncode, 0)
+        claimed = qstore.claim([(qid, 'withdraw', 1)])  # 停在 sending 时服务被杀
+        self.assertEqual(len(claimed), 1)
+        qstore.repair()
+        self.assertEqual(self.meta(qid)['withdraw_notice'], 'uncertain')
+        self.assertTrue(qstore.delivery_view(self.meta(qid))[2])
+        qstore.renotify(qid)
+        server.scan_once()
+        self.assertEqual(self.meta(qid)['withdraw_notice'], 'sent')
+
+    def test_correction_uncertain_can_be_renotified(self):
+        qid = self.delivered()
+        qstore.submit(qid, 1, 1, {'Q1': {'type': 'defer'}, 'Q2': {'type': 'defer'}})
+        self.set_herdr(panes={'demo': [pane()]}, prompt='garbage')
+        server.scan_once()
+        m = self.meta(qid)
+        self.assertEqual((m['delivery'], m['delivery_kind']), ('uncertain', 'correction'))
+        self.assertTrue(server.detail_view(qid)['renotify'])
+        qstore.renotify(qid)
+        self.set_herdr(panes={'demo': [pane()]}, prompt='ok')
+        server.scan_once()
+        self.assertEqual(self.meta(qid)['delivery'], 'sent')
+        self.assertIn('更正', self.herdr_calls()[-1][-1])
+
+    def test_renotify_keeps_previous_error(self):
+        qid = self.delivered()
+        self.set_herdr(panes={'demo': [pane()]}, prompt='garbage')
+        qstore.renotify(qid)  # sent → pending
+        server.scan_once()
+        before = self.meta(qid)['last_error']
+        self.assertIn('bad_output', before)
+        qstore.renotify(qid)
+        after = self.meta(qid)['last_error']
+        self.assertTrue(after.startswith(before[:20]), after)
+        self.assertIn('重新通知', after)
+        self.assertIn('bad_output', '\n'.join(server.detail_view(qid)['timeline']))
+
+
+class OwnershipTest(Base):
+    """D：resolve / withdraw / erratum / ask --supersedes 只有原 lead 能做；不符时退出码 4、什么都不改。"""
+
+    def setUp(self):
+        super().setUp()
+        self.set_herdr(panes={'demo': [pane('w1:p1', 'lead-a'), pane('w1:p2', 'lead-b')]})
+        self.b_env = {'HERDR_PANE_ID': 'w1:p2'}
+        self.no_herdr = {'HERDR_SESSION': '', 'HERDR_PANE_ID': ''}
+
+    def snapshot(self):
+        return {p.name: p.read_bytes() for p in (self.tmp / 'inbox').glob('*.md')}
+
+    def denied(self, *args, env):
+        before = self.snapshot()
+        r = self.q(*args, env=env)
+        self.assertEqual(r.returncode, 4, (args, r.stdout, r.stderr))
+        self.assertEqual(self.snapshot(), before, args)
+
+    def test_other_lead_and_non_herdr_are_refused(self):
+        qid = self.ask()
+        f = self.tmp / 'b.md'
+        f.write_text(body())
+        for env in (self.b_env, self.no_herdr):
+            self.denied('erratum', qid, '--note', 'x', '--drop', 'Q1', env=env)
+            self.denied('withdraw', qid, '--reason', 'x', env=env)
+            self.denied('ask', '--body', str(f), '--title', 't', '--issue', 'none', '--blocking', 'no',
+                        '--supersedes', qid, env=env)
+        qstore.submit(qid, 1, 0, self.answer_all(qid))
+        self.assertEqual(self.q('receive', qid).returncode, 0)
+        for env in (self.b_env, self.no_herdr):
+            self.denied('receive', qid, env=env)
+            self.denied('resolve', qid, '--answer-rev', '1', '--note', 'x', env=env)
+        # 存储层同样拒绝
+        ident_b = qstore.identify('demo', 'w1:p2')
+        for call in (lambda: qstore.resolve(qid, 1, 'x', ident_b), lambda: qstore.withdraw(qid, 'x', ident_b),
+                     lambda: qstore.resolve(qid, 1, 'x', {}), lambda: qstore.withdraw(qid, 'x', None)):
+            with self.assertRaises(qstore.QError) as e:
+                call()
+            self.assertEqual(e.exception.code, 403)
+        m = self.meta(qid)
+        self.assertEqual((m['status'], m['lead_session']), ('answered', 'lead-a'))
+        # 原 lead 照常可以
+        self.assertEqual(self.q('resolve', qid, '--answer-rev', '1', '--note', '记到 Issue').returncode, 0)
+
+    def test_original_lead_can_erratum_withdraw_and_supersede(self):
+        a, b = self.ask(), self.ask()
+        self.assertEqual(self.q('erratum', a, '--note', '行号更正').returncode, 0)
+        self.assertEqual(self.q('withdraw', b, '--reason', '不需要了').returncode, 0)
+        c = self.ask(extra=('--supersedes', a))
+        self.assertEqual(self.meta(c)['lead_session'], 'lead-a')
+        self.assertEqual(self.meta(a)['superseded_by'], c)
+
+
+class SeparatorRoundTripTest(Base):
+    """E：U+2028 / U+2029 / U+0085 在草稿、提交、网页读取、receive 四条路径上逐字往返。"""
+
+    def setUp(self):
+        super().setUp()
+        self.start_server()
+
+    def test_round_trip(self):
+        for name, ch in SEPARATORS.items():
+            with self.subTest(name):
+                qid = self.ask()
+                text = f'保持现状{ch}不要删除{ch}'
+                slots = {'Q1': {'type': 'free', 'text': text}, 'Q2': {'type': 'option', 'choice': 'A. 方案甲（后果：快）',
+                                                                    'text': f'补充{ch}说明'}}
+                code, _, _ = self.http('POST', f'/api/q/{qid}/save', {'content_rev': 1, 'slots': slots})
+                self.assertEqual(code, 200)
+                _, d, _ = self.http('GET', f'/api/q/{qid}')
+                self.assertEqual(d['draft']['slots'], slots)
+                code, _, _ = self.http('POST', f'/api/q/{qid}/submit', {'content_rev': 1, 'answer_rev': 0, 'slots': slots})
+                self.assertEqual(code, 200)
+                _, d, _ = self.http('GET', f'/api/q/{qid}')
+                self.assertEqual(d['revs'][0]['slots'], slots)
+                r = self.q('receive', qid)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertIn(text, r.stdout)
+                self.assertIn(f'补充{ch}说明', r.stdout)
+                self.assertEqual(self.meta(qid)['delivery'], 'received')
+        self.assertEqual(self.q('doctor').returncode, 0)
+
+    def test_incomplete_answer_record_is_not_received(self):
+        qid = self.ask()
+        qstore.submit(qid, 1, 0, self.answer_all(qid))
+        path = self.tmp / 'inbox' / f'{qid}.md'
+        broken = re.sub(r'^- Q2 \[option\] .*$', '- Q2 [option] {"type": "opt', path.read_text(encoding='utf-8'),
+                        flags=re.M)
+        path.write_text(broken, encoding='utf-8')
+        r = self.q('receive', qid)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('不完整', r.stderr)
+        self.assertNotIn('方案乙', r.stdout)
+        self.assertNotEqual(self.meta(qid)['delivery'], 'received')
+        self.assertEqual(self.q('resolve', qid, '--answer-rev', '1', '--note', 'x').returncode, 3)
+        self.assertIn('不完整', self.q('doctor').stdout)
+
+
+class DocAndSmallFixTest(Base):
+    """G：SKILL.md 命令能照抄执行；链接跟随 QI_PORT；doctor 对进行中的 sending；系统段标题的围栏识别。"""
+
+    def skill_blocks(self):
+        return re.findall(r'```bash\n(.*?)```', (QI / 'SKILL.md').read_text(encoding='utf-8'), re.S)
+
+    def fake_home(self):
+        home = self.tmp / 'home'
+        (home / '.claude' / 'skills').mkdir(parents=True)
+        (home / '.claude' / 'skills' / 'question-inbox').symlink_to(QI)
+        (home / 'Library' / 'LaunchAgents').mkdir(parents=True)
+        return home
+
+    def test_skill_q_alias_runs_verbatim(self):
+        home = self.fake_home()
+        line = next(l for b in self.skill_blocks() for l in b.split('\n') if l.startswith('Q='))
+        r = subprocess.run(['bash', '-c', f'{line}\n$Q status --all'], capture_output=True, text=True,
+                           encoding='utf-8', env={**os.environ, 'HOME': str(home)}, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('等 Owner 回答', r.stdout)
+
+    def test_skill_install_block_renders_plist(self):
+        home = self.fake_home()
+        block = next(b for b in self.skill_blocks() if 'plist.template' in b)
+        script = '\n'.join(l for l in block.split('\n') if not l.startswith('launchctl'))
+        r = subprocess.run(['bash', '-c', script], capture_output=True, text=True,
+                           env={**os.environ, 'HOME': str(home)}, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(home / 'Library' / 'LaunchAgents' / 'local.question-inbox.plist', 'rb') as f:
+            pl = plistlib.load(f)
+        self.assertEqual(pl['Label'], 'local.question-inbox')
+        self.assertTrue(pl['ProgramArguments'][1].endswith('question-inbox/server.py'))
+        self.assertTrue(Path(pl['ProgramArguments'][1]).is_file())
+        self.assertTrue(pl['StandardErrorPath'].startswith(str(home)))
+
+    def test_ask_link_follows_qi_port(self):
+        f = self.tmp / 'q.md'
+        f.write_text(body())
+        r = self.q('ask', '--body', str(f), '--title', 't', '--issue', 'none', '--blocking', 'no')
+        self.assertIn(f'http://127.0.0.1:{self.port}/#demo-0001', r.stdout)
+        self.assertNotEqual(self.port, 7788)
+
+    def test_doctor_sending_only_flagged_when_server_not_running(self):
+        qid = self.ask()
+        qstore.submit(qid, 1, 0, self.answer_all(qid))
+        self.assertEqual(len(qstore.claim([(qid, 'answer', 1)])), 1)
+        r = self.q('doctor')
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('sending', r.stdout)
+        sd = self.tmp / 'state'
+        sd.mkdir(parents=True, exist_ok=True)
+        with open(sd / 'server.lock', 'a') as lock:  # 服务在跑：sending 是进行中的正常状态
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            r = self.q('doctor')
+            fcntl.flock(lock, fcntl.LOCK_UN)
+        self.assertEqual(r.returncode, 0, r.stdout)
+
+    def test_system_heading_inside_fence_is_allowed(self):
+        quoted = body(evidence='上次的输出：\n\n```\n## 回答\n\n### Rev 1 · x\n## 时间线\n```\n\n`demo/app.py:3`')
+        qid = self.ask(quoted)
+        self.assertIsInstance(qid, str, getattr(qid, 'stderr', ''))
+        qstore.submit(qid, 1, 0, self.answer_all(qid))
+        lead, sp = qstore.split_body(qstore.read(qid)[1])
+        self.assertIn('## 回答', lead)  # 引用留在正文里
+        self.assertEqual(len(qstore.answer_revs(sp)), 1)
+        r = self.q('receive', qid)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = self.ask(body(evidence='```\n## 回答\n'))  # 围栏没闭合
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('没有闭合', r.stderr)
+        r = self.ask(body() + '\n## 回答\n\n伪造\n')
+        self.assertEqual(r.returncode, 1)
+
+
+# ---------- C / F：用 node 执行 server.PAGE 里的真实前端函数（DOM 与网络换成最小替身） ----------
+
+PAGE_HARNESS = r"""
+const vm = require('vm');
+const fs = require('fs');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const scenario = process.argv[3];
+
+class Elem {
+  constructor(tag) { this.tag = tag; this.children = []; this.attrs = {}; }
+  setAttribute(k, v) { this.attrs[k] = v; }
+  addEventListener() {}
+  append(...k) { this.children.push(...k); }
+  replaceChildren(...k) { this.children = k; }
+  after() {}
+  set innerHTML(v) { this._html = v; }
+}
+const form = {values: {}, checked: {}, texts: {}};
+function radio(q, v) {
+  if (!(form.values[q] || []).includes(v)) return null;
+  return {value: v,
+    get checked() { return form.checked[q] === v; },
+    set checked(b) { if (b) form.checked[q] = v; else if (form.checked[q] === v) delete form.checked[q]; }};
+}
+const document = {
+  title: '',
+  createElement: t => new Elem(t),
+  createTextNode: t => ({text: t}),
+  querySelector(sel) {
+    if (sel === 'meta[name=qi-token]') return {content: 'tok'};
+    let m = sel.match(/^input\[name="t_(Q\d+)"\]:checked$/);
+    if (m) { const v = form.checked[m[1]]; return v ? radio(m[1], v) : null; }
+    m = sel.match(/^input\[name="t_(Q\d+)"\]\[value="([^"]+)"\]$/);
+    if (m) return radio(m[1], m[2]);
+    throw new Error('unexpected selector ' + sel);
+  },
+  getElementById(id) {
+    const m = id.match(/^x_(Q\d+)$/);
+    if (m) return (m[1] in form.texts) ? {get value() { return form.texts[m[1]]; }, set value(v) { form.texts[m[1]] = v; }} : null;
+    return id === 'msg' ? null : new Elem('div');
+  },
+};
+const requests = [];
+function fetch(path, opt) { return new Promise(resolve => requests.push({path, opt: opt || {}, resolve})); }
+function reply(req, status, body) { req.resolve({status, json: async () => body}); }
+const flush = async () => { for (let i = 0; i < 20; i++) await new Promise(r => setImmediate(r)); };
+const rendered = [];
+const ctx = {document, window: {addEventListener() {}}, location: {hash: ''}, fetch, setInterval() {}, Node: Elem,
+  console, __rendered: rendered,
+  __buildForm(d) {
+    form.values = {}; form.checked = {}; form.texts = {};
+    for (const q of d.questions) {
+      form.values[q.q] = [...q.options.map((o, i) => 'opt:' + i), 'free', 'need_context', 'defer'].concat(q.suggestion ? ['suggested'] : []);
+      form.texts[q.q] = '';
+    }
+  }};
+vm.createContext(ctx);
+const run = code => vm.runInContext(code, ctx);
+const LIST = {open_count: 0, groups: {todo: [], waiting: [], received: [], closed: []}};
+function mkDetail(id, n) {
+  const questions = [];
+  for (let i = 1; i <= (n || 2); i++) questions.push({q: 'Q' + i, text: '问题 ' + i, options: ['A. 甲', 'B. 乙'], suggestion: 'B —— 理由', withdrawn: false});
+  return {id, title: id, status: 'open', content_rev: 1, answer_rev: 0, editable: true, questions, draft: {slots: {}, note: ''},
+    revs: [], timeline: [], warnings: [], body_html: '', errata_html: '', delivery: '', renotify: false};
+}
+const pending = path => requests.filter(r => r.path === path && !r.done);
+function answer(path, status, body) { const r = pending(path)[0]; r.done = true; reply(r, status, body); }
+const posts = () => requests.filter(r => r.opt.method === 'POST').map(r => ({path: r.path, body: JSON.parse(r.opt.body)}));
+
+(async () => {
+  const out = {};
+  ctx.location.hash = '#demo-0001';
+  run(src);
+  run('render = function () { __rendered.push(detail.id); __buildForm(detail); }');
+  if (scenario === 'late-get') {
+    ctx.location.hash = '#demo-0002'; run('route()');
+    answer('/api/q/demo-0002', 200, mkDetail('demo-0002')); await flush();
+    answer('/api/q/demo-0001', 200, mkDetail('demo-0001')); await flush();
+    out.cur = run('cur'); out.displayed = run('detail && detail.id'); out.rendered = rendered.slice();
+    form.texts.Q1 = '只回答 B'; form.checked.Q2 = 'defer';
+    run('post(detail, "submit", {content_rev: detail.content_rev, answer_rev: detail.answer_rev, slots: slotsFromForm(detail)})');
+    await flush();
+    out.posts = posts();
+  } else if (scenario === 'stale-closure') {
+    answer('/api/q/demo-0001', 200, mkDetail('demo-0001')); await flush();
+    run('__oldA = detail');
+    ctx.location.hash = '#demo-0002'; run('route()');
+    answer('/api/q/demo-0002', 200, mkDetail('demo-0002')); await flush();
+    out.result = await run('post(__oldA, "submit", {content_rev: 1, answer_rev: 0, slots: {Q1: {type: "free", text: "A 的答案"}}})');
+    out.posts = posts(); out.displayed = run('detail.id'); out.msg = run('msg && msg.text');
+  } else if (scenario === 'post-after-switch') {
+    answer('/api/q/demo-0001', 200, mkDetail('demo-0001')); await flush();
+    form.texts.Q1 = 'A 的草稿'; run('markDirty()');
+    run('post(detail, "save", {content_rev: 1, slots: slotsFromForm(detail)})');
+    await flush();
+    ctx.location.hash = '#demo-0002'; run('route()');
+    answer('/api/q/demo-0002', 200, mkDetail('demo-0002')); await flush();
+    form.texts.Q1 = 'B 正在写'; run('markDirty()');
+    const before = requests.length;
+    answer('/api/q/demo-0001/save', 200, {ok: true}); await flush();
+    out.dirty = run('dirty'); out.displayed = run('detail.id'); out.text = form.texts.Q1;
+    out.newGets = requests.slice(before).filter(r => r.path.startsWith('/api/q/')).map(r => r.path);
+    out.rendered = rendered.slice();
+  } else if (scenario === 'suggest') {
+    answer('/api/q/demo-0001', 200, mkDetail('demo-0001', 4)); await flush();
+    form.texts.Q1 = '不要删除这个配置';
+    form.checked.Q2 = 'opt:0';
+    form.checked.Q4 = 'defer'; form.texts.Q4 = '下周再说';
+    out.before = run('slotsFromForm(detail)');
+    out.filled = run('fillSuggested(detail)');
+    out.after = run('slotsFromForm(detail)');
+    out.posts = posts();
+    out.stale = run('fillForm(detail, {Q1: {type: "option", choice: "Z. 已被勘误删掉", text: "保留原话"}, Q2: {type: "option", choice: "B. 乙"}})');
+    out.q1 = {checked: form.checked.Q1 || null, text: form.texts.Q1}; out.q2 = form.checked.Q2;
+  }
+  for (const r of requests) if (r.path === '/api/list' && !r.done) { r.done = true; reply(r, 200, LIST); }
+  await flush();
+  process.stdout.write(JSON.stringify(out));
+})().catch(e => { console.error(e.stack); process.exit(2); });
+"""
+
+
+@unittest.skipUnless(shutil.which('node'), 'node not installed')
+class PageScriptTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix='qi-page-'))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        page = server.PAGE
+        start = page.index('>', page.index('<script nonce')) + 1
+        (self.tmp / 'page.js').write_text(page[start:page.index('</script>')], encoding='utf-8')
+        (self.tmp / 'harness.js').write_text(PAGE_HARNESS, encoding='utf-8')
+
+    def run_page(self, scenario):
+        r = subprocess.run([shutil.which('node'), str(self.tmp / 'harness.js'), str(self.tmp / 'page.js'), scenario],
+                           capture_output=True, text=True, encoding='utf-8', timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout)
+
+    def test_late_response_for_previous_question_is_ignored(self):
+        out = self.run_page('late-get')
+        self.assertEqual((out['cur'], out['displayed']), ('demo-0002', 'demo-0002'))
+        self.assertNotIn('demo-0001', out['rendered'])
+        self.assertEqual(len(out['posts']), 1)
+        self.assertEqual(out['posts'][0]['path'], '/api/q/demo-0002/submit')
+        self.assertEqual(out['posts'][0]['body']['slots']['Q1'], {'type': 'free', 'text': '只回答 B'})
+
+    def test_old_view_cannot_submit_to_current_route(self):
+        out = self.run_page('stale-closure')
+        self.assertFalse(out['result'])
+        self.assertEqual(out['posts'], [])
+        self.assertEqual(out['displayed'], 'demo-0002')
+        self.assertIn('没有发出', out['msg'])
+
+    def test_post_completing_after_switch_keeps_new_input(self):
+        out = self.run_page('post-after-switch')
+        self.assertTrue(out['dirty'])
+        self.assertEqual(out['displayed'], 'demo-0002')
+        self.assertEqual(out['text'], 'B 正在写')
+        self.assertEqual(out['newGets'], [])
+        self.assertEqual(out['rendered'][-1], 'demo-0002')
+
+    def test_fill_suggested_only_fills_empty_slots(self):
+        out = self.run_page('suggest')
+        self.assertEqual(out['before']['Q1'], {'type': 'free', 'text': '不要删除这个配置'})
+        self.assertEqual(out['filled'], 1)
+        self.assertEqual(out['after']['Q1'], out['before']['Q1'])
+        self.assertEqual(out['after']['Q2'], {'type': 'option', 'choice': 'A. 甲', 'text': ''})
+        self.assertEqual(out['after']['Q3'], {'type': 'suggested', 'text': ''})
+        self.assertEqual(out['after']['Q4'], {'type': 'defer', 'text': '下周再说'})
+        self.assertEqual(out['posts'], [])  # 按钮本身不提交
+        self.assertEqual(len(out['stale']), 1)  # N2：失效的选项有提示，原话保留
+        self.assertIn('Q1', out['stale'][0])
+        self.assertEqual(out['q1'], {'checked': None, 'text': '保留原话'})
+        self.assertEqual(out['q2'], 'opt:1')
 
 
 if __name__ == '__main__':

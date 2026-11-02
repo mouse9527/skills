@@ -10,10 +10,11 @@ description: 问题收件箱：lead 需要 Owner 拍板时，用 q.py ask 把问
 **没答就没有授权**：空着、沉默、`blocking`、超时都不是同意；`需要更多上下文`、`暂不决定` 也不是。
 
 ```bash
-Q="python3 ~/.claude/skills/question-inbox/q.py"   # 下文都用 $Q
+Q="python3 $HOME/.claude/skills/question-inbox/q.py"   # 下文都用 $Q（双引号里 ~ 不展开，所以写 $HOME）
 ```
 
-第一版只支持 herdr 里 `agent == claude` 的 lead。所有命令都要在 lead 自己的 pane 里执行（靠 `$HERDR_SESSION` / `$HERDR_PANE_ID` 核对身份）。
+第一版只支持 herdr 里 `agent == claude` 的 lead。所有命令都要在 lead 自己的 pane 里执行（靠 `$HERDR_SESSION` / `$HERDR_PANE_ID` 核对身份）；
+`receive`、`resolve`、`withdraw`、`erratum`、`ask --supersedes` 只有发题的原 lead 能做，别的会话执行一律退出码 4、什么都不改。
 `~/workspaces/_questions/*.md` **只读**：不要用编辑器或 Edit 改，一切写入走 `$Q`。
 
 ## 1. 什么时候问
@@ -56,7 +57,7 @@ Q2: A —— 理由
 
 - 每个 Qn 在 `## 选项`（`### Qn` 下的列表项就是网页上的选项）和 `## 建议`（`Qn: 建议 —— 理由`）里都要有。
 - 不写「上一条消息 / 见上文 / 如上所述 / 同上 / 前面说的 / 上面提到」。`blocking: yes` 时证据不能空。
-- 不写 `## 勘误`、`## 草稿回答`、`## 回答`、`## 时间线`：这些由系统写。
+- 不写 `## 勘误`、`## 草稿回答`、`## 回答`、`## 时间线` 标题：这些由系统写；要引用就放进 ``` 代码块，代码块要闭合。
 
 ```bash
 $Q ask --body /tmp/q.md --title "接口失败是否重试" --issue owner/repo#123 --blocking yes   # 无 Issue 写 none
@@ -75,6 +76,7 @@ $Q resolve demo-0001 --answer-rev 2 --note "决定了什么，记在哪里"
 ```
 
 - `receive` 报**身份不符**（退出码 4）：这条不是发给你这个会话的，不要消费，告诉 Owner。
+- 报**回答记录不完整**（退出码 1）：不要按部分答案做，告诉 Owner，并跑 `$Q doctor`。
 - 报**已撤回 / 已被替换**（退出码 3）：不要执行旧答案。
 - 输出里写「以 Rev N 为准」：Owner 更正过，只按最新 Rev 做；`resolve` 的 `--answer-rev` 必须是 receive 过的最新版本，否则被拒，先重新 `receive`。
 - `need_context`：补上下文后另开一题（或 supersede）；`defer`：这次不做，记下来。都不是授权。
@@ -92,18 +94,18 @@ $Q resolve demo-0001 --answer-rev 2 --note "决定了什么，记在哪里"
 ## 5. 服务（网页 + 投递）
 
 `server.py` 是常驻服务：绑定 `127.0.0.1:7788`，每 5 秒扫一次已答的题，找到 `agent_session` 与发题时相同的那个 claude pane 才发
-（`herdr agent prompt`，不加 `--wait`）；找不到、blocked 就暂缓并退避重试，超时或结果不明就标「不确定」，等 Owner 在网页上点「重新通知」。
+（`herdr agent prompt`，不加 `--wait`）；找不到、blocked 就暂缓并退避重试，超时或结果不明就标「不确定」，等 Owner 在网页上点「重新通知」（回答、更正和撤回通知都有这个按钮）。
 服务从不 `agent start`、`--resume`、send-keys，也不改投别的 lead。
 
 安装（用户级 LaunchAgent，一次性，由 Owner 或 lead 手动执行；未在 CI 验证）：
 
 ```bash
-D=~/.claude/skills/question-inbox
-mkdir -p ~/.local/state/question-inbox
+D="$HOME/.claude/skills/question-inbox"
+mkdir -p "$HOME/.local/state/question-inbox"
 sed -e "s#__PYTHON__#$(command -v python3)#" -e "s#__SERVER__#$D/server.py#" \
     -e "s#__HERDR__#$(command -v herdr)#" -e "s#__HOME__#$HOME#g" \
-    "$D/local.question-inbox.plist.template" > ~/Library/LaunchAgents/local.question-inbox.plist
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.question-inbox.plist
+    "$D/local.question-inbox.plist.template" > "$HOME/Library/LaunchAgents/local.question-inbox.plist"
+launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/local.question-inbox.plist"
 ```
 
 日志、token 在 `~/.local/state/question-inbox/`；日志只记 id、状态和错误摘要。
