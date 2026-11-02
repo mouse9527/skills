@@ -38,6 +38,11 @@ def prompt_text(kind, metas):
     args = ' '.join(m['id'] for m in metas)
     if kind == 'withdraw':
         m = metas[0]
+        if qstore.closed_by_owner(m):
+            why = m.get('resolution') if m.get('status') == 'resolved' else m.get('withdraw_reason')
+            return (f'[question-inbox] Owner 已在页面上关闭问题 {m["id"]}（{why}）。这条消息本身不是新的授权。\n'
+                    f'不用再 receive / resolve 它；如果还没按之前的回答执行，先停下，有需要另开一题问 Owner。\n'
+                    f'需要时执行：python3 {q_cmd()} show {m["id"]}')
         return (f'[question-inbox] 问题 {m["id"]} 已撤回（{m.get("withdraw_reason") or "未写原因"}），'
                 f'之前投递给你的回答不要再执行。这条消息本身不是新的授权。\n'
                 f'需要时执行：python3 {q_cmd()} show {m["id"]}')
@@ -174,7 +179,9 @@ def summary(meta, allq):
     return {'id': meta['id'], 'title': meta.get('title'), 'ws': meta.get('ws'), 'blocking': meta.get('blocking'),
             'status': meta.get('status'), 'created': meta.get('created'), 'updated': meta.get('updated'),
             'answer_rev': qstore.geti(meta, 'answer_rev'), 'delivery': label, 'delivery_detail': why,
-            'renotify': renot, 'invalid': qstore.invalid_reason(meta, allq)}
+            'renotify': renot, 'invalid': qstore.invalid_reason(meta, allq),
+            'closed_by': ('owner' if qstore.closed_by_owner(meta) else
+                          'lead' if meta.get('status') in ('resolved', 'withdrawn') else '')}
 
 
 def list_view():
@@ -215,6 +222,7 @@ def detail_view(qid):
         'warnings': [w for w in (meta.get('warnings') or '').split(' | ') if w],
         'received': meta.get('delivery') == 'received' and qstore.geti(meta, 'received_rev') == n and n > 0,
         'editable': not invalid and meta.get('status') in ('open', 'answered'),
+        'closable': not invalid and meta.get('status') in ('open', 'answered'),
         'not_executed': (f'这条回答不会被执行，原因：{invalid}' if invalid and n > 0 else ''),
         'resolution': meta.get('resolution') if meta.get('status') == 'resolved' else '',
         'body_html': md(lead), 'errata_html': md(sp.get('勘误', '')),
@@ -297,7 +305,7 @@ class Handler(BaseHTTPRequestHandler):
         if bad:
             log.warning('rejected write %s: %s', self.path, bad)
             return self.send(403, {'error': bad})
-        m = re.fullmatch(r'/api/q/([A-Za-z0-9_.-]+)/(save|submit|renotify)', self.path)
+        m = re.fullmatch(r'/api/q/([A-Za-z0-9_.-]+)/(save|submit|renotify|close)', self.path)
         if not m:
             return self.send(404, {'error': 'not found'})
         try:
@@ -318,6 +326,10 @@ class Handler(BaseHTTPRequestHandler):
                 n = qstore.submit(qid, int(req.get('content_rev', -1)), int(req.get('answer_rev', -1)),
                                   req.get('slots') or {})
                 res = {'ok': True, 'answer_rev': n}
+            elif action == 'close':
+                st = qstore.owner_close(qid, int(req.get('content_rev', -1)), int(req.get('answer_rev', -1)),
+                                        req.get('reason') if isinstance(req.get('reason'), str) else '')
+                res = {'ok': True, 'status': st, 'note': '已由你关闭' + ('（等于撤回）' if st == 'withdrawn' else '')}
             else:
                 qstore.renotify(qid)
                 res = {'ok': True, 'note': '已重新排队；这条可能已经在 lead 的队列里'}
@@ -448,7 +460,8 @@ async function refreshList() {
   for (const [g, title] of Object.entries(names)) {
     side.append(el('h2', {class: 'g'}, `${title}（${j.groups[g].length}）`));
     for (const s of j.groups[g]) {
-      const sub = g === 'todo' ? s.created : (s.invalid || s.delivery || s.status);
+      const closedAs = s.closed_by === 'owner' ? 'Owner 关闭' : (s.status === 'resolved' ? 'lead 闭环' : (s.invalid || '已撤回'));
+      const sub = g === 'todo' ? s.created : g === 'closed' ? closedAs + (s.renotify ? ' · ' + s.delivery : '') : (s.invalid || s.delivery || s.status);
       side.append(el('a', {class: 'item' + (s.id === cur ? ' cur' : ''), href: '#' + s.id},
         s.blocking === 'yes' && g === 'todo' ? el('span', {class: 'tag b'}, 'blocking') : null,
         s.id, ' · ', s.title, el('small', {}, sub || '')));
@@ -538,14 +551,14 @@ function render() {
   if (d.invalid) main.append(el('div', {class: 'bar bad'}, `已失效：${d.invalid}`));
   if (d.not_executed) main.append(el('div', {class: 'bar bad'}, d.not_executed));
   for (const w of d.warnings) main.append(el('div', {class: 'bar warn'}, '提示：' + w));
-  const notice = d.status === 'withdrawn' && d.delivery && d.delivery !== '已撤回';
+  const notice = (d.status === 'withdrawn' || d.closed_by === 'owner') && d.delivery && !['已撤回', 'Owner 已关闭'].includes(d.delivery);
   if (d.status === 'answered' || d.status === 'resolved' || notice) {
     const st = d.received ? 'lead 已接收' : (d.delivery || '');
     main.append(el('div', {class: 'bar ' + (d.received ? 'ok' : (d.renotify ? 'bad' : 'warn')), id: 'dstate'}, `投递：${st}${d.delivery_detail && !d.received ? '（' + d.delivery_detail + '）' : ''}`,
       d.renotify ? el('button', {style: 'margin-left:12px', onclick: () => post(d, 'renotify', {})}, '重新通知') : null,
       d.renotify ? el('div', {class: 'sugg'}, '重新通知会重新核对 lead 身份后再发；这条可能已经在 lead 的队列里。') : null));
   }
-  if (d.resolution) main.append(el('div', {class: 'bar ok'}, '已闭环：' + d.resolution));
+  if (d.resolution) main.append(el('div', {class: 'bar ok'}, (d.closed_by === 'owner' ? '由你在页面上关闭（不是 lead 闭环）：' : 'lead 已闭环：') + d.resolution));
   main.append(el('div', {class: 'card'}, html(d.body_html)));
   if (d.errata_html) main.append(el('div', {class: 'card'}, el('h3', {}, '勘误'), html(d.errata_html)));
   let staleBox = null, draftBox = null;
@@ -570,6 +583,18 @@ function render() {
       el('div', {class: 'sugg'}, '「其余按建议」只填还空着的子问题，你可以再改；只有点提交才算回答。')));
     main.append(form);
   }
+  if (d.closable) {
+    const reason = el('textarea', {id: 'close_reason', placeholder: '关闭原因（必填）', oninput: markDirty});
+    main.append(el('details', {class: 'card'}, el('summary', {}, '由我关闭'),
+      el('div', {class: 'sugg'}, d.status === 'open'
+        ? '还没回答的题：关闭等于撤回，之后不会投递。'
+        : '已回答的题：记为「Owner 关闭」（不是 lead 闭环），待投递的取消；如果回答已投递或已领取，会另发一条关闭通知给原 lead。用于 lead 会话已经没了、没人能闭环的情况。'),
+      reason,
+      el('button', {onclick: () => {
+        if (!reason.value.trim()) { msg = {cls: 'bad', text: '关闭必须写原因'}; renderMsg(); return; }
+        post(d, 'close', {content_rev: d.content_rev, answer_rev: d.answer_rev, reason: reason.value});
+      }}, '确认关闭')));
+  }
   for (const r of [...d.revs].reverse()) {
     const c = el('div', {class: 'card'}, el('h3', {}, `Rev ${r.rev}${r.corrected_by ? `（已被 Rev ${r.corrected_by} 更正）` : ''}`), el('div', {class: 'meta'}, r.at));
     for (const [q, s] of Object.entries(r.slots)) c.append(el('div', {}, `${q}：[${s.type === 'option' ? '选项' : (TYPES[s.type] || s.type)}] ${s.choice || ''}`, s.text ? el('div', {class: 'sugg'}, '原话：' + s.text) : null));
@@ -585,8 +610,10 @@ function render() {
   renderMsg();
 }
 
+// 会重建表单的只有这里（render 只被 load 调用）。force 也不能绕过输入保护：
+// 请求发出后 Owner 又输入过（formGen 变了），就保留表单，只提示服务端状态变了
 async function load(force) {
-  const id = cur, g = gen, seq = ++loadSeq;
+  const id = cur, g = gen, seq = ++loadSeq, fg = formGen;
   if (!id) return;
   const {status, j} = await api('/api/q/' + encodeURIComponent(id));
   if (g !== gen || id !== cur || seq < loadApplied) return;  // 发起后切了题，或已有更新的读取生效
@@ -595,11 +622,22 @@ async function load(force) {
   if (j.id !== id) return;
   const changed = !detail || detail.id !== j.id || detail.content_rev !== j.content_rev || detail.answer_rev !== j.answer_rev || detail.status !== j.status;
   if (!force && !dirty && JSON.stringify(detail) === JSON.stringify(j)) return;
+  if (fg !== formGen && detail && detail.editable) {
+    if (changed) msg = {cls: 'warn', text: (force && msg ? msg.text + '。' : '') + '服务端状态已变化：你刚才的新输入还在表单里，没有被覆盖；需要时先保存草稿再刷新页面。'};
+    renderMsg();
+    return;
+  }
   if (force || !dirty) { const keep = force ? msg : null; detail = j; render(); msg = keep; renderMsg(); return; }
   if (changed) { msg = {cls: 'warn', text: '问题或回答已在别处更新：你填的内容还在表单里，提交会提示冲突并自动保留为草稿，然后刷新页面。'}; renderMsg(); }
 }
 
-function route() { gen++; cur = decodeURIComponent(location.hash.slice(1)) || null; detail = null; dirty = false; msg = null; load(true); refreshList(); }
+function route() {
+  // 切题前有未保存的输入：先按原题存草稿（冲突时服务端也会保留为草稿），不丢
+  if (dirty && detail && detail.editable) api(`/api/q/${encodeURIComponent(detail.id)}/save`, {content_rev: detail.content_rev, slots: slotsFromForm(detail)});
+  gen++; cur = decodeURIComponent(location.hash.slice(1)) || null; detail = null; dirty = false; msg = null;
+  document.getElementById('main').replaceChildren(el('p', {class: 'meta'}, cur ? '加载中…' : '选择左边的问题。'));
+  load(true); refreshList();
+}
 window.addEventListener('hashchange', route);
 route();
 setInterval(() => { refreshList(); load(false); }, 3000);

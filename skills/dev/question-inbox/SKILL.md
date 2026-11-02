@@ -80,6 +80,10 @@ $Q resolve demo-0001 --answer-rev 2 --note "决定了什么，记在哪里"
 - 报**已撤回 / 已被替换**（退出码 3）：不要执行旧答案。
 - 输出里写「以 Rev N 为准」：Owner 更正过，只按最新 Rev 做；`resolve` 的 `--answer-rev` 必须是 receive 过的最新版本，否则被拒，先重新 `receive`。
 - `need_context`：补上下文后另开一题（或 supersede）；`defer`：这次不做，记下来。都不是授权。
+- 报 **Owner 已关闭**（退出码 3）：Owner 在页面上关了这题，不用再 receive / resolve，也不要按其中的回答继续做；要做什么另开一题问。
+- **lead 会话丢了**（pane 关了、换了会话，原题的 receive / resolve 一律退出码 4）：不放宽身份校验。
+  在聊天里请 Owner 在页面上点「由我关闭」（写原因；未答的等于撤回，已答的记为 Owner 关闭，不算 lead 闭环），
+  需要继续的事由新 lead 另开一题。
 
 ## 4. 其它命令
 

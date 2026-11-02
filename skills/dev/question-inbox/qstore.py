@@ -62,7 +62,8 @@ FIELDS = (
     'herdr_session', 'pane_id', 'agent_kind', 'lead_session',
     'delivery', 'delivery_rev', 'delivery_kind', 'received_rev', 'attempt_id', 'attempts', 'hold_count',
     'next_try_at', 'last_error', 'lead_status', 'herdr_accepted_at', 'received_at', 'withdraw_notice',
-    'supersedes', 'superseded_by', 'withdraw_reason', 'resolved_at', 'resolution', 'resolved_rev',
+    'supersedes', 'superseded_by', 'withdraw_reason', 'withdrawn_by', 'resolved_at', 'resolution', 'resolved_rev',
+    'resolved_by',
     'created', 'updated', 'warnings',
 )
 STATUSES = ('open', 'answered', 'resolved', 'withdrawn')
@@ -357,8 +358,33 @@ def invalid_reason(meta, allq):
     if meta.get('status') == 'withdrawn':
         if meta.get('superseded_by'):
             return f'已被 {meta["superseded_by"]} 替换'
+        if meta.get('withdrawn_by') == 'owner':
+            return f'已由 {meta.get("withdraw_reason")}'
         return f'已撤回：{meta.get("withdraw_reason") or "未写原因"}'
     return None
+
+
+def closed_by_owner(meta):
+    return (meta.get('status') == 'withdrawn' and meta.get('withdrawn_by') == 'owner') or \
+        (meta.get('status') == 'resolved' and meta.get('resolved_by') == 'owner')
+
+
+def owner_closed_message(meta):
+    """Owner 关闭的题给 lead 的统一提示；不是 Owner 关闭的返回 None。"""
+    if not closed_by_owner(meta):
+        return None
+    why = meta.get('resolution') if meta.get('status') == 'resolved' else meta.get('withdraw_reason')
+    return (f'{meta["id"]} 已由 Owner 在页面上关闭（{why}）：不要再 receive / resolve / withdraw 它，'
+            f'也不要按其中的回答继续行动；需要的话另开一题')
+
+
+def owner_closed(qid):
+    """只读预检：q.py 在核对身份之前先调它，lead 会话丢了也能拿到明确提示。"""
+    try:
+        meta, _ = read(qid)
+    except QError:
+        return None
+    return owner_closed_message(meta)
 
 
 def _load_checked(qid, allq):
@@ -366,6 +392,9 @@ def _load_checked(qid, allq):
         path_of(qid)  # 校验 id 格式
         raise QError(404, f'{qid} 不存在')
     meta, body = allq[qid]
+    closed = owner_closed_message(meta)
+    if closed:
+        raise QError(409, closed)
     why = invalid_reason(meta, allq)
     if why:
         raise QError(410, f'{qid} {why}，不能再保存、提交、投递或领取')
@@ -495,13 +524,22 @@ def publish(fields, lead, identity, supersedes=None):
     return qid, warnings
 
 
-def _withdraw(meta, body, reason, superseded_by=''):
-    if meta.get('delivery') in ('sent', 'received', 'sending', 'uncertain'):
-        meta['withdraw_notice'] = 'pending'  # lead 可能已经拿到过回答，单独发一条撤回通知
+DELIVERED = ('sending', 'sent', 'uncertain', 'received')  # lead 可能已经拿到过回答
+
+
+def _queue_notice(meta):
+    """撤回 / Owner 关闭时，回答可能已经在 lead 手里：单独排一条通知（送不到不影响撤回或关闭本身）。"""
+    if meta.get('delivery') in DELIVERED:
+        meta['withdraw_notice'] = 'pending'
         meta['next_try_at'] = now()
         meta['hold_count'] = '0'
+
+
+def _withdraw(meta, body, reason, superseded_by='', by='lead'):
+    _queue_notice(meta)
     meta['status'] = 'withdrawn'
     meta['withdraw_reason'] = reason
+    meta['withdrawn_by'] = by
     if superseded_by:
         meta['superseded_by'] = superseded_by
     if meta.get('delivery') != 'none':
@@ -658,6 +696,11 @@ def submit(qid, content_rev, answer_rev, slots):
         return n
 
 
+def has_notice_channel(meta):
+    """撤回的题、Owner 关闭的题：只剩撤回 / 关闭通知这一条投递。"""
+    return meta.get('status') == 'withdrawn' or closed_by_owner(meta)
+
+
 def _append_error(old, new):
     """last_error 只保留一行：旧原因在前、新记录在后，超长时截掉最旧的部分。"""
     text = f'{old}；{new}' if old else new
@@ -669,10 +712,10 @@ def renotify(qid):
     投递时会重新核对身份；原来的失败原因保留在 last_error 和时间线里。"""
     with locked():
         allq = all_questions()
-        if qid in allq and allq[qid][0].get('status') == 'withdrawn':
+        if qid in allq and has_notice_channel(allq[qid][0]):
             meta, body = allq[qid]
             if meta.get('withdraw_notice') not in ('uncertain', 'held'):
-                raise QError(409, f'{qid} 的撤回通知当前不需要重新通知（{meta.get("withdraw_notice") or "无"}）')
+                raise QError(409, f'{qid} 的撤回 / 关闭通知当前不需要重新通知（{meta.get("withdraw_notice") or "无"}）')
             old = meta.get('last_error') or ''
             meta.update({'withdraw_notice': 'pending', 'next_try_at': now(), 'hold_count': '0',
                          'last_error': _append_error(old, '重新通知撤回：这条可能已经在 lead 的队列里')})
@@ -685,6 +728,33 @@ def renotify(qid):
         meta.update({'delivery': 'pending', 'next_try_at': now(), 'hold_count': '0',
                      'last_error': _append_error(old, '重新通知：这条可能已经在 lead 的队列里')})
         _save(meta, body, f'Owner 点了重新通知（Rev {meta.get("answer_rev")}，之前：{old or "无记录"}）')
+
+
+def owner_close(qid, content_rev, answer_rev, reason):
+    """Owner 在页面上「由我关闭」：lead 会话丢了也能闭环，不放宽 lead 侧身份校验。
+    open → withdrawn（withdrawn_by: owner）；answered → resolved（resolved_by: owner）。返回关闭后的 status。"""
+    reason = one_line(reason or '').strip()
+    if not reason:
+        raise QError(400, '关闭必须写原因')
+    if len(reason) > 500:
+        raise QError(400, '原因不超过 500 字')
+    with locked():
+        allq = all_questions()
+        meta, body = _writable_for_owner(qid, allq)
+        if int(content_rev) != geti(meta, 'content_rev') or int(answer_rev) != geti(meta, 'answer_rev'):
+            raise QError(409, f'问题或回答已被更新（content_rev {meta["content_rev"]}，answer_rev '
+                              f'{meta["answer_rev"]}），请刷新后再决定是否关闭')
+        text = f'Owner 关闭：{reason}'
+        if meta.get('status') == 'open':
+            _withdraw(meta, body, text, by='owner')
+            return 'withdrawn'
+        _queue_notice(meta)
+        if meta.get('delivery') != 'received':
+            meta['delivery'] = 'cancelled'  # 待投递的取消；正在发的回包也不会再覆盖（finish 只认 sending）
+        meta.update({'status': 'resolved', 'resolved_at': now(), 'resolution': text, 'resolved_by': 'owner',
+                     'resolved_rev': meta.get('answer_rev') or '0'})
+        _save(meta, body, f'{text}（Rev {meta.get("answer_rev")}，不是 lead 闭环）')
+        return 'resolved'
 
 
 # ---------- lead 侧：receive / resolve ----------
@@ -766,7 +836,8 @@ def resolve(qid, answer_rev, note, ident):
             raise QError(409, f'{qid} 当前是 Rev {n}，你传的是 Rev {answer_rev}：先 receive 看最新回答')
         if geti(meta, 'received_rev') != n:
             raise QError(409, f'{qid} 的 Rev {n} 还没 receive，先执行 receive {qid}')
-        meta.update({'status': 'resolved', 'resolved_at': now(), 'resolution': note.strip(), 'resolved_rev': str(n)})
+        meta.update({'status': 'resolved', 'resolved_at': now(), 'resolution': note.strip(), 'resolved_rev': str(n),
+                     'resolved_by': 'lead'})
         _save(meta, body, f'lead 闭环 Rev {n}：{note.strip()}')
 
 
@@ -811,7 +882,7 @@ def due_for_delivery(at=None):
         if (meta.get('status') == 'answered' and meta.get('delivery') in ('pending', 'held')
                 and not invalid_reason(meta, allq)):
             out.append((meta, meta.get('delivery_kind') or 'answer'))
-        elif meta.get('status') == 'withdrawn' and meta.get('withdraw_notice') in ('pending', 'held'):
+        elif has_notice_channel(meta) and meta.get('withdraw_notice') in ('pending', 'held'):
             out.append((meta, 'withdraw'))
     return out
 
@@ -1013,17 +1084,19 @@ def delivery_view(meta, at=None):
     at = at or datetime.now(TZ)
     d, n = meta.get('delivery'), geti(meta, 'answer_rev')
     err = meta.get('last_error') or ''
-    if meta.get('status') == 'withdrawn':
+    if has_notice_channel(meta):
         note = meta.get('withdraw_notice') or ''
-        why = meta.get('withdraw_reason') or ''
+        owner = closed_by_owner(meta)
+        head, kind = ('Owner 已关闭', '关闭通知') if owner else ('已撤回', '撤回通知')
+        why = (meta.get('resolution') if meta.get('status') == 'resolved' else meta.get('withdraw_reason')) or ''
         if note in ('uncertain', 'held'):
             state = '不确定是否送达' if note == 'uncertain' else f'暂缓，下次尝试 {meta.get("next_try_at")}'
-            return '已撤回，撤回通知未送达', f'{why}；撤回通知{state}：{err}', True
+            return f'{head}，{kind}未送达', f'{why}；{kind}{state}：{err}', True
         if note in ('pending', 'sending'):
-            return '已撤回，撤回通知投递中', why, False
+            return f'{head}，{kind}投递中', why, False
         if note == 'sent':
-            return '已撤回，撤回通知已投进 pane', why, False
-        return '已撤回', why, False
+            return f'{head}，{kind}已投进 pane', why, False
+        return head, why, False
     if d == 'received' and geti(meta, 'received_rev') == n:
         return 'lead 已接收', f'Rev {n}，{meta.get("received_at")}', False
     if d == 'sent':

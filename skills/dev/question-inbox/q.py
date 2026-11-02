@@ -8,6 +8,7 @@ import fcntl
 import os
 import re
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -41,11 +42,20 @@ def cmd_ask(args):
     print(f'聊天里最多带一行：待你回答：{qid}')
 
 
+def refuse_if_owner_closed(qid):
+    """Owner 在页面上关闭的题：先于身份核对给出明确提示（lead 会话丢了也一样），退出码 3。"""
+    msg = qstore.owner_closed(qid)
+    if msg:
+        raise qstore.QError(409, msg)
+
+
 def cmd_receive(args):
-    ident = caller(args)
+    ident = None
     rc = 0
     for i, qid in enumerate(args.ids):
         try:
+            refuse_if_owner_closed(qid)
+            ident = ident or caller(args)
             text = qstore.receive(qid, ident)
         except qstore.QError as e:
             print(f'✗ {qid}：{e.message}', file=sys.stderr)
@@ -58,16 +68,19 @@ def cmd_receive(args):
 
 
 def cmd_resolve(args):
+    refuse_if_owner_closed(args.id)
     qstore.resolve(args.id, args.answer_rev, args.note, caller(args))
     print(f'{args.id} 已闭环（Rev {args.answer_rev}）')
 
 
 def cmd_withdraw(args):
+    refuse_if_owner_closed(args.id)
     qstore.withdraw(args.id, args.reason, caller(args))
     print(f'{args.id} 已撤回')
 
 
 def cmd_erratum(args):
+    refuse_if_owner_closed(args.id)
     rev = qstore.erratum(args.id, args.note, caller(args), [q.strip().upper() for q in args.drop or []])
     print(f'{args.id} 已补勘误，content_rev = {rev}（Owner 若正在填写，提交时会收到冲突提示，输入不会丢）')
 
@@ -80,9 +93,14 @@ def cmd_status(args):
             me = caller(args)['lead_session']
         except qstore.QError as e:
             print(f'（无法确定当前 lead：{e.message}；列出全部）', file=sys.stderr)
-    groups = {'等 Owner 回答': [], '已答，未领取': [], '已领取，未闭环': []}
+    groups = {'等 Owner 回答': [], '已答，未领取': [], '已领取，未闭环': [], 'Owner 已关闭（近 7 天）': []}
+    week_ago = datetime.now(qstore.TZ) - timedelta(days=7)
     for qid, (m, _) in sorted(allq.items()):
         if (args.ws and m.get('ws') != args.ws) or (me and m.get('lead_session') != me):
+            continue
+        if qstore.closed_by_owner(m):
+            if (qstore.parse_time(m.get('updated')) or week_ago) >= week_ago:
+                groups['Owner 已关闭（近 7 天）'].append(m)
             continue
         if qstore.invalid_reason(m, allq):
             continue
@@ -96,7 +114,7 @@ def cmd_status(args):
         print(f'## {name}（{len(items)}）')
         for m in items:
             label, why, _ = qstore.delivery_view(m)
-            extra = f'  [{label}{"：" + why if why else ""}]' if m.get('status') == 'answered' else ''
+            extra = f'  [{label}{"：" + why if why else ""}]' if m.get('status') != 'open' else ''
             blk = ' blocking' if m.get('blocking') == 'yes' else ''
             print(f'- {m["id"]}{blk} Rev {m.get("answer_rev")} · {m.get("title")}{extra}')
     print(f'页面：{page_url()}')
@@ -104,7 +122,7 @@ def cmd_status(args):
 
 def cmd_show(args):
     meta, body = qstore.read(args.id)
-    why = qstore.invalid_reason(meta, qstore.all_questions())
+    why = qstore.owner_closed_message(meta) or qstore.invalid_reason(meta, qstore.all_questions())
     if why:
         print(f'⚠️ {args.id} {why}：不要执行其中的回答\n')
     print(qstore.render(meta, body))
@@ -165,8 +183,14 @@ def doctor():
                 out.append(f'{qid}: {k} 大于 answer_rev')
         if m.get('delivery') == 'received' and qstore.geti(m, 'received_rev') != qstore.geti(m, 'delivery_rev'):
             out.append(f'{qid}: delivery=received 但 received_rev ≠ delivery_rev')
-        if m.get('status') == 'resolved' and qstore.geti(m, 'resolved_rev') != qstore.geti(m, 'received_rev'):
-            out.append(f'{qid}: resolved_rev ≠ received_rev')
+        if m.get('resolved_by', '') not in ('', 'lead', 'owner') or m.get('withdrawn_by', '') not in ('', 'lead', 'owner'):
+            out.append(f'{qid}: resolved_by / withdrawn_by 不合法')
+        if m.get('status') == 'resolved' and m.get('resolved_by') != 'owner' \
+                and qstore.geti(m, 'resolved_rev') != qstore.geti(m, 'received_rev'):
+            out.append(f'{qid}: lead 闭环但 resolved_rev ≠ received_rev')
+        if m.get('status') == 'resolved' and m.get('resolved_by') == 'owner' \
+                and qstore.geti(m, 'resolved_rev') != qstore.geti(m, 'answer_rev'):
+            out.append(f'{qid}: Owner 关闭但 resolved_rev ≠ answer_rev')
         if (m.get('delivery') == 'sending' or m.get('withdraw_notice') == 'sending') and not server_running():
             out.append(f'{qid}: 停在 sending 且服务没在运行（服务启动时会改为 uncertain）')
         sup = m.get('supersedes')

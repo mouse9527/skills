@@ -509,6 +509,136 @@ class DeliveryTest(Base):
         self.assertEqual(len(self.herdr_calls()), calls + 1)
 
 
+class OwnerCloseTest(Base):
+    """I：lead 会话丢了也有出口——Owner 在页面上「由我关闭」，不放宽 lead 侧身份校验。"""
+
+    def setUp(self):
+        super().setUp()
+        os.environ['QI_SCAN_INTERVAL'] = '3600'  # 投递由测试手动 scan_once()，结果确定
+        self.start_server()
+
+    def close(self, qid, reason='lead 会话已经没了', headers=None, **rev):
+        m = self.meta(qid)
+        payload = {'content_rev': int(m['content_rev']), 'answer_rev': int(m['answer_rev']), 'reason': reason}
+        payload.update(rev)
+        return self.http('POST', f'/api/q/{qid}/close', payload, headers=headers)
+
+    def received_then_lead_gone(self):
+        qid = self.ask()
+        qstore.submit(qid, 1, 0, self.answer_all(qid))
+        server.scan_once()
+        self.assertEqual(self.q('receive', qid).returncode, 0)
+        self.set_herdr(panes={'demo': []})  # 原 lead 的 pane 关了
+        self.assertEqual(self.q('resolve', qid, '--answer-rev', '1', '--note', 'x').returncode, 4)  # D 不放宽
+        return qid
+
+    def test_close_answered_after_lead_gone_and_notice_path(self):
+        qid = self.received_then_lead_gone()
+        code, res, _ = self.close(qid)
+        self.assertEqual((code, res.get('status')), (200, 'resolved'))
+        m = self.meta(qid)
+        self.assertEqual((m['status'], m['resolved_by'], m['resolution']), ('resolved', 'owner', 'Owner 关闭：lead 会话已经没了'))
+        self.assertEqual((m['delivery'], m['withdraw_notice']), ('received', 'pending'))
+        self.assertIn('Owner 关闭', '\n'.join(server.detail_view(qid)['timeline']))
+        # 通知送不到（pane 没了）也不影响关闭本身，页面可见、可重新通知
+        calls = len(self.herdr_calls())
+        server.scan_once()
+        m = self.meta(qid)
+        self.assertEqual((m['status'], m['withdraw_notice']), ('resolved', 'held'))
+        self.assertEqual(len(self.herdr_calls()), calls)
+        _, d, _ = self.http('GET', f'/api/q/{qid}')
+        self.assertEqual(d['closed_by'], 'owner')
+        self.assertTrue(d['renotify'])
+        self.assertIn('关闭通知', d['delivery'])
+        self.assertFalse(d['editable'] or d['closable'])
+        self.set_herdr(panes={'demo': [pane()]})  # lead 会话又找到了：通知走撤回通知同一路径送达
+        self.assertEqual(self.http('POST', f'/api/q/{qid}/renotify', {})[0], 200)
+        server.scan_once()
+        self.assertEqual(self.meta(qid)['withdraw_notice'], 'sent')
+        self.assertIn('Owner 已在页面上关闭', self.herdr_calls()[-1][-1])
+        _, lst, _ = self.http('GET', '/api/list')
+        self.assertEqual([s['closed_by'] for s in lst['groups']['closed'] if s['id'] == qid], ['owner'])
+        self.assertEqual(self.q('doctor').returncode, 0, self.q('doctor').stdout)
+
+    def test_close_open_is_withdraw_without_delivery(self):
+        qid = self.ask()
+        self.set_herdr(panes={'demo': []})
+        code, res, _ = self.close(qid, reason='不需要了')
+        self.assertEqual((code, res.get('status')), (200, 'withdrawn'))
+        m = self.meta(qid)
+        self.assertEqual((m['status'], m['withdrawn_by'], m['withdraw_reason']), ('withdrawn', 'owner', 'Owner 关闭：不需要了'))
+        self.assertEqual(m['withdraw_notice'], '')
+        server.scan_once()
+        self.assertEqual(self.herdr_calls(), [])
+        code, _, _ = self.http('POST', f'/api/q/{qid}/submit', {'content_rev': 1, 'answer_rev': 0, 'slots': self.answer_all(qid)})
+        self.assertEqual(code, 409)  # 之后不能再回答、不会投递
+
+    def test_close_answered_not_yet_delivered_cancels_delivery(self):
+        qid = self.ask()
+        qstore.submit(qid, 1, 0, self.answer_all(qid))
+        code, _, _ = self.close(qid)
+        self.assertEqual(code, 200)
+        m = self.meta(qid)
+        self.assertEqual((m['status'], m['delivery'], m['withdraw_notice']), ('resolved', 'cancelled', ''))
+        server.scan_once()
+        self.assertEqual(self.herdr_calls(), [])
+
+    def test_in_flight_delivery_does_not_overwrite_close(self):
+        qid = self.ask()
+        qstore.submit(qid, 1, 0, self.answer_all(qid))
+        claimed = qstore.claim([(qid, 'answer', 1)])
+        self.assertEqual(self.close(qid)[0], 200)
+        qstore.finish(claimed, 'sent')
+        m = self.meta(qid)
+        self.assertEqual((m['status'], m['delivery'], m['withdraw_notice']), ('resolved', 'cancelled', 'pending'))
+
+    def test_lead_commands_after_close(self):
+        a = self.received_then_lead_gone()
+        self.set_herdr(panes={'demo': [pane()]})
+        b = self.ask()
+        self.assertEqual(self.close(a)[0], 200)
+        self.assertEqual(self.close(b)[0], 200)
+        gone = {'HERDR_SESSION': '', 'HERDR_PANE_ID': ''}
+        for env in (None, gone):  # 原 lead 还在，或会话已丢：都得到明确提示、退出码 3
+            for qid in (a, b):
+                for args in (('receive', qid), ('resolve', qid, '--answer-rev', '1', '--note', 'x'),
+                             ('withdraw', qid, '--reason', 'x'), ('erratum', qid, '--note', 'x')):
+                    before = (self.tmp / 'inbox' / f'{qid}.md').read_bytes()
+                    r = self.q(*args, env=env)
+                    self.assertEqual(r.returncode, 3, (args, env, r.stderr))
+                    self.assertIn('Owner 在页面上关闭', r.stderr)
+                    self.assertNotIn('方案乙', r.stdout)
+                    self.assertEqual((self.tmp / 'inbox' / f'{qid}.md').read_bytes(), before)
+        out = self.q('status', '--all').stdout
+        self.assertIn('Owner 已关闭', out)
+        self.assertIn(a, out)
+        self.assertIn(b, out)
+        self.assertIn('Owner 在页面上关闭', self.q('show', a).stdout)
+        self.assertEqual(self.q('doctor').returncode, 0)
+
+    def test_close_requires_same_security_and_versions(self):
+        qid = self.ask()
+        qstore.submit(qid, 1, 0, self.answer_all(qid))
+        for h in ({'Origin': 'http://evil.example'}, {'Origin': None}, {'Content-Type': 'text/plain'},
+                  {'X-QI-Token': None}, {'X-QI-Token': 'wrong'}, {'Host': 'evil.example'}):
+            self.assertEqual(self.close(qid, headers=h)[0], 403, h)
+        self.assertEqual(self.close(qid, reason='  ')[0], 400)
+        self.assertEqual(self.close(qid, answer_rev=0)[0], 409)  # 页面读到的是旧版本
+        self.assertEqual(self.close(qid, content_rev=9)[0], 409)
+        m = self.meta(qid)
+        self.assertEqual((m['status'], m.get('resolved_by', '')), ('answered', ''))
+        self.assertEqual(self.close(qid)[0], 200)
+        self.assertEqual(self.close(qid)[0], 409)  # 已关闭不能再关
+        lead_done = self.ask()
+        qstore.submit(lead_done, 1, 0, self.answer_all(lead_done))
+        self.assertEqual(self.q('receive', lead_done).returncode, 0)
+        self.assertEqual(self.q('resolve', lead_done, '--answer-rev', '1', '--note', '记到 Issue').returncode, 0)
+        self.assertEqual(self.close(lead_done)[0], 409)
+        _, lst, _ = self.http('GET', '/api/list')
+        by = {s['id']: s['closed_by'] for s in lst['groups']['closed']}
+        self.assertEqual((by[qid], by[lead_done]), ('owner', 'lead'))
+
+
 SEPARATORS = {'U+2028': ' ', 'U+2029': ' ', 'U+0085': '\u0085'}
 
 
@@ -912,6 +1042,36 @@ const posts = () => requests.filter(r => r.opt.method === 'POST').map(r => ({pat
     out.posts = posts();
     out.stale = run('fillForm(detail, {Q1: {type: "option", choice: "Z. 已被勘误删掉", text: "保留原话"}, Q2: {type: "option", choice: "B. 乙"}})');
     out.q1 = {checked: form.checked.Q1 || null, text: form.texts.Q1}; out.q2 = form.checked.Q2;
+  } else if (scenario === 'post-then-type') {
+    // POST 已成功、强制 GET 还没回来时继续输入，GET 回来后输入不能被覆盖
+    const action = process.argv[4];
+    const d = mkDetail('demo-0001');
+    if (action !== 'save') { d.status = 'answered'; d.answer_rev = 1; d.revs = [{rev: 1, at: 't', corrected_by: 0, slots: {Q1: {type: 'defer'}, Q2: {type: 'defer'}}}]; d.renotify = action === 'renotify'; }
+    answer('/api/q/demo-0001', 200, d); await flush();
+    const initialRenders = rendered.length;
+    form.texts.Q1 = '点按钮之前的原稿'; run('markDirty()');
+    const bodies = {save: '{content_rev: 1, slots: slotsFromForm(detail)}',
+      submit: '{content_rev: 1, answer_rev: 1, slots: {Q1: {type: "free", text: "更正"}, Q2: {type: "defer"}}}',
+      renotify: '{}', close: '{content_rev: 1, answer_rev: 1, reason: "lead 会话没了"}'};
+    run(`post(detail, "${action}", ${bodies[action]})`); await flush();
+    answer(`/api/q/demo-0001/${action}`, 200, {ok: true, answer_rev: 2, note: '已处理', status: 'resolved'}); await flush();
+    out.getPending = pending('/api/q/demo-0001').length;
+    form.texts.Q1 = 'POST 成功后继续写的新回答'; form.checked.Q2 = 'opt:1'; run('markDirty()');
+    const fresh = mkDetail('demo-0001');
+    if (action === 'save') fresh.draft = {slots: {Q1: {type: 'free', text: '点按钮之前的原稿'}}, note: '保存于 t'};
+    else { fresh.status = action === 'close' ? 'resolved' : 'answered'; fresh.answer_rev = action === 'submit' ? 2 : 1; fresh.editable = action !== 'close'; fresh.delivery = 'x'; }
+    answer('/api/q/demo-0001', 200, fresh); await flush();
+    out.text = form.texts.Q1; out.q2 = form.checked.Q2 || null; out.dirty = run('dirty');
+    out.rebuilt = rendered.length - initialRenders; out.msg = run('msg && msg.text');
+    // 再来一次轮询（不带 force），同样不能覆盖
+    run('load(false)'); await flush();
+    answer('/api/q/demo-0001', 200, fresh); await flush();
+    out.textAfterPoll = form.texts.Q1; out.rebuiltAfterPoll = rendered.length - initialRenders;
+  } else if (scenario === 'route-autosave') {
+    answer('/api/q/demo-0001', 200, mkDetail('demo-0001')); await flush();
+    form.texts.Q1 = '没保存就切题'; run('markDirty()');
+    ctx.location.hash = '#demo-0002'; run('route()');
+    out.posts = posts();
   }
   for (const r of requests) if (r.path === '/api/list' && !r.done) { r.done = true; reply(r, 200, LIST); }
   await flush();
@@ -930,8 +1090,8 @@ class PageScriptTest(unittest.TestCase):
         (self.tmp / 'page.js').write_text(page[start:page.index('</script>')], encoding='utf-8')
         (self.tmp / 'harness.js').write_text(PAGE_HARNESS, encoding='utf-8')
 
-    def run_page(self, scenario):
-        r = subprocess.run([shutil.which('node'), str(self.tmp / 'harness.js'), str(self.tmp / 'page.js'), scenario],
+    def run_page(self, scenario, *extra):
+        r = subprocess.run([shutil.which('node'), str(self.tmp / 'harness.js'), str(self.tmp / 'page.js'), scenario, *extra],
                            capture_output=True, text=True, encoding='utf-8', timeout=60)
         self.assertEqual(r.returncode, 0, r.stderr)
         return json.loads(r.stdout)
@@ -972,6 +1132,25 @@ class PageScriptTest(unittest.TestCase):
         self.assertIn('Q1', out['stale'][0])
         self.assertEqual(out['q1'], {'checked': None, 'text': '保留原话'})
         self.assertEqual(out['q2'], 'opt:1')
+
+    def test_input_after_successful_post_survives_forced_reload(self):
+        for action in ('save', 'submit', 'renotify', 'close'):
+            with self.subTest(action):
+                out = self.run_page('post-then-type', action)
+                self.assertEqual(out['getPending'], 1)  # 成功后确实发起了强制 GET
+                self.assertEqual(out['text'], 'POST 成功后继续写的新回答')
+                self.assertEqual(out['q2'], 'opt:1')
+                self.assertTrue(out['dirty'])
+                self.assertEqual(out['rebuilt'], 0)
+                self.assertIn('已处理', out['msg'])
+                self.assertEqual(out['textAfterPoll'], 'POST 成功后继续写的新回答')
+                self.assertEqual(out['rebuiltAfterPoll'], 0)
+
+    def test_route_away_autosaves_unsaved_input(self):
+        out = self.run_page('route-autosave')
+        self.assertEqual(len(out['posts']), 1)
+        self.assertEqual(out['posts'][0]['path'], '/api/q/demo-0001/save')
+        self.assertEqual(out['posts'][0]['body']['slots']['Q1'], {'type': 'free', 'text': '没保存就切题'})
 
 
 if __name__ == '__main__':
