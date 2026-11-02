@@ -184,9 +184,14 @@ git -C repos/<repo> worktree prune
 
 需要派 worker 时用 skill `herdr-workers`。汇报时事实标来源，推断标依据和不确定性。
 
+**向 Owner 提问一律走问题收件箱**（skill `question-inbox`，`q ask`）：业务偏好、范围、授权、只有 Owner 知道的事实。
+聊天里不列问题清单，最多一行「待你回答：<id>」。技术取舍也可以问，但要写清各方案的优缺点和 lead 的推荐。
+收到投递先 `q receive`，把决定写进 Issue / PR，再 `q resolve`。
+
 ## 9. 防膨胀
 
 - **不为这套流程写工具**：不建 CLI、状态机、本地 backlog、证据库、跨 ws 注册表。Issue 状态从 Issue + PR + checks 现算，不落盘。
+  **唯一例外**（Owner 2026-11-02 批准）：问题收件箱（skill `question-inbox`）。它只放等 Owner 决定的问题，不放 Issue 进度、PR、CI 状态；决定答复后仍由 lead 落到 Issue / PR。
 - 规则只写一处：通用的在 skill，ws 特有的（参数、目录映射、验收命令、Owner 确认的例外）在它的 README；不复制，只指向。
 - 评价一条规则看它有没有改变判断、防住具体错误，不看短期内被加载了几次。
 - 一条规则连续几个 Issue 都没帮你做出不同决定，删掉。

@@ -32,11 +32,12 @@
     },
     {
       "name": "dev",
-      "description": "开发协作：工作区（ws）流程与 herdr worker 委派",
+      "description": "开发协作：工作区（ws）流程、herdr worker 委派与问题收件箱",
       "source": "./",
       "strict": false,
       "skills": [
         "./skills/dev/herdr-workers",
+        "./skills/dev/question-inbox",
         "./skills/dev/workspace"
       ]
     }
