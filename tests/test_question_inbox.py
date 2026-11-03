@@ -1272,5 +1272,380 @@ class PageScriptTest(unittest.TestCase):
         self.assertEqual([r for r in out['newRequests'] if r['method'] == 'POST'], [])
 
 
+# ---------- UI 重做：用一个能装下真实 render() 的迷你 DOM 跑页面脚本 ----------
+
+DOM_HARNESS = r"""
+const vm = require('vm');
+const fs = require('fs');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const scenario = process.argv[3];
+
+const htmlSets = [], scrolled = [];
+class Node {}
+class Text extends Node { constructor(t) { super(); this.text = String(t); } get textContent() { return this.text; } }
+class Elem extends Node {
+  constructor(tag) { super(); this.tagName = tag.toUpperCase(); this.children = []; this.attrs = {}; this.listeners = {};
+    this.className = ''; this.parent = null; this._checked = false; this.disabled = false; this.open = false; }
+  setAttribute(k, v) { this.attrs[k] = String(v); if (k === 'id') this.id = String(v); if (k === 'open') this.open = true; if (k === 'disabled') this.disabled = true; }
+  removeAttribute(k) { delete this.attrs[k]; }
+  addEventListener(k, f) { (this.listeners[k] = this.listeners[k] || []).push(f); }
+  dispatch(k, ev) { for (const f of this.listeners[k] || []) f(Object.assign({target: this, preventDefault() {}}, ev || {})); }
+  append(...k) { for (const c of k) { if (typeof c === 'object' && !(c instanceof Node)) throw new Error('append 收到非节点对象（真 DOM 会把它转成字符串）');
+    const n = c instanceof Node ? c : new Text(c); n.parent = this; this.children.push(n); } }
+  replaceChildren(...k) { this.children = []; this.append(...k); }
+  set innerHTML(v) { this._html = v; htmlSets.push(v); }
+  get value() { return this._value !== undefined ? this._value : (this.attrs.value || ''); }
+  set value(v) { this._value = String(v); }
+  get checked() { return this._checked; }
+  set checked(b) {
+    if (b && this.attrs.type === 'radio') for (const r of walk(doc)) if (r !== this && r.tagName === 'INPUT' && r.attrs.name === this.attrs.name) r._checked = false;
+    this._checked = !!b;
+  }
+  get textContent() { return this.children.map(c => c.textContent).join('') + (this._html ? '[html]' : ''); }
+  scrollIntoView() { scrolled.push(this.id); }
+  focus() {}
+}
+function* walk(e) { yield e; for (const c of e.children || []) if (c instanceof Elem) yield* walk(c); }
+const doc = new Elem('body');
+const mk = (tag, id) => { const e = new Elem(tag); e.setAttribute('id', id); return e; };
+const app = mk('div', 'app'), side = mk('nav', 'side'), main = mk('main', 'main');
+app.append(side, main); doc.append(app, mk('div', 'sheet'), mk('div', 'help'));
+const find = (pred, from) => { for (const e of walk(from || doc)) if (pred(e)) return e; return null; };
+const findAll = (pred, from) => [...walk(from || doc)].filter(pred);
+const byId = id => find(e => e.id === id);
+const button = (text, from) => find(e => e.tagName === 'BUTTON' && e.textContent.includes(text), from);
+const radio = (q, v) => find(e => e.tagName === 'INPUT' && e.attrs.name === 't_' + q && e.attrs.value === v);
+const pick = (q, v) => { const r = radio(q, v); r.checked = true; r.dispatch('change'); };
+const document = {
+  title: '',
+  createElement: t => new Elem(t),
+  createTextNode: t => new Text(t),
+  querySelector(sel) {
+    if (sel === 'meta[name=qi-token]') return {content: 'tok'};
+    let m = sel.match(/^input\[name="([^"]+)"\]:checked$/);
+    if (m) return find(e => e.tagName === 'INPUT' && e.attrs.name === m[1] && e.checked);
+    m = sel.match(/^input\[name="([^"]+)"\]\[value="([^"]+)"\]$/);
+    if (m) return find(e => e.tagName === 'INPUT' && e.attrs.name === m[1] && e.attrs.value === m[2]);
+    throw new Error('unexpected selector ' + sel);
+  },
+  getElementById: byId,
+};
+const requests = [];
+function fetch(path, opt) { return new Promise(resolve => requests.push({path, opt: opt || {}, resolve})); }
+const flush = async () => { for (let i = 0; i < 20; i++) await new Promise(r => setImmediate(r)); };
+const listeners = {};
+const mem = {};
+const ctx = {document, window: {addEventListener(k, f) { listeners[k] = f; }, scrollY: 0, scrollTo() {}}, location: {hash: ''}, fetch,
+  setInterval() {}, Node, confirm: () => true, console,
+  localStorage: {getItem: k => (k in mem ? mem[k] : null), setItem: (k, v) => { mem[k] = String(v); }}};
+vm.createContext(ctx);
+const run = code => vm.runInContext(code, ctx);
+const pending = path => requests.filter(r => r.path === path && !r.done);
+function answer(path, status, body) { const r = pending(path)[0]; r.done = true; r.resolve({status, json: async () => body}); }
+const posts = () => requests.filter(r => r.opt.method === 'POST').map(r => ({path: r.path, body: JSON.parse(r.opt.body)}));
+const key = (k, extra) => listeners.keydown(Object.assign({key: k, target: doc, preventDefault() {}}, extra || {}));
+const EMPTY = {open_count: 0, groups: {todo: [], waiting: [], received: [], closed: []}};
+const HTML = {background_html: '<p>背景原文</p>', evidence_html: '<ul><li>证据一条</li></ul>', after_html: '<p>答完之后做 X</p>',
+  extra_html: '', errata_html: '', body_html: '<h2>问题</h2><p>BODY_HTML_SHOULD_NOT_RENDER</p>'};
+function mkDetail(id, n, over) {
+  const questions = [];
+  for (let i = 1; i <= n; i++) questions.push({q: 'Q' + i, text: '第 ' + i + ' 题问什么', options: ['A. 甲方案 ' + i, 'B. 乙方案 ' + i],
+    suggestion: 'B —— 理由 ' + i, withdrawn: false});
+  return Object.assign({id, title: '演示 ' + id, ws: 'demo', issue: 'owner/repo#592', blocking: 'yes', status: 'open', content_rev: 1, answer_rev: 0,
+    editable: true, closable: true, questions, draft: {slots: {}, note: ''}, revs: [], timeline: [], warnings: [], option_notes: {},
+    delivery: '', renotify: false, created: '2026-11-03T10:00:00+08:00', updated: '2026-11-03T10:00:00+08:00'}, HTML, over || {});
+}
+const answeredFrom = (d, slots, extra) => Object.assign({}, d, {status: 'answered', answer_rev: 1, delivery: '排队投递',
+  revs: [{rev: 1, at: '2026-11-03T10:05:00+08:00', corrected_by: 0, slots}]}, extra || {});
+const formShown = () => !!find(e => e.tagName === 'INPUT' && e.attrs.type === 'radio', main);
+const text = e => (e ? e.textContent : null);
+
+(async () => {
+  const out = {};
+  ctx.location.hash = '#demo-0001';
+  run(src);
+  const open = async d => { answer('/api/q/demo-0001', 200, d); await flush(); };
+  if (scenario === 'cards') {
+    await open(mkDetail('demo-0001', 3));
+    out.cards = run('detail.questions.map(q => q.q)').map(q => text(byId('card_' + q)));
+    out.headings = findAll(e => /^H[1-6]$/.test(e.tagName), main).map(text);
+    out.htmlSets = htmlSets.slice();
+    out.suggestBadge = ['Q1', 'Q2', 'Q3'].map(q => text(radio(q, 'opt:1').parent));
+    out.preselected = findAll(e => e.tagName === 'INPUT' && e.checked).length;
+  } else if (scenario === 'summary') {
+    const n = +process.argv[4];
+    await open(mkDetail('demo-0001', n));
+    pick('Q1', 'opt:0');
+    for (let i = 2; i <= n; i++) pick('Q' + i, 'suggested');
+    key('Enter', {metaKey: true});
+    await flush();
+    out.postsAfterKey = posts().length;
+    out.sheetOpen = 'data-open' in byId('sheet').attrs;
+    out.rows = findAll(e => /\bsrow\b/.test(e.className), byId('sheet')).map(e => ({cls: e.className, text: text(e)}));
+    out.buttons = findAll(e => e.tagName === 'BUTTON', byId('sheet')).map(text);
+    if (out.sheetOpen) {
+      button('返回修改', byId('sheet')).dispatch('click');
+      out.closed = !('data-open' in byId('sheet').attrs);
+      button('检查并提交', main).dispatch('click'); await flush();
+      out.reopened = 'data-open' in byId('sheet').attrs;
+      out.postsBeforeConfirm = posts().length;
+      const ok = button('确认提交', byId('sheet'));
+      ok.dispatch('click'); ok.dispatch('click'); await flush();
+    }
+    out.posts = posts();
+  } else if (scenario === 'keys') {
+    await open(mkDetail('demo-0001', 3));
+    key('1'); out.k1 = run('checkedValue("Q1")');
+    key('j'); out.cur = run('curQ'); out.focus = byId('card_Q2').className; out.unfocus = byId('card_Q1').className;
+    key('s'); out.ks = run('checkedValue("Q2")');
+    key('k'); key('2'); out.k2 = run('checkedValue("Q1")');
+    const ta = byId('x_Q3');
+    key('j'); key('j');
+    key('1', {target: ta}); key('s', {target: ta}); key('j', {target: ta});
+    out.inTextarea = {q3: run('checkedValue("Q3")'), cur: run('curQ')};
+    key('1', {isComposing: true}); out.composing = run('checkedValue("Q3")');
+    out.posts = posts().length;
+  } else if (scenario === 'list') {
+    const it = (id, ws, blocking, created, n) => ({id, ws, blocking, created, updated: created, title: 'T ' + id, issue: 'owner/repo#' + id.slice(-2),
+      status: 'open', content_rev: 1, n_questions: n, has_draft: false, delivery: '', renotify: false, invalid: '', closed_by: ''});
+    ctx.location.hash = ''; listeners.hashchange(); await flush();
+    const L = {open_count: 4, groups: {todo: [it('b-0002', 'beta', 'yes', '2026-11-03T09:00'), it('a-0003', 'alpha', 'no', '2026-11-03T08:00'),
+      it('a-0001', 'alpha', 'yes', '2026-11-03T10:00', 7), it('a-0002', 'alpha', 'yes', '2026-11-03T11:00', 1)], waiting: [], received: [], closed: []}};
+    for (const r of pending('/api/list')) { r.done = true; r.resolve({status: 200, json: async () => L}); }
+    await flush();
+    out.groups = findAll(e => e.tagName === 'SECTION', side).map(s => ({
+      title: text(s.children[0]), ws: findAll(e => e.tagName === 'H3', s).map(text),
+      items: findAll(e => e.tagName === 'A', s).map(a => a.attrs.href)}));
+    out.firstItem = text(find(e => e.tagName === 'A' && e.attrs.href === '#a-0001', side));
+  } else if (scenario === 'escape') {
+    const d = mkDetail('demo-0001', 2, {title: '<script>alert(1)</script>'});
+    const slots = {Q1: {type: 'free', text: '<script>answer()</script>'}, Q2: {type: 'option', choice: 'A. 甲方案 2', text: '<b>补充</b>'}};
+    await open(answeredFrom(d, slots));
+    out.htmlSets = htmlSets.slice();
+    out.text = text(main);
+    out.scriptElems = findAll(e => e.tagName === 'SCRIPT').length;
+  } else if (scenario === 'double-submit') {
+    const n = +process.argv[4], outcome = process.argv[5];
+    const d = mkDetail('demo-0001', n);
+    await open(d);
+    for (let i = 1; i <= n; i++) pick('Q' + i, 'opt:0');
+    const go = byId('go');
+    if (n === 1) { go.dispatch('click'); go.dispatch('click'); key('Enter', {metaKey: true}); go.dispatch('click'); }
+    else {
+      go.dispatch('click'); await flush();
+      const ok = button('确认提交', byId('sheet'));
+      ok.dispatch('click'); ok.dispatch('click'); go.dispatch('click'); key('Enter', {metaKey: true}); ok.dispatch('click');
+    }
+    await flush();
+    out.postsWhilePending = posts().length;
+    out.goWhilePending = {disabled: byId('go').disabled, text: text(byId('go'))};
+    const slots = {}; for (let i = 1; i <= n; i++) slots['Q' + i] = {type: 'option', choice: 'A. 甲方案 ' + i, text: ''};
+    if (outcome === 'fail') {
+      answer('/api/q/demo-0001/submit', 409, {error: '问题或回答已被更新'}); await flush();
+      out.goAfter = {disabled: byId('go').disabled, text: text(byId('go'))};
+      out.kept = run('checkedValue("Q1")'); out.msg = run('msg && msg.text'); out.formShown = formShown();
+    } else {
+      answer('/api/q/demo-0001/submit', 200, outcome === 'unchanged' ? {ok: true, answer_rev: 1, unchanged: true} : {ok: true, answer_rev: 1}); await flush();
+      await open(answeredFrom(d, slots));
+      out.formShown = formShown(); out.textareas = findAll(e => e.tagName === 'TEXTAREA' && e.id !== 'close_reason', main).length;
+      out.banner = text(byId('dstate')); out.bannerCls = byId('dstate').className; out.msg = run('msg && msg.text');
+      out.go = !!byId('go');
+      key('1'); out.keyAfter = posts().length;
+      button('更正回答', main).dispatch('click');
+      out.editShown = formShown(); out.refilled = run('checkedValue("Q1")');
+      out.goLabel = text(byId('go'));
+      run('load(false)'); await flush();
+      await open(answeredFrom(d, slots, {delivery: 'lead 已接收', received: true}));
+      out.stillEditing = formShown();
+    }
+    out.posts = posts().length;
+  }
+  for (const r of requests) if (r.path === '/api/list' && !r.done) { r.done = true; r.resolve({status: 200, json: async () => EMPTY}); }
+  await flush();
+  process.stdout.write(JSON.stringify(out));
+})().catch(e => { console.error(e.stack); process.exit(2); });
+"""
+
+
+@unittest.skipUnless(shutil.which('node'), 'node not installed')
+class PageUiTest(unittest.TestCase):
+    def setUp(self):
+        PageScriptTest.setUp(self)
+        (self.tmp / 'harness.js').write_text(DOM_HARNESS, encoding='utf-8')
+
+    run_page = PageScriptTest.run_page
+
+    def test_cards_hold_question_options_and_suggestion(self):
+        out = self.run_page('cards')
+        for i, c in enumerate(out['cards'], 1):
+            self.assertIn(f'第 {i} 题问什么', c)
+            self.assertIn(f'A. 甲方案 {i}', c)
+            self.assertIn(f'B. 乙方案 {i}', c)
+            self.assertIn(f'理由 {i}', c)
+        for h in ('问题', '选项', '建议'):
+            self.assertNotIn(h, out['headings'])  # 不再整段渲染这三段
+        self.assertNotIn(HTML_BODY_MARK, ''.join(out['htmlSets']))
+        self.assertIn('<p>背景原文</p>', out['htmlSets'])
+        self.assertIn('<ul><li>证据一条</li></ul>', out['htmlSets'])
+        for t in out['suggestBadge']:
+            self.assertIn('建议', t)  # 建议对上的选项带角标
+        self.assertEqual(out['preselected'], 0)  # 不预选
+
+    def test_multi_question_submit_goes_through_summary(self):
+        out = self.run_page('summary', '3')
+        self.assertEqual(out['postsAfterKey'], 0)
+        self.assertTrue(out['sheetOpen'])
+        self.assertEqual(len(out['rows']), 3)
+        self.assertIn('A. 甲方案 1', out['rows'][0]['text'])
+        self.assertIn('warn', out['rows'][0]['cls'])  # 不是建议的标黄
+        self.assertIn('B. 乙方案 2', out['rows'][1]['text'])
+        self.assertIn('B —— 理由 2', out['rows'][1]['text'])
+        self.assertNotIn('warn', out['rows'][1]['cls'])
+        self.assertEqual(out['buttons'], ['返回修改', '确认提交'])
+        self.assertTrue(out['closed'])
+        self.assertTrue(out['reopened'])
+        self.assertEqual(out['postsBeforeConfirm'], 0)
+        self.assertEqual(len(out['posts']), 1)
+        self.assertEqual(out['posts'][0]['path'], '/api/q/demo-0001/submit')
+        self.assertEqual(out['posts'][0]['body']['slots']['Q1']['choice'], 'A. 甲方案 1')
+        self.assertEqual(out['posts'][0]['body']['slots']['Q3']['type'], 'suggested')
+
+    def test_single_question_submits_directly(self):
+        out = self.run_page('summary', '1')
+        self.assertFalse(out['sheetOpen'])
+        self.assertEqual(out['postsAfterKey'], 1)
+        self.assertEqual(len(out['posts']), 1)
+
+    def test_shortcuts(self):
+        out = self.run_page('keys')
+        self.assertEqual(out['k1'], 'opt:0')
+        self.assertEqual(out['cur'], 'Q2')
+        self.assertIn('focus', out['focus'])
+        self.assertNotIn('focus', out['unfocus'])
+        self.assertEqual(out['ks'], 'suggested')
+        self.assertEqual(out['k2'], 'opt:1')
+        self.assertEqual(out['inTextarea'], {'q3': None, 'cur': 'Q3'})
+        self.assertIsNone(out['composing'])
+        self.assertEqual(out['posts'], 0)
+
+    def test_list_groups_blocking_first_by_ws_and_hides_empty(self):
+        out = self.run_page('list')
+        self.assertEqual([g['title'] for g in out['groups']], ['lead 正在等3 题', '可稍后1 题'])
+        self.assertEqual(out['groups'][0]['ws'], ['beta1 题', 'alpha2 题'])  # ws 按组里最早一题排
+        self.assertEqual(out['groups'][0]['items'], ['#b-0002', '#a-0001', '#a-0002'])  # 组内从旧到新
+        self.assertEqual(out['groups'][1]['items'], ['#a-0003'])
+        self.assertIn('alpha · #01 · 7 问', out['firstItem'])
+
+    def test_script_and_answer_text_render_as_text(self):
+        out = self.run_page('escape')
+        allowed = {'<p>背景原文</p>', '<ul><li>证据一条</li></ul>', '<p>答完之后做 X</p>'}
+        self.assertTrue(set(out['htmlSets']) <= allowed, out['htmlSets'])
+        self.assertIn('<script>alert(1)</script>', out['text'])
+        self.assertIn('<script>answer()</script>', out['text'])
+        self.assertIn('<b>补充</b>', out['text'])
+        self.assertEqual(out['scriptElems'], 0)
+
+    def test_rapid_submit_clicks_send_one_post_then_read_only(self):
+        for n in (1, 3):
+            with self.subTest(n=n):
+                out = self.run_page('double-submit', str(n), 'ok')
+                self.assertEqual(out['postsWhilePending'], 1)
+                self.assertEqual(out['goWhilePending'], {'disabled': True, 'text': '提交中…'})
+                self.assertFalse(out['formShown'])
+                self.assertEqual(out['textareas'], 0)
+                self.assertFalse(out['go'])
+                self.assertIn('已提交 Rev 1', out['banner'])
+                self.assertIn('正在发回 lead', out['banner'])
+                self.assertIn('banner', out['bannerCls'])
+                self.assertEqual(out['keyAfter'], 1)  # 只读状态下快捷键不改任何东西
+                self.assertTrue(out['editShown'])  # 显式点「更正回答」才能编辑
+                self.assertEqual(out['refilled'], 'opt:0')
+                self.assertTrue(out['stillEditing'])  # 轮询不会把正在更正的表单收起
+                self.assertEqual(out['posts'], 1)
+
+    def test_failed_submit_restores_button_and_keeps_input(self):
+        out = self.run_page('double-submit', '1', 'fail')
+        self.assertEqual(out['postsWhilePending'], 1)
+        self.assertEqual(out['goAfter']['disabled'], False)
+        self.assertIn('提交并发回 lead', out['goAfter']['text'])
+        self.assertEqual(out['kept'], 'opt:0')
+        self.assertTrue(out['formShown'])
+        self.assertIn('版本冲突', out['msg'])
+
+    def test_unchanged_submit_says_not_resent(self):
+        out = self.run_page('double-submit', '1', 'unchanged')
+        self.assertIn('没有重复发送', out['msg'])
+        self.assertFalse(out['formShown'])
+
+
+HTML_BODY_MARK = 'BODY_HTML_SHOULD_NOT_RENDER'
+
+
+class UiViewTest(Base):
+    def test_detail_sections_escape_and_keep_extra_text(self):
+        text = ('前言一段\n\n' + body(extra_bg='<script>alert(1)</script>').replace(
+            '## 选项\n\n', '## 选项\n\n选项总说明\n\n').replace('- B. 方案乙（后果：稳）', '- B. 方案乙（后果：稳）\n  乙的细节', 1)
+            + '\n## 风险\n\n可能 <img src=x>\n')
+        qid = self.ask(text)
+        d = server.detail_view(qid)
+        self.assertIn('&lt;script&gt;alert(1)&lt;/script&gt;', d['background_html'])
+        self.assertNotIn('<script', d['background_html'] + d['extra_html'])
+        self.assertIn('demo/app.py:12', d['evidence_html'])
+        self.assertIn('按回答改代码', d['after_html'])
+        for s in ('前言一段', '选项总说明', '风险', '&lt;img src=x&gt;'):
+            self.assertIn(s, d['extra_html'])
+        self.assertIn('乙的细节', d['option_notes']['Q1'])
+        self.assertNotIn('Q2', d['option_notes'])
+
+    def test_long_evidence_code_is_folded(self):
+        code = '```\n' + '\n'.join(f'line {i}' for i in range(30)) + '\n```'
+        qid = self.ask(body(evidence='短的一条\n\n' + code))
+        h = server.detail_view(qid)['evidence_html']
+        self.assertIn('<details><summary>代码（30 行）</summary><pre>', h)
+        self.assertNotIn('<details>', server.md('```\nshort\n```', fold=True))
+
+    def test_list_summary_has_display_fields(self):
+        a = self.ask(body(3))
+        qstore.save_draft(a, 1, {'Q1': {'type': 'defer'}})
+        b = self.ask()
+        self.assertEqual(self.q('erratum', b, '--note', '撤掉 Q2', '--drop', 'Q2').returncode, 0)
+        todo = {s['id']: s for s in server.list_view()['groups']['todo']}
+        self.assertEqual((todo[a]['n_questions'], todo[a]['has_draft'], todo[a]['content_rev']), (3, True, 1))
+        self.assertEqual((todo[b]['n_questions'], todo[b]['has_draft'], todo[b]['content_rev']), (1, False, 2))
+        self.assertEqual(todo[a]['issue'], 'none')
+
+
+class DuplicateSubmitTest(Base):
+    def test_identical_correction_is_not_a_new_rev(self):
+        qid = self.ask()
+        slots = self.answer_all(qid)
+        self.assertEqual(qstore.submit(qid, 1, 0, slots), 1)
+        server.scan_once()
+        before = self.meta(qid)
+        self.assertEqual(before['delivery'], 'sent')
+        calls = len(self.herdr_calls())
+        self.assertEqual(qstore.submit(qid, 1, 1, slots), 1)
+        after = self.meta(qid)
+        self.assertEqual((after['answer_rev'], after['delivery'], after['delivery_rev'], after['delivery_kind']),
+                         (before['answer_rev'], before['delivery'], before['delivery_rev'], before['delivery_kind']))
+        self.assertEqual(len(qstore.answer_revs(qstore.split_body(qstore.read(qid)[1])[1])), 1)
+        server.scan_once()
+        self.assertEqual(len(self.herdr_calls()), calls)
+        changed = dict(slots, Q2={'type': 'defer'})
+        self.assertEqual(qstore.submit(qid, 1, 1, changed), 2)
+        m = self.meta(qid)
+        self.assertEqual((m['answer_rev'], m['delivery'], m['delivery_kind']), ('2', 'pending', 'correction'))
+
+    def test_http_reports_unchanged(self):
+        self.start_server()
+        qid = self.ask()
+        good = {'content_rev': 1, 'answer_rev': 0, 'slots': self.answer_all(qid)}
+        code, res, _ = self.http('POST', f'/api/q/{qid}/submit', good)
+        self.assertEqual((code, res), (200, {'ok': True, 'answer_rev': 1}))
+        code, res, _ = self.http('POST', f'/api/q/{qid}/submit', dict(good, answer_rev=1))
+        self.assertEqual((code, res), (200, {'ok': True, 'answer_rev': 1, 'unchanged': True}))
+        self.assertEqual(self.meta(qid)['answer_rev'], '1')
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -111,7 +111,10 @@ def inline(s):
     return ''.join(out)
 
 
-def md(text):
+FOLD_LINES = 12  # 证据里超过这么多行的代码块折叠显示
+
+
+def md(text, fold=False):
     out, para, lst = [], [], None
     lines = text.split('\n')
 
@@ -132,7 +135,11 @@ def md(text):
             j = i + 1
             while j < len(lines) and not lines[j].lstrip().startswith('```'):
                 j += 1
-            out.append('<pre><code>' + html.escape('\n'.join(lines[i + 1:j])) + '</code></pre>')
+            code = lines[i + 1:j]
+            block = '<pre><code>' + html.escape('\n'.join(code)) + '</code></pre>'
+            if fold and len(code) > FOLD_LINES:
+                block = f'<details><summary>代码（{len(code)} 行）</summary>{block}</details>'
+            out.append(block)
             i = j + 1
             continue
         if line.lstrip().startswith('|'):
@@ -174,14 +181,62 @@ def md(text):
 
 # ---------- 视图数据 ----------
 
+CARD_SECTIONS = ('问题', '选项', '建议')  # 拆进 Qn 卡片
+SHOWN_SECTIONS = CARD_SECTIONS + ('背景', '证据', '答完之后')
+
+
+def lead_view(lead):
+    """展示用拆段：背景 / 证据 / 答完之后各自渲染；没拆进 Qn 卡片、也不属于这几段的行都进「补充材料」，不丢。"""
+    secs = qstore.sections(lead)
+    lines = lead.split('\n')
+    infence = qstore.fenced(lines)
+    first = next((i for i, l in enumerate(lines) if not infence[i] and re.match(r'^##\s+', l)), len(lines))
+    extra = ['\n'.join(lines[:first]).strip()]
+    rest = [l for l in secs.get('问题', '').split('\n') if l.strip() and not qstore.Q_LINE_RE.match(l.strip())]
+    if rest:
+        extra.append('#### 问题段的其他内容\n' + '\n'.join(rest))
+    notes, cur, head = {}, None, []
+    for line in secs.get('选项', '').split('\n'):
+        m = re.match(r'^###\s+Q(\d+)\b', line.strip())
+        if m:
+            cur = f'Q{int(m.group(1))}'
+            continue
+        if cur and qstore.OPTION_RE.match(line) and not line.startswith('  '):
+            continue  # 选项本身，已在卡片按钮上
+        if cur:
+            notes.setdefault(cur, []).append(line)
+        elif line.strip():
+            head.append(line)
+    if head:
+        extra.append('#### 选项段的其他内容\n' + '\n'.join(head))
+    seen, rest = set(), []
+    for line in secs.get('建议', '').split('\n'):
+        m = qstore.SUGGEST_RE.match(line)
+        if m and f'Q{int(m.group(1))}' not in seen:
+            seen.add(f'Q{int(m.group(1))}')
+        elif line.strip():
+            rest.append(line)
+    if rest:
+        extra.append('#### 建议段的其他内容\n' + '\n'.join(rest))
+    extra += [f'### {k}\n\n{v}' for k, v in secs.items() if k not in SHOWN_SECTIONS]
+    return {'background_html': md(secs.get('背景', '')), 'evidence_html': md(secs.get('证据', ''), fold=True),
+            'after_html': md(secs.get('答完之后', '')), 'extra_html': md('\n\n'.join(x for x in extra if x)),
+            'option_notes': {q: md('\n'.join(v).strip()) for q, v in notes.items() if '\n'.join(v).strip()}}
+
+
 def summary(meta, allq):
     label, why, renot = qstore.delivery_view(meta)
+    lead, sp = qstore.split_body(allq[meta['id']][1]) if meta.get('id') in allq else ('', {})
+    dropped = set(q for q in (meta.get('withdrawn_qs') or '').split(',') if q)
     return {'id': meta['id'], 'title': meta.get('title'), 'ws': meta.get('ws'), 'blocking': meta.get('blocking'),
             'status': meta.get('status'), 'created': meta.get('created'), 'updated': meta.get('updated'),
             'answer_rev': qstore.geti(meta, 'answer_rev'), 'delivery': label, 'delivery_detail': why,
             'renotify': renot, 'invalid': qstore.invalid_reason(meta, allq),
             'closed_by': ('owner' if qstore.closed_by_owner(meta) else
-                          'lead' if meta.get('status') in ('resolved', 'withdrawn') else '')}
+                          'lead' if meta.get('status') in ('resolved', 'withdrawn') else ''),
+            'issue': meta.get('issue'), 'content_rev': qstore.geti(meta, 'content_rev'),
+            'n_questions': len([q for q, _ in qstore.questions(lead) if q not in dropped]),
+            'has_draft': bool(qstore.draft(sp)['slots'])}
 
 
 def list_view():
@@ -225,7 +280,7 @@ def detail_view(qid):
         'closable': not invalid and meta.get('status') in ('open', 'answered'),
         'not_executed': (f'这条回答不会被执行，原因：{invalid}' if invalid and n > 0 else ''),
         'resolution': meta.get('resolution') if meta.get('status') == 'resolved' else '',
-        'body_html': md(lead), 'errata_html': md(sp.get('勘误', '')),
+        'body_html': md(lead), 'errata_html': md(sp.get('勘误', '')), **lead_view(lead),
         'timeline': [l[2:] for l in sp.get('时间线', '').split('\n') if l.startswith('- ')],
         'questions': [{'q': q, 'text': t, 'options': opts.get(q, []), 'suggestion': sugg.get(q, ''),
                        'withdrawn': q in dropped} for q, t in qstore.questions(lead)],
@@ -323,9 +378,11 @@ class Handler(BaseHTTPRequestHandler):
                 qstore.save_draft(qid, int(req.get('content_rev', -1)), req.get('slots') or {})
                 res = {'ok': True}
             elif action == 'submit':
-                n = qstore.submit(qid, int(req.get('content_rev', -1)), int(req.get('answer_rev', -1)),
-                                  req.get('slots') or {})
+                base = int(req.get('answer_rev', -1))
+                n = qstore.submit(qid, int(req.get('content_rev', -1)), base, req.get('slots') or {})
                 res = {'ok': True, 'answer_rev': n}
+                if n == base:
+                    res['unchanged'] = True
             elif action == 'close':
                 st = qstore.owner_close(qid, int(req.get('content_rev', -1)), int(req.get('answer_rev', -1)),
                                         req.get('reason') if isinstance(req.get('reason'), str) else '')
@@ -393,43 +450,167 @@ def main():
 
 PAGE = r'''<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="qi-token" content="__TOKEN__">
 <title>问题收件箱</title>
 <style>
-:root{--bg:#fafaf8;--fg:#1d1d1b;--mute:#6b6b66;--line:#e2e1dc;--card:#fff;--acc:#2f5fd0;--warn:#fff4c2;--bad:#fde3e1;--ok:#e3f4e6}
-@media (prefers-color-scheme:dark){:root{--bg:#18181a;--fg:#e8e8e3;--mute:#9a9a94;--line:#333336;--card:#212124;--acc:#7da2ff;--warn:#4a3f12;--bad:#4a2220;--ok:#1f3d25}}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.55 -apple-system,"PingFang SC",system-ui,sans-serif}
-#app{display:grid;grid-template-columns:320px 1fr;height:100vh}
-#side{border-right:1px solid var(--line);overflow:auto;padding:12px}
-#main{overflow:auto;padding:16px 24px 80px}
-h2.g{font-size:12px;color:var(--mute);margin:16px 0 6px;font-weight:600}
-.item{display:block;padding:8px 10px;border-radius:6px;cursor:pointer;margin-bottom:2px;color:inherit;text-decoration:none}
-.item:hover{background:var(--card)}.item.cur{background:var(--card);outline:1px solid var(--line)}
-.item small{display:block;color:var(--mute)}
-.tag{display:inline-block;font-size:11px;padding:0 6px;border-radius:9px;border:1px solid var(--line);margin-right:4px}
-.tag.b{border-color:#d0442f;color:#d0442f}
-.bar{padding:8px 12px;border-radius:6px;margin:8px 0}.bar.warn{background:var(--warn)}.bar.bad{background:var(--bad)}.bar.ok{background:var(--ok)}
-.card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:12px 16px;margin:12px 0}
-.meta{color:var(--mute);font-size:12px}
-pre{background:var(--bg);border:1px solid var(--line);padding:8px;overflow:auto;border-radius:4px}
-code{background:var(--bg);padding:0 3px;border-radius:3px}
-.slot{border-top:1px solid var(--line);padding:10px 0}.slot:first-child{border-top:0}
-.slot label{display:block;margin:2px 0}
-textarea{width:100%;min-height:48px;font:inherit;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:4px;padding:6px}
-button{font:inherit;padding:6px 14px;border-radius:6px;border:1px solid var(--line);background:var(--card);color:var(--fg);cursor:pointer;margin-right:8px}
-button.pri{background:var(--acc);color:#fff;border-color:var(--acc)}
-.sugg{color:var(--mute);font-size:12px}
-@media (max-width:760px){#app{grid-template-columns:1fr;height:auto}#side{border-right:0;border-bottom:1px solid var(--line)}#main{padding:16px}}
+:root{--bg:#F7F8FA;--surface:#FFFFFF;--text:#1F2937;--muted:#5B6472;--border:#D8DEE8;--accent:#2563EB;--on-accent:#FFFFFF;--accent-weak:#EAF1FE;
+--warn-text:#9A4D00;--warn-bg:#FFF4E5;--bad-text:#B42318;--bad-bg:#FFF0EE;--ok-text:#18794E;--ok-bg:#EDF8F1;color-scheme:light dark}
+@media (prefers-color-scheme:dark){:root{--bg:#11151C;--surface:#1A2029;--text:#EDF2F7;--muted:#A8B3C2;--border:#3A4656;--accent:#8AB4FF;--on-accent:#101826;--accent-weak:#1C2A42;
+--warn-text:#FFC078;--warn-bg:#382A1A;--bad-text:#FFB4AB;--bad-bg:#3D2024;--ok-text:#8DDFB5;--ok-bg:#183329}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:16px/1.65 -apple-system,BlinkMacSystemFont,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",system-ui,sans-serif}
+a{color:var(--accent)}
+#app{display:grid;grid-template-columns:280px minmax(0,1fr);height:100vh}
+#side{border-right:1px solid var(--border);overflow:auto;padding:14px 10px 24px;background:var(--surface)}
+#main{overflow:auto;position:relative}
+.brand{display:flex;justify-content:space-between;align-items:baseline;font-weight:600;padding:0 8px 6px}
+.brand .count{font-size:13px;color:var(--muted);font-weight:400}
+.grp h2{font-size:13px;margin:16px 8px 4px;font-weight:600;display:flex;justify-content:space-between}
+.grp.hot h2{color:var(--warn-text)}
+.grp h3{font-size:13px;font-weight:600;color:var(--muted);margin:8px 8px 2px;display:flex;justify-content:space-between}
+.grp .n{font-weight:400;color:var(--muted)}
+.grp.dim{opacity:.78}.grp.dim h2{color:var(--muted)}
+.item{display:block;padding:6px 8px;border-radius:8px;color:inherit;text-decoration:none;border-left:3px solid transparent;font-size:13px;line-height:1.5}
+.item:hover{background:var(--bg)}
+.item.cur{background:var(--accent-weak);border-left-color:var(--accent)}
+.item .l1{color:var(--muted);display:flex;align-items:center;gap:6px}
+.item .l2{display:flex;gap:8px;font-size:14px}
+.item .tt{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.item time,.item .l3{color:var(--muted);font-size:12px;white-space:nowrap}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--accent);display:inline-block;flex:none}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
+.tag{font-size:11px;padding:0 6px;border-radius:9px;border:1px solid var(--border);color:var(--muted)}
+.empty{color:var(--muted);font-size:13px;padding:16px 8px}
+.wrap{max-width:880px;margin:0 auto;padding:24px 32px 32px}
+.prose{max-width:72ch}
+.mute{color:var(--muted)}
+.small{font-size:13px;line-height:1.5}
+.back{display:none;font-size:15px;text-decoration:none;margin-bottom:8px}
+.where{display:flex;justify-content:space-between;align-items:center;color:var(--muted);font-size:13px}
+h1{font-size:24px;line-height:1.3;margin:4px 0 6px}
+.state{font-size:14px;color:var(--muted)}
+.chip{display:inline-block;font-size:13px;padding:0 8px;border-radius:10px;font-weight:600}
+.chip.hot{background:var(--warn-bg);color:var(--warn-text)}
+.chip.bad{background:var(--bad-bg);color:var(--bad-text)}
+.chip.ok{background:var(--ok-bg);color:var(--ok-text)}
+.more{position:relative}
+.more>summary{list-style:none;cursor:pointer;padding:2px 10px;border-radius:6px;border:1px solid var(--border);font-size:16px;line-height:1.4}
+.more>summary::-webkit-details-marker{display:none}
+.more .pop{position:absolute;right:0;top:34px;z-index:5;width:min(420px,80vw);background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:12px 14px;box-shadow:0 6px 24px rgba(0,0,0,.15);color:var(--text);font-size:14px}
+.msgbar{padding:8px 12px;border-radius:8px;margin:8px 0;font-size:14px}
+.msgbar.warn{background:var(--warn-bg);color:var(--warn-text)}.msgbar.bad{background:var(--bad-bg);color:var(--bad-text)}
+.msgbar.ok{background:var(--ok-bg);color:var(--ok-text)}.msgbar.info{background:var(--accent-weak);color:var(--text)}
+.msgbar button{margin-left:12px}
+.banner{padding:14px 16px;border-radius:10px;margin:12px 0;font-size:17px;border:2px solid currentColor}
+.banner .small{font-size:13px;margin-top:4px}.banner button{margin-left:12px;font-size:14px}
+.banner.ok{background:var(--ok-bg);color:var(--ok-text)}.banner.info{background:var(--accent-weak);color:var(--accent)}
+.banner.bad{background:var(--bad-bg);color:var(--bad-text)}
+.sec{margin:18px 0}
+.sec>h2,.sec>summary{font-size:13px;font-weight:600;color:var(--muted);margin:0 0 4px;cursor:default}
+.sec>summary{cursor:pointer}
+.sec p{margin:0 0 8px}.sec ul,.sec ol{margin:0 0 8px;padding-left:22px}
+.after{border-left:3px solid var(--border);padding:2px 12px;margin:18px 0;display:flex;gap:8px;align-items:baseline}
+.after .mute{flex:none}.after p{margin:0}
+.errata>summary{color:var(--warn-text)}
+pre{background:var(--bg);border:1px solid var(--border);padding:8px 10px;overflow:auto;border-radius:6px;font-size:13px;line-height:1.5}
+code{font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--bg);padding:0 3px;border-radius:3px;word-break:break-all}
+pre code{padding:0;word-break:normal}
+.nav{position:sticky;top:0;z-index:3;background:var(--bg);padding:8px 0;margin:12px 0 4px;border-bottom:1px solid var(--border);display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:13px}
+.nav .anc{min-width:44px;padding:2px 8px;border-radius:6px;border:1px solid var(--muted);background:var(--surface);color:var(--text);font:inherit;cursor:pointer}
+.nav .anc.done{border-color:var(--accent);background:var(--accent-weak)}
+.nav .anc.gone{text-decoration:line-through;color:var(--muted);border-color:var(--border)}
+.nav .next{margin-left:auto}
+.q{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:16px 20px;margin:16px 0;scroll-margin-top:64px}
+.q.focus{outline:2px solid var(--accent);outline-offset:2px}
+.q.gone{opacity:.7}
+.q h3{font-size:17px;line-height:1.5;font-weight:600;margin:0 0 10px;max-width:72ch}
+.qn{color:var(--accent);margin-right:4px}
+.opts{display:flex;flex-direction:column;gap:8px}
+.opt{display:flex;align-items:center;gap:10px;min-height:44px;padding:8px 12px;border:1px solid var(--muted);border-radius:8px;cursor:pointer;background:var(--surface)}
+.opt.sug{background:var(--accent-weak)}
+.opt:has(input:checked){border:2px solid var(--accent);padding:7px 11px}
+.opt:has(input:checked)::after{content:'已选';margin-left:auto;font-size:13px;color:var(--accent);font-weight:600}
+.opt input{accent-color:var(--accent);width:18px;height:18px;margin:0;flex:none}
+.opt .ot{flex:1;min-width:0}
+kbd{font:12px/1.4 ui-monospace,Menlo,monospace;border:1px solid var(--border);border-bottom-width:2px;border-radius:4px;padding:0 5px;color:var(--muted);background:var(--bg)}
+.badge{font-size:12px;font-weight:600;padding:0 8px;border-radius:9px;background:var(--accent);color:var(--on-accent);flex:none}
+.why{color:var(--muted);font-size:14px;margin:6px 0 0 4px}
+.sugrow{margin-top:8px}
+.note{font-size:14px;margin-top:8px;color:var(--muted)}
+.fold{margin-top:8px}
+.fold>summary{display:inline-block;cursor:pointer;color:var(--accent);font-size:14px;padding:4px 2px;list-style:none}
+.fold>summary::-webkit-details-marker{display:none}
+.others{display:flex;flex-wrap:wrap;gap:8px;margin-top:6px}
+.others .opt{flex:1 1 180px}
+textarea{width:100%;min-height:56px;font:16px/1.5 inherit;font-family:inherit;background:var(--bg);color:var(--text);border:1px solid var(--muted);border-radius:8px;padding:8px 10px;margin-top:6px}
+button{font:inherit;font-size:15px;min-height:40px;padding:6px 14px;border-radius:8px;border:1px solid var(--muted);background:var(--surface);color:var(--text);cursor:pointer}
+button.pri{background:var(--accent);color:var(--on-accent);border-color:var(--accent);font-weight:600}
+button.pri kbd{background:transparent;color:inherit;border-color:currentColor;margin-left:6px;opacity:.8}
+button:disabled{opacity:.5;cursor:not-allowed}
+button:focus-visible,.opt:has(input:focus-visible),a:focus-visible,summary:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.ans{margin-top:10px;padding:10px 12px;border-radius:8px;background:var(--bg);border:1px solid var(--border)}
+.ans .k{font-size:13px;color:var(--muted)}
+.olist{margin:0;padding:0;list-style:none;color:var(--muted)}.olist li{margin:2px 0}.olist .badge{margin-left:8px}
+.rev{margin:12px 0;font-size:14px}
+.dbar{display:flex;align-items:center;flex-wrap:wrap;gap:8px}
+.bar-b{position:sticky;bottom:0;z-index:4;background:var(--surface);border-top:1px solid var(--border);margin:24px -32px -32px;padding:10px 32px calc(10px + env(safe-area-inset-bottom))}
+.bar-b .row{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.bar-b .prog{display:flex;align-items:center;gap:10px;font-size:14px;flex:1;min-width:200px}
+.pb{width:120px;height:6px;border-radius:3px;background:var(--border);overflow:hidden;flex:none}
+.pb span{display:block;height:100%;background:var(--accent)}
+.acts{display:flex;gap:8px;flex-wrap:wrap}
+.foot{margin:28px 0 8px;font-size:13px;color:var(--muted)}
+.foot details{margin:6px 0}.foot summary{cursor:pointer}
+.kv{display:grid;grid-template-columns:max-content 1fr;gap:2px 12px;margin:6px 0}
+#sheet,#help{display:none}
+#sheet[data-open],#help[data-open]{display:flex;position:fixed;inset:0;z-index:20;background:rgba(0,0,0,.45);align-items:center;justify-content:center;padding:16px}
+.dlg{background:var(--surface);color:var(--text);border-radius:12px;max-width:760px;width:100%;max-height:calc(100vh - 32px);overflow:auto;padding:20px 24px;box-shadow:0 12px 40px rgba(0,0,0,.3)}
+.dlg h2{font-size:18px;margin:0 0 4px}
+.srow{display:grid;grid-template-columns:40px minmax(0,1fr);gap:4px 10px;padding:10px 12px;border-radius:8px;margin:6px 0;border:1px solid var(--border);cursor:pointer}
+.srow .qq{font-size:13px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.srow .dec{font-weight:600}
+.srow .tg{font-size:12px;font-weight:600;margin-left:8px;padding:0 6px;border-radius:8px;background:var(--ok-bg);color:var(--ok-text)}
+.srow.warn{background:var(--warn-bg);border-color:transparent}.srow.warn .tg{background:var(--surface);color:var(--warn-text)}
+.srow.miss{background:var(--bad-bg);border-color:transparent}.srow.miss .dec{color:var(--bad-text)}
+.dlg .btns{display:flex;justify-content:flex-end;gap:10px;margin-top:16px}
+.keys{display:grid;grid-template-columns:max-content 1fr;gap:6px 16px;margin:10px 0}
+@media (max-width:760px){
+  #app{display:block;height:auto}
+  #app[data-view=detail] #side{display:none}
+  #app[data-view=list] #main{display:none}
+  #side{border-right:0;min-height:100vh}
+  #main{overflow:visible}
+  .wrap{padding:12px 16px 16px}
+  .back{display:inline-block}
+  h1{font-size:20px;line-height:1.4}
+  .q{padding:14px 14px}
+  .nav{overflow-x:auto;flex-wrap:nowrap}
+  .nav .next{margin-left:8px}
+  .bar-b{margin:20px -16px -16px;padding:8px 16px calc(8px + env(safe-area-inset-bottom))}
+  .bar-b .row{gap:8px}
+  .acts{width:100%}.acts button{flex:1;padding:6px 8px}
+  .acts kbd,.bar-b>p,.prog .hint{display:none}
+  .item{padding:10px 8px}
+  #sheet[data-open],#help[data-open]{padding:8px}
+  .dlg{padding:16px 14px;max-height:calc(100vh - 16px)}
+  .srow{padding:8px 10px}
+}
 </style></head><body>
-<div id="app"><nav id="side"></nav><main id="main"><p class="meta">选择左边的问题。</p></main></div>
+<div id="app" data-view="list"><nav id="side"></nav><main id="main"><div class="wrap"><p class="mute">选择左边的问题。</p></div></main></div>
+<div id="sheet" role="dialog" aria-modal="true" aria-label="提交前确认"></div>
+<div id="help" role="dialog" aria-label="快捷键"></div>
 <script nonce="__NONCE__">
 'use strict';
 const TOKEN = document.querySelector('meta[name=qi-token]').content;
 const TYPES = {free:'自由回答', suggested:'按建议', need_context:'需要更多上下文', defer:'暂不决定'};
+const OTHER = ['free', 'need_context', 'defer'];
 let cur = null, detail = null, dirty = false, msg = null;
 // 异步回包都要对得上发起时的视图：gen 每次切题 +1；formGen 每次表单输入 +1；seq 只认最新的一次读取
 let gen = 0, formGen = 0, listSeq = 0, loadSeq = 0, loadApplied = 0;
+// 只影响展示的本地状态，切题时清空：当前卡片、是否在更正、提交摘要、展开过的折叠块
+let curQ = null, editing = false, sheet = null, help = false, openState = {}, shownId = null, formShown = false;
+let openCount = 0, posting = false;
 
 function el(tag, attrs, ...kids) {
   const e = document.createElement(tag);
@@ -441,6 +622,15 @@ function el(tag, attrs, ...kids) {
   return e;
 }
 function html(s) { const d = document.createElement('div'); d.innerHTML = s; return d; } // 只用于服务端已 escape 的白名单 HTML
+function setCls(e, cls, on) {
+  if (!e) return;
+  const list = (e.className || '').split(' ').filter(c => c && c !== cls);
+  if (on) list.push(cls);
+  e.className = list.join(' ');
+}
+function store(k, v) {  // localStorage 只记「看过哪一版」，不存答案；不可用时当作没记
+  try { if (v === undefined) return localStorage.getItem(k); localStorage.setItem(k, v); return true; } catch (e) { return v === undefined ? null : false; }
+}
 
 async function api(path, body) {
   const opt = body === undefined ? {} : {method: 'POST', body: JSON.stringify(body),
@@ -450,28 +640,73 @@ async function api(path, body) {
   return {status: r.status, j};
 }
 
+function ago(t) {
+  const ms = Date.parse(t || '');
+  if (isNaN(ms)) return t || '';
+  const s = Math.max(0, (Date.now() - ms) / 1000);
+  if (s < 60) return '刚刚';
+  if (s < 3600) return `${Math.floor(s / 60)} 分钟前`;
+  if (s < 86400) return `${Math.floor(s / 3600)} 小时前`;
+  if (s < 86400 * 30) return `${Math.floor(s / 86400)} 天前`;
+  return t.slice(0, 10);
+}
+function when(t) { return el('time', {title: t || ''}, ago(t)); }
+function issueTag(issue) { const m = /#(\d+)$/.exec(issue || ''); return m ? '#' + m[1] : ''; }
+function where(s) { return [s.ws, issueTag(s.issue)].filter(Boolean).join(' · '); }
+
+// ---------- 左栏 ----------
+
+function listItem(s, g) {
+  const unseen = g === 'todo' && store('qi.seen.' + s.id) !== String(s.content_rev);
+  const closedAs = s.closed_by === 'owner' ? 'Owner 关闭' : (s.status === 'resolved' ? 'lead 闭环' : (s.invalid || '已撤回'));
+  const sub = g === 'todo' ? '' : g === 'closed' ? closedAs + (s.renotify ? ' · ' + s.delivery : '') : (s.invalid || s.delivery || s.status);
+  return el('a', {class: 'item' + (s.id === cur ? ' cur' : ''), href: '#' + s.id},
+    el('div', {class: 'l1'}, unseen ? [el('span', {class: 'dot', title: '有没看过的内容'}), el('span', {class: 'sr'}, '未看')] : null,
+      (where(s) || s.id) + (s.n_questions ? ` · ${s.n_questions} 问` : ''), s.has_draft ? el('span', {class: 'tag'}, '草稿') : null),
+    el('div', {class: 'l2'}, el('span', {class: 'tt', title: s.title || ''}, s.title || s.id), when(g === 'todo' ? s.created : s.updated)),
+    sub ? el('div', {class: 'l3'}, sub) : null);
+}
+
+// 待答按 ws 聚合；ws 的先后看组里最早的一题，组内从旧到新。空分组不渲染
+function listGroup(title, items, cls, g) {
+  if (!items.length) return null;
+  const box = el('section', {class: 'grp ' + cls}, el('h2', {}, title, el('span', {class: 'n'}, `${items.length} 题`)));
+  if (g !== 'todo') { for (const s of items) box.append(listItem(s, g)); return box; }
+  const byWs = new Map();
+  for (const s of [...items].sort((a, b) => (a.created || '').localeCompare(b.created || ''))) {
+    if (!byWs.has(s.ws)) byWs.set(s.ws, []);
+    byWs.get(s.ws).push(s);
+  }
+  for (const [ws, list] of byWs) box.append(el('h3', {}, ws || '（无 ws）', el('span', {class: 'n'}, `${list.length} 题`)), ...list.map(s => listItem(s, 'todo')));
+  return box;
+}
+
 async function refreshList() {
   const seq = ++listSeq;
   const {status, j} = await api('/api/list');
   if (seq !== listSeq || status !== 200) return;  // 迟到的旧列表不覆盖新的
+  openCount = j.open_count;
   document.title = (j.open_count ? `(${j.open_count}) ` : '') + '问题收件箱';
-  const side = document.getElementById('side'); side.replaceChildren();
-  const names = {todo: '待答', waiting: '已答，lead 未接收', received: 'lead 已接收，未闭环', closed: '最近已闭环 / 撤回'};
-  for (const [g, title] of Object.entries(names)) {
-    side.append(el('h2', {class: 'g'}, `${title}（${j.groups[g].length}）`));
-    for (const s of j.groups[g]) {
-      const closedAs = s.closed_by === 'owner' ? 'Owner 关闭' : (s.status === 'resolved' ? 'lead 闭环' : (s.invalid || '已撤回'));
-      const sub = g === 'todo' ? s.created : g === 'closed' ? closedAs + (s.renotify ? ' · ' + s.delivery : '') : (s.invalid || s.delivery || s.status);
-      side.append(el('a', {class: 'item' + (s.id === cur ? ' cur' : ''), href: '#' + s.id},
-        s.blocking === 'yes' && g === 'todo' ? el('span', {class: 'tag b'}, 'blocking') : null,
-        s.id, ' · ', s.title, el('small', {}, sub || '')));
-    }
-  }
+  const side = document.getElementById('side'), top = side.scrollTop, todo = j.groups.todo;
+  const parts = [
+    listGroup('lead 正在等', todo.filter(s => s.blocking === 'yes'), 'hot', 'todo'),
+    listGroup('可稍后', todo.filter(s => s.blocking !== 'yes'), '', 'todo'),
+    listGroup('已答，lead 未接收', j.groups.waiting, 'dim', 'waiting'),
+    listGroup('lead 已接收，未闭环', j.groups.received, 'dim', 'received'),
+    listGroup('最近已闭环 / 撤回', j.groups.closed, 'dim', 'closed')].filter(Boolean);
+  side.replaceChildren(el('div', {class: 'brand'}, '问题收件箱', el('span', {class: 'count'}, `待答 ${j.open_count}`)),
+    ...(parts.length ? parts : [el('div', {class: 'empty'}, '收件箱是空的。')]));
+  side.scrollTop = top;
+  const back = document.getElementById('back');
+  if (back) back.replaceChildren(`← 收件箱（待答 ${openCount}）`);
 }
 
-function markDirty() { dirty = true; formGen++; }
+// ---------- 表单读写（不依赖卡片的样子，只认 radio 和 textarea） ----------
+
+function markDirty() { dirty = true; formGen++; updateProgress(); }
 function checkedValue(q) { const r = document.querySelector(`input[name="t_${q}"]:checked`); return r ? r.value : null; }
 function textOf(q) { const t = document.getElementById('x_' + q); return t ? t.value : ''; }
+function liveQs(d) { return d.questions.filter(q => !q.withdrawn); }
 
 // 「已填」只在这里判定：选了类型，或者没选类型但写了非空文字（算自由回答）。按钮和提交共用
 function slotFor(q) {
@@ -518,6 +753,195 @@ function fillForm(d, slots) {
   return stale;
 }
 
+// 建议开头的字母能对上某个选项（「A —— 理由」对「A. …」）时返回那个选项的下标，否则 -1。只影响展示
+function suggestIndex(q) {
+  const m = /^\s*([A-Za-z])(?=\s|[.．、:：)）—-]|$)/.exec(q.suggestion || '');
+  if (!m) return -1;
+  const re = new RegExp('^\\s*' + m[1] + '(?=\\s|[.．、:：)）]|$)', 'i');
+  return q.options.findIndex(o => re.test(o));
+}
+function suggestReason(q) { return (q.suggestion || '').replace(/^\s*[A-Za-z]\s*(?:[.．、:：)）]|[—-]+)?\s*/, ''); }
+
+// 一个槽「具体决定了什么」：提交摘要和只读回答共用。follows = 跟建议一致
+function decision(q, s) {
+  if (!s) return {main: '未答', tag: '', follows: false, miss: true};
+  const si = suggestIndex(q), extra = s.type !== 'free' && (s.text || '').trim() ? s.text : '';
+  if (s.type === 'option') {
+    const same = si >= 0 && q.options[si] === s.choice;
+    return {main: s.choice || '', tag: same ? '与建议一致' : '不是建议', follows: same, extra};
+  }
+  if (s.type === 'suggested') {
+    const sugg = s.choice || q.suggestion || '';
+    return {main: si >= 0 ? q.options[si] : sugg, sub: si >= 0 ? '建议原文：' + sugg : '', tag: '按建议', follows: true, extra};
+  }
+  if (s.type === 'free') return {main: s.text || '', tag: '自由回答', follows: false};
+  if (s.type === 'withdrawn') return {main: '已撤回', tag: '', follows: true};
+  return {main: TYPES[s.type] || s.type, tag: '没做决定', follows: false, extra};
+}
+
+// ---------- 进度、当前卡片、快捷键 ----------
+
+function updateProgress() {
+  const d = detail;
+  if (!d || !formShown) return;
+  const live = liveQs(d), done = live.filter(q => slotFor(q)).length;
+  for (const q of d.questions) {
+    const a = document.getElementById('nav_' + q.q); if (!a) continue;
+    const st = q.withdrawn ? 'gone' : slotFor(q) ? 'done' : 'todo';
+    a.className = 'anc ' + st;
+    a.setAttribute('title', {gone: '已撤回', done: '已填', todo: '未填'}[st]);
+    a.replaceChildren(q.q + (st === 'done' ? ' ✓' : ''));
+  }
+  for (const id of ['prog', 'prog2']) { const p = document.getElementById(id); if (p) p.replaceChildren(`已答 ${done}/${live.length}`); }
+  const b = document.getElementById('pbar'); if (b) b.setAttribute('style', `width:${live.length ? Math.round(done * 100 / live.length) : 100}%`);
+  const ds = document.getElementById('dstat');
+  if (ds) ds.replaceChildren(dirty ? '有未保存的改动' : (d.draft.note ? '已保存草稿' : ''));
+}
+
+function setCurQ(q, scroll) {
+  if (curQ && curQ !== q) setCls(document.getElementById('card_' + curQ), 'focus', false);
+  curQ = q;
+  const c = document.getElementById('card_' + q);
+  setCls(c, 'focus', true);
+  if (scroll && c && c.scrollIntoView) c.scrollIntoView({block: 'start', behavior: 'smooth'});
+}
+
+function nextUnanswered(d) {
+  const live = liveQs(d), i = live.findIndex(q => q.q === curQ);
+  const order = live.slice(i + 1).concat(live.slice(0, i + 1));
+  const q = order.find(x => !slotFor(x));
+  if (q) setCurQ(q.q, true);
+  else { msg = {cls: 'info', text: '都填了，可以检查并提交。'}; renderMsg(); }
+}
+
+// 展开「补充」「其他回答」：已有内容就一直展开，不会被收起
+function reveal(q) {
+  const v = checkedValue(q.q), t = textOf(q.q).trim();
+  const open = (k, b) => {
+    if (!b) return;
+    openState[`${k}_${q.q}`] = true;
+    const e = document.getElementById(`f_${k}_${q.q}`); if (e) e.open = true;
+  };
+  open('add', t || v === 'free');
+  open('oth', OTHER.includes(v));
+}
+
+function typing(t) {
+  if (!t || !t.tagName) return false;
+  const tag = String(t.tagName).toUpperCase();
+  if (tag === 'TEXTAREA' || tag === 'SELECT' || t.isContentEditable) return true;
+  return tag === 'INPUT' && !['radio', 'checkbox', 'button', 'submit'].includes(String(t.type || '').toLowerCase());
+}
+
+function onKey(e) {
+  if (e.isComposing || e.keyCode === 229) return;  // 中文输入法正在合成
+  if (sheet) { if (e.key === 'Escape') { e.preventDefault(); closeSheet(); } return; }
+  if (help && (e.key === 'Escape' || e.key === '?')) { e.preventDefault(); showHelp(false); return; }
+  if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+    if (formShown && detail) { e.preventDefault(); startSubmit(detail); }
+    return;
+  }
+  if (e.metaKey || e.ctrlKey || e.altKey || typing(e.target)) return;
+  if (e.key === '?') { e.preventDefault(); showHelp(true); return; }
+  if (!formShown || !detail) return;
+  const live = liveQs(detail); if (!live.length) return;
+  let i = live.findIndex(q => q.q === curQ);
+  if (e.key === 'j' || e.key === 'k') {
+    i = i < 0 ? 0 : Math.max(0, Math.min(live.length - 1, i + (e.key === 'j' ? 1 : -1)));
+    e.preventDefault(); setCurQ(live[i].q, true); return;
+  }
+  const q = live[i < 0 ? 0 : i];
+  let v = null;
+  if (/^[1-9]$/.test(e.key)) { const k = +e.key - 1; if (k < q.options.length) v = 'opt:' + k; }
+  else if (e.key === 's' && q.suggestion) v = 'suggested';
+  if (!v) return;
+  const r = document.querySelector(`input[name="t_${q.q}"][value="${v}"]`);
+  if (r) { e.preventDefault(); r.checked = true; setCurQ(q.q); markDirty(); }
+}
+
+function showHelp(on) {
+  help = on;
+  const box = document.getElementById('help');
+  if (!on) { box.removeAttribute ? box.removeAttribute('data-open') : null; box.replaceChildren(); return; }
+  const keys = [['1 – 9', '选当前卡片的第 n 个选项'], ['s', '当前卡片按建议'], ['j / k', '下一张 / 上一张卡片'],
+    ['⌘↵ / Ctrl+↵', '多问题：打开提交摘要；单问题：直接提交'], ['?', '显示 / 关闭这份帮助'], ['Esc', '关闭摘要或帮助']];
+  box.setAttribute('data-open', '');
+  box.replaceChildren(el('div', {class: 'dlg'}, el('h2', {}, '快捷键'),
+    el('div', {class: 'keys'}, keys.map(([k, t]) => [el('kbd', {}, k), el('span', {}, t)])),
+    el('p', {class: 'mute small'}, '「当前卡片」是最后点过、或用 j / k 定位到的那张。焦点在输入框里或输入法正在合成时，字母和数字键不响应。'),
+    el('div', {class: 'btns'}, el('button', {onclick: () => showHelp(false)}, '关闭'))));
+}
+
+// ---------- 提交：多问题先出摘要，单问题直接提交 ----------
+
+function revKey(d) { return `${d.id}/${d.content_rev}/${d.answer_rev}`; }
+
+function startSubmit(d) {
+  if (d !== detail || posting) return;
+  const slots = slotsFromForm(d);
+  if (liveQs(d).length < 2) return submitNow(d, slots);
+  sheet = {key: revKey(d), fg: formGen, slots};
+  renderSheet();
+}
+
+function goLabel(d) { return posting ? '提交中…' : liveQs(d).length > 1 ? '检查并提交' : (d.answer_rev ? '提交更正' : '提交并发回 lead'); }
+function syncGo(d) {
+  const go = document.getElementById('go'); if (!go) return;
+  go.disabled = posting;
+  go.replaceChildren(goLabel(d), posting ? '' : el('kbd', {}, '⌘↵'));
+}
+
+// 同一次提交只发一个请求：提交中按钮禁用并显示「提交中…」，失败后恢复，输入原样保留
+async function submitNow(d, slots) {
+  if (posting) return false;
+  posting = true; syncGo(d);
+  try { return await post(d, 'submit', {content_rev: d.content_rev, answer_rev: d.answer_rev, slots}); }
+  finally { posting = false; if (detail) syncGo(detail); }
+}
+
+function closeSheet() { sheet = null; renderSheet(); }
+
+function confirmSheet() {
+  const d = detail, s = sheet;
+  if (!s || !d || s.key !== revKey(d)) {
+    closeSheet(); msg = {cls: 'warn', text: '问题或回答在别处更新了，摘要已关闭，请重新核对。'}; renderMsg(); return;
+  }
+  if (s.fg !== formGen) { sheet = {key: s.key, fg: formGen, slots: slotsFromForm(d)}; renderSheet(); return; }
+  closeSheet();
+  submitNow(d, s.slots);
+}
+
+function renderSheet() {
+  const box = document.getElementById('sheet'), d = detail;
+  if (!sheet || !d) { if (box.removeAttribute) box.removeAttribute('data-open'); box.replaceChildren(); return; }
+  const live = liveQs(d), rows = [];
+  let follows = 0, missing = [];
+  for (const q of live) {
+    const x = decision(q, sheet.slots[q.q]);
+    if (x.miss) missing.push(q.q); else if (x.follows) follows++;
+    rows.push(el('div', {class: 'srow' + (x.miss ? ' miss' : x.follows ? '' : ' warn'), title: '点这一行回到这题修改',
+      onclick: () => { closeSheet(); setCurQ(q.q, true); }},
+      el('strong', {}, q.q),
+      el('div', {}, el('div', {class: 'qq'}, q.text),
+        el('div', {}, el('span', {class: 'dec'}, x.main), x.tag ? el('span', {class: 'tg'}, x.tag) : null),
+        x.sub ? el('div', {class: 'small mute'}, x.sub) : null,
+        x.extra ? el('div', {class: 'small'}, '补充：' + x.extra) : null)));
+  }
+  const n = live.length - missing.length;
+  const ok = el('button', {class: 'pri', id: 'sheet_ok', onclick: confirmSheet, disabled: missing.length > 0},
+    d.answer_rev ? `确认提交（生成 Rev ${d.answer_rev + 1}）` : '确认提交');
+  box.setAttribute('data-open', '');
+  box.replaceChildren(el('div', {class: 'dlg'},
+    el('h2', {}, `提交前确认 · ${live.length} 个问题`),
+    el('p', {class: 'mute small'}, missing.length ? `还有 ${missing.join('、')} 没答，补完才能提交。` :
+      `${follows} 个按建议，${n - follows} 个不是（黄色）。确认后才会发回 lead。`),
+    rows,
+    el('div', {class: 'btns'}, el('button', {onclick: closeSheet}, '返回修改'), ok)));
+  if (ok.focus && !missing.length) ok.focus();
+}
+
+// ---------- 详情 ----------
+
 // d 是发起操作时屏幕上的那题；切题后不再发，回包也不再改当前视图
 async function post(d, action, body) {
   const id = d.id, g = gen, fg = formGen;
@@ -529,8 +953,9 @@ async function post(d, action, body) {
   refreshList();
   if (g !== gen || id !== cur) return status === 200;
   if (status === 200) {
-    const text = j.note || ({save: '已保存草稿（不投递）', submit: `已提交 Rev ${j.answer_rev}，将发回 lead`}[action] || '完成');
-    if (fg === formGen) { dirty = false; msg = {cls: 'ok', text}; await load(true); }
+    const text = j.note || (action === 'submit' && j.unchanged ? '和当前回答相同，没有重复发送' :
+      {save: '已保存草稿（不投递）', submit: `已提交 Rev ${j.answer_rev}，正在发回 lead`}[action] || '完成');
+    if (fg === formGen) { dirty = false; if (action === 'submit') editing = false; msg = {cls: 'ok', text}; await load(true); }
     else { msg = {cls: 'warn', text: text + '。你在请求期间又改了表单，改动还在，先别刷新。'}; renderMsg(); }
     return true;
   }
@@ -540,77 +965,182 @@ async function post(d, action, body) {
 
 function renderMsg() {
   const box = document.getElementById('msg'); if (!box) return;
-  box.replaceChildren(msg ? el('div', {class: 'bar ' + msg.cls}, msg.text) : '');
+  box.replaceChildren(msg ? el('div', {class: 'msgbar ' + msg.cls}, msg.text) : '');
+}
+
+// 折叠块：展开状态记在 openState，轮询重建后保持
+function fold(key, cls, title, def, ...kids) {
+  const open = key in openState ? openState[key] : def;
+  return el('details', {class: cls, id: 'f_' + key, open, ontoggle: e => { openState[key] = !!e.target.open; }},
+    el('summary', {}, title), ...kids);
+}
+
+function stateLine(d) {
+  const live = liveQs(d).length, gone = d.questions.length - live;
+  let head;
+  if (d.invalid) head = el('span', {class: 'chip bad'}, '已失效');
+  else if (d.status === 'open') head = d.blocking === 'yes' ? el('span', {class: 'chip hot'}, 'lead 正在等你') : '可稍后回答';
+  else if (d.status === 'answered') head = d.received ? el('span', {class: 'chip ok'}, `lead 已接收 Rev ${d.answer_rev}`) : `已提交 Rev ${d.answer_rev}，等 lead 接收`;
+  else if (d.status === 'resolved') head = el('span', {class: 'chip ok'}, d.closed_by === 'owner' ? '已由你关闭' : 'lead 已闭环');
+  else head = '已撤回';
+  return [head, ` · ${live} 个问题${gone ? `（另有 ${gone} 个已撤回）` : ''} · `, when(d.created)];
+}
+
+function closeMenu(d) {
+  if (!d.closable) return null;
+  const reason = el('textarea', {id: 'close_reason', placeholder: '关闭原因（必填）', oninput: markDirty});
+  return fold('more', 'more', '⋯', false, el('div', {class: 'pop'},
+    el('strong', {}, '由我关闭'),
+    el('p', {class: 'mute small'}, d.status === 'open'
+      ? '还没回答的题：关闭等于撤回，之后不会投递。'
+      : '已回答的题：记为「Owner 关闭」（不是 lead 闭环），待投递的取消；如果回答已投递或已领取，会另发一条关闭通知给原 lead。用于 lead 会话已经没了、没人能闭环的情况。'),
+    reason,
+    el('div', {class: 'btns'}, el('button', {onclick: () => {
+      if (!reason.value.trim()) { msg = {cls: 'bad', text: '关闭必须写原因'}; renderMsg(); return; }
+      post(d, 'close', {content_rev: d.content_rev, answer_rev: d.answer_rev, reason: reason.value});
+    }}, '确认关闭'))));
+}
+
+function deliveryBar(d) {
+  if (d.status === 'answered') {  // 已提交：醒目横幅，随投递状态更新
+    const cls = d.received ? 'ok' : (d.renotify ? 'bad' : 'info');
+    const st = d.received ? 'lead 已接收' : d.renotify ? `投递有问题：${d.delivery}` : '正在发回 lead';
+    return el('div', {class: 'banner ' + cls, id: 'dstate'},
+      el('div', {class: 'dbar'}, el('strong', {}, `已提交 Rev ${d.answer_rev}`), ` · ${st}`,
+        d.renotify ? el('button', {onclick: () => post(d, 'renotify', {})}, '重新通知') : null),
+      !d.received && d.delivery ? el('div', {class: 'small'}, `投递：${d.delivery}${d.delivery_detail ? '（' + d.delivery_detail + '）' : ''}`) : null,
+      d.renotify ? el('div', {class: 'small'}, '重新通知会重新核对 lead 身份后再发；这条可能已经在 lead 的队列里。') : null);
+  }
+  const notice = (d.status === 'withdrawn' || d.closed_by === 'owner') && d.delivery && !['已撤回', 'Owner 已关闭'].includes(d.delivery);
+  if (!(d.status === 'answered' || d.status === 'resolved' || notice)) return null;
+  const st = d.received ? 'lead 已接收' : (d.delivery || '');
+  return el('div', {class: 'msgbar ' + (d.received ? 'ok' : (d.renotify ? 'bad' : 'warn')), id: 'dstate'},
+    el('div', {class: 'dbar'}, `投递：${st}${d.delivery_detail && !d.received ? '（' + d.delivery_detail + '）' : ''}`,
+      d.renotify ? el('button', {onclick: () => post(d, 'renotify', {})}, '重新通知') : null),
+    d.renotify ? el('div', {class: 'small'}, '重新通知会重新核对 lead 身份后再发；这条可能已经在 lead 的队列里。') : null);
+}
+
+function answerCard(q, s, label) {  // 只读：一题的已提交决定
+  const x = decision(q, s);
+  return el('div', {class: 'ans'}, el('div', {class: 'k'}, label),
+    el('div', {}, el('strong', {}, x.main), x.tag ? el('span', {class: 'mute small'}, ' · ' + x.tag) : null),
+    x.sub ? el('div', {class: 'small mute'}, x.sub) : null,
+    x.extra ? el('div', {class: 'small'}, '补充：' + x.extra) : null);
+}
+
+function card(d, q, latest) {
+  const c = el('section', {class: 'q' + (q.q === curQ ? ' focus' : '') + (q.withdrawn ? ' gone' : ''), id: 'card_' + q.q,
+    onclick: () => { if (curQ !== q.q) setCurQ(q.q); }},
+    el('h3', {}, el('span', {class: 'qn'}, q.q), q.text));
+  if (q.withdrawn) { c.append(el('p', {class: 'mute small'}, 'lead 已撤回这个子问题，不用答（算已填）。')); return c; }
+  const si = suggestIndex(q), note = (d.option_notes || {})[q.q];
+  if (!formShown) {  // 只读：选项、建议、已提交的决定
+    c.append(el('ul', {class: 'olist'}, q.options.map((o, k) => el('li', {}, o, k === si ? el('span', {class: 'badge'}, '建议') : null))));
+    if (note) c.append(el('div', {class: 'note'}, html(note)));
+    if (q.suggestion) c.append(el('p', {class: 'why'}, 'lead 建议：' + q.suggestion));
+    if (latest && latest.slots[q.q]) c.append(answerCard(q, latest.slots[q.q], `你的回答（Rev ${latest.rev}）`));
+    return c;
+  }
+  const name = 't_' + q.q;
+  const radio = (v, cls, ...kids) => el('label', {class: 'opt' + cls},
+    el('input', {type: 'radio', name, value: v, onchange: () => { markDirty(); reveal(q); }}), ...kids);
+  const opts = el('div', {class: 'opts'});
+  q.options.forEach((o, k) => opts.append(radio('opt:' + k, k === si ? ' sug' : '', el('kbd', {}, k < 9 ? String(k + 1) : '·'),
+    el('span', {class: 'ot'}, o), k === si ? el('span', {class: 'badge'}, '建议') : null)));
+  c.append(opts);
+  if (q.suggestion && si >= 0) {
+    c.append(el('p', {class: 'why'}, '理由：' + (suggestReason(q) || q.suggestion)),
+      el('div', {class: 'sugrow'}, radio('suggested', '', el('kbd', {}, 's'),
+        el('span', {class: 'ot'}, '按建议', el('span', {class: 'mute small'}, `（记为「按建议」，存下建议原文：${q.suggestion}）`)))));
+  } else if (q.suggestion) {
+    c.append(el('div', {class: 'sugrow'}, radio('suggested', ' sug', el('kbd', {}, 's'),
+      el('span', {class: 'ot'}, 'lead 建议：' + q.suggestion), el('span', {class: 'badge'}, '按此建议'))));
+  }
+  if (note) c.append(el('div', {class: 'note'}, html(note)));
+  c.append(fold('add_' + q.q, 'fold', '＋补充', false,
+      el('textarea', {id: 'x_' + q.q, rows: 2, placeholder: '补充 / 原话（不选上面的类型直接写，就算自由回答）', oninput: markDirty})),
+    fold('oth_' + q.q, 'fold', '其他回答 ▾', false,
+      el('div', {class: 'others'}, OTHER.map(t => radio(t, '', el('span', {class: 'ot'}, TYPES[t]))))));
+  return c;
 }
 
 function render() {
-  const d = detail, main = document.getElementById('main'); main.replaceChildren();
-  main.append(el('h1', {}, `${d.id} · ${d.title}`),
-    el('div', {class: 'meta'}, `issue ${d.issue} · ${d.blocking === 'yes' ? 'blocking · ' : ''}${d.status} · content_rev ${d.content_rev} · answer_rev ${d.answer_rev} · 创建于 ${d.created}`),
-    el('div', {id: 'msg'}));
-  if (d.invalid) main.append(el('div', {class: 'bar bad'}, `已失效：${d.invalid}`));
-  if (d.not_executed) main.append(el('div', {class: 'bar bad'}, d.not_executed));
-  for (const w of d.warnings) main.append(el('div', {class: 'bar warn'}, '提示：' + w));
-  const notice = (d.status === 'withdrawn' || d.closed_by === 'owner') && d.delivery && !['已撤回', 'Owner 已关闭'].includes(d.delivery);
-  if (d.status === 'answered' || d.status === 'resolved' || notice) {
-    const st = d.received ? 'lead 已接收' : (d.delivery || '');
-    main.append(el('div', {class: 'bar ' + (d.received ? 'ok' : (d.renotify ? 'bad' : 'warn')), id: 'dstate'}, `投递：${st}${d.delivery_detail && !d.received ? '（' + d.delivery_detail + '）' : ''}`,
-      d.renotify ? el('button', {style: 'margin-left:12px', onclick: () => post(d, 'renotify', {})}, '重新通知') : null,
-      d.renotify ? el('div', {class: 'sugg'}, '重新通知会重新核对 lead 身份后再发；这条可能已经在 lead 的队列里。') : null));
+  const d = detail, main = document.getElementById('main');
+  const same = shownId === d.id, top = main.scrollTop, wy = window.scrollY || 0;
+  shownId = d.id;
+  if (sheet && sheet.key !== revKey(d)) { sheet = null; msg = {cls: 'warn', text: '问题或回答在别处更新了，摘要已关闭，请重新核对。'}; }
+  formShown = !!(d.editable && (!d.answer_rev || editing || Object.keys(d.draft.slots).length));
+  const latest = d.revs.find(r => r.rev === d.answer_rev), live = liveQs(d);
+  const wrap = el('div', {class: 'wrap'});
+  wrap.append(el('header', {},
+    el('a', {class: 'back', id: 'back', href: '#'}, `← 收件箱（待答 ${openCount}）`),
+    el('div', {class: 'where'}, el('span', {}, where(d) || d.id), closeMenu(d)),
+    el('h1', {}, d.title || d.id),
+    el('div', {class: 'state'}, stateLine(d))));
+  if (!formShown) wrap.append(el('div', {id: 'msg'}));
+  if (d.invalid) wrap.append(el('div', {class: 'msgbar bad'}, `已失效：${d.invalid}`));
+  if (d.not_executed) wrap.append(el('div', {class: 'msgbar bad'}, d.not_executed));
+  for (const w of d.warnings) wrap.append(el('div', {class: 'msgbar warn'}, '提示：' + w));
+  wrap.append(deliveryBar(d) || '');
+  if (d.resolution) wrap.append(el('div', {class: 'msgbar ok'}, (d.closed_by === 'owner' ? '由你在页面上关闭（不是 lead 闭环）：' : 'lead 已闭环：') + d.resolution));
+  const prose = (title, h, cls) => h ? el('section', {class: 'sec prose ' + (cls || '')}, el('h2', {}, title), html(h)) : null;
+  wrap.append(prose('背景', d.background_html) || '', prose('证据', d.evidence_html) || '');
+  if (d.errata_html) wrap.append(fold('errata', 'sec prose errata', '勘误（lead 改过问题，作答前请看）', false, html(d.errata_html)));
+  if (d.after_html) wrap.append(el('div', {class: 'after prose'}, el('span', {class: 'mute small'}, '答完之后：'), html(d.after_html)));
+  if (d.extra_html) wrap.append(fold('extra', 'sec prose', '补充材料', true, html(d.extra_html)));
+  let staleBox = null;
+  if (formShown) {
+    staleBox = el('div', {});
+    wrap.append(el('div', {class: 'nav'}, el('span', {id: 'prog'}),
+      d.questions.map(q => el('button', {class: 'anc', id: 'nav_' + q.q, onclick: () => setCurQ(q.q, true)}, q.q)),
+      el('button', {class: 'next', onclick: () => nextUnanswered(d)}, '下一个未答')), staleBox);
+    if (d.answer_rev) wrap.append(el('div', {class: 'msgbar info'}, `正在更正：当前 Rev ${d.answer_rev}，提交后生成 Rev ${d.answer_rev + 1}，旧版作废。`));
   }
-  if (d.resolution) main.append(el('div', {class: 'bar ok'}, (d.closed_by === 'owner' ? '由你在页面上关闭（不是 lead 闭环）：' : 'lead 已闭环：') + d.resolution));
-  main.append(el('div', {class: 'card'}, html(d.body_html)));
-  if (d.errata_html) main.append(el('div', {class: 'card'}, el('h3', {}, '勘误'), html(d.errata_html)));
-  let staleBox = null, draftBox = null;
-  if (d.editable) {
-    staleBox = el('div', {}); draftBox = el('div', {class: 'sugg'});
-    const form = el('div', {class: 'card'}, el('h3', {}, d.answer_rev ? `更正回答（当前 Rev ${d.answer_rev}，提交后生成 Rev ${d.answer_rev + 1}）` : '回答'), draftBox, staleBox);
-    for (const q of d.questions) {
-      const box = el('div', {class: 'slot'}, el('strong', {}, `${q.q}. ${q.text}`));
-      if (q.withdrawn) { box.append(el('div', {class: 'sugg'}, 'lead 已撤回这个子问题（算已填）')); form.append(box); continue; }
-      q.options.forEach((o, i) => box.append(el('label', {}, el('input', {type: 'radio', name: 't_' + q.q, value: 'opt:' + i, onchange: markDirty}), ' ', o)));
-      for (const [t, name] of Object.entries(TYPES)) {
-        if (t === 'suggested' && !q.suggestion) continue;
-        box.append(el('label', {}, el('input', {type: 'radio', name: 't_' + q.q, value: t, onchange: markDirty}), ' ', name, t === 'suggested' ? `：${q.suggestion}` : ''));
-      }
-      box.append(el('textarea', {id: 'x_' + q.q, placeholder: '补充 / 原话（不选类型直接写，就算自由回答）', oninput: markDirty}));
-      form.append(box);
-    }
-    form.append(el('div', {},
-      el('button', {onclick: () => post(d, 'save', {content_rev: d.content_rev, slots: slotsFromForm(d)})}, '保存草稿'),
-      el('button', {onclick: () => fillSuggested(d)}, '其余按建议'),
-      el('button', {class: 'pri', onclick: () => post(d, 'submit', {content_rev: d.content_rev, answer_rev: d.answer_rev, slots: slotsFromForm(d)})}, d.answer_rev ? '提交更正并发回 lead' : '提交并发回 lead'),
-      el('div', {class: 'sugg'}, '「其余按建议」只填还空着的子问题，你可以再改；只有点提交才算回答。')));
-    main.append(form);
+  for (const q of d.questions) wrap.append(card(d, q, latest));
+  if (!formShown && d.editable && latest) {
+    wrap.append(el('div', {class: 'acts'}, el('button', {onclick: () => { editing = true; msg = null; render(); }}, '更正回答')));
   }
-  if (d.closable) {
-    const reason = el('textarea', {id: 'close_reason', placeholder: '关闭原因（必填）', oninput: markDirty});
-    main.append(el('details', {class: 'card'}, el('summary', {}, '由我关闭'),
-      el('div', {class: 'sugg'}, d.status === 'open'
-        ? '还没回答的题：关闭等于撤回，之后不会投递。'
-        : '已回答的题：记为「Owner 关闭」（不是 lead 闭环），待投递的取消；如果回答已投递或已领取，会另发一条关闭通知给原 lead。用于 lead 会话已经没了、没人能闭环的情况。'),
-      reason,
-      el('button', {onclick: () => {
-        if (!reason.value.trim()) { msg = {cls: 'bad', text: '关闭必须写原因'}; renderMsg(); return; }
-        post(d, 'close', {content_rev: d.content_rev, answer_rev: d.answer_rev, reason: reason.value});
-      }}, '确认关闭')));
+  const older = d.revs.filter(r => r.rev !== d.answer_rev || formShown).reverse();
+  wrap.append(el('div', {class: 'foot'},
+    older.length ? fold('revs', '', `已提交的回答（${older.length} 版）`, false, older.map(r => el('div', {class: 'rev'},
+      el('strong', {}, `Rev ${r.rev}${r.corrected_by ? `（已被 Rev ${r.corrected_by} 更正）` : ''}`), ' ', el('span', {title: r.at}, ago(r.at)),
+      d.questions.filter(q => r.slots[q.q]).map(q => { const x = decision(q, r.slots[q.q]); return el('div', {}, `${q.q}：${x.main}${x.tag ? '（' + x.tag + '）' : ''}`, x.extra ? el('div', {class: 'small'}, '补充：' + x.extra) : null); })))) : null,
+    fold('tl', '', '时间线', false, d.timeline.map(t => el('div', {}, t))),
+    fold('info', '', '详情', false, el('div', {class: 'kv'},
+      [['id', d.id], ['状态', d.status], ['issue', d.issue], ['group', d.group], ['content_rev', d.content_rev],
+        ['answer_rev', d.answer_rev], ['创建', d.created], ['更新', d.updated]]
+        .filter(([, v]) => v !== '' && v != null).map(([k, v]) => [el('span', {}, k), el('span', {}, String(v))])))));
+  if (formShown) {
+    const empty = () => liveQs(d).filter(q => q.suggestion && !slotFor(q)).map(q => q.q);
+    wrap.append(el('div', {class: 'bar-b'}, el('div', {id: 'msg'}), el('div', {class: 'row'},
+      el('div', {class: 'prog'}, el('strong', {id: 'prog2'}), el('span', {class: 'pb'}, el('span', {id: 'pbar'})),
+        el('span', {id: 'dstat', class: 'mute small'}), el('span', {class: 'mute small hint'}, '? 快捷键')),
+      el('div', {class: 'acts'},
+        d.answer_rev && !Object.keys(d.draft.slots).length ? el('button', {onclick: () => {
+          if (dirty && !confirm(LEAVE_MSG)) return;
+          editing = false; dirty = false; msg = null; render();
+        }}, '放弃更正') : null,
+        el('button', {onclick: () => post(d, 'save', {content_rev: d.content_rev, slots: slotsFromForm(d)})}, '保存草稿'),
+        live.some(q => q.suggestion) ? el('button', {onclick: () => {
+          const todo = empty(), n = fillSuggested(d);
+          msg = {cls: 'info', text: n ? `已按建议填入 ${todo.join('、')}，还没提交，可以再改。` : '没有能按建议填的空题。'}; renderMsg();
+        }}, '其余按建议') : null,
+        el('button', {class: 'pri', id: 'go', disabled: posting, onclick: () => startSubmit(d)}, goLabel(d), posting ? null : el('kbd', {}, '⌘↵')))),
+      el('p', {class: 'mute small'}, '「其余按建议」只填还空着的题，你可以再改；只有提交才算回答。')));
   }
-  for (const r of [...d.revs].reverse()) {
-    const c = el('div', {class: 'card'}, el('h3', {}, `Rev ${r.rev}${r.corrected_by ? `（已被 Rev ${r.corrected_by} 更正）` : ''}`), el('div', {class: 'meta'}, r.at));
-    for (const [q, s] of Object.entries(r.slots)) c.append(el('div', {}, `${q}：[${s.type === 'option' ? '选项' : (TYPES[s.type] || s.type)}] ${s.choice || ''}`, s.text ? el('div', {class: 'sugg'}, '原话：' + s.text) : null));
-    main.append(c);
-  }
-  main.append(el('details', {class: 'card'}, el('summary', {}, '时间线'), ...d.timeline.map(t => el('div', {class: 'meta'}, t))));
-  if (d.editable) {
-    const latest = d.revs.find(r => r.rev === d.answer_rev);
+  main.replaceChildren(wrap);
+  if (formShown) {
     const stale = fillForm(d, Object.keys(d.draft.slots).length ? d.draft.slots : (latest ? latest.slots : {}));
-    if (d.draft.note) draftBox.append('草稿：' + d.draft.note);
-    for (const s of stale) staleBox.append(el('div', {class: 'bar warn'}, s + '（问题有勘误），请重新选择。'));
+    for (const s of stale) staleBox.append(el('div', {class: 'msgbar warn'}, s + '（问题有勘误），请重新选择。'));
+    for (const q of live) reveal(q);
   }
-  renderMsg();
+  renderMsg(); updateProgress(); renderSheet();
+  if (same) { main.scrollTop = top; if (window.scrollTo && window.scrollY !== wy) window.scrollTo(0, wy); }
+  else { main.scrollTop = 0; if (window.scrollTo) window.scrollTo(0, 0); }
+  if (store('qi.seen.' + d.id) !== String(d.content_rev) && store('qi.seen.' + d.id, String(d.content_rev))) refreshList();
 }
 
-// 会重建表单的只有这里（render 只被 load 调用）。force 也不能绕过输入保护：
+// 会重建表单的只有这里（render 只被 load 和本地按钮调用）。force 也不能绕过输入保护：
 // 请求发出后 Owner 又输入过（formGen 变了），就保留表单，只提示服务端状态变了
 async function load(force) {
   const id = cur, g = gen, seq = ++loadSeq, fg = formGen;
@@ -618,7 +1148,7 @@ async function load(force) {
   const {status, j} = await api('/api/q/' + encodeURIComponent(id));
   if (g !== gen || id !== cur || seq < loadApplied) return;  // 发起后切了题，或已有更新的读取生效
   loadApplied = seq;
-  if (status !== 200) { document.getElementById('main').replaceChildren(el('div', {class: 'bar bad'}, j.error || '加载失败')); detail = null; return; }
+  if (status !== 200) { document.getElementById('main').replaceChildren(el('div', {class: 'wrap'}, el('div', {class: 'msgbar bad'}, j.error || '加载失败'))); detail = null; return; }
   if (j.id !== id) return;
   const changed = !detail || detail.id !== j.id || detail.content_rev !== j.content_rev || detail.answer_rev !== j.answer_rev || detail.status !== j.status;
   if (!force && !dirty && JSON.stringify(detail) === JSON.stringify(j)) return;
@@ -639,11 +1169,15 @@ function route() {
   if (detail && next === cur) return;  // 取消离开时恢复 hash 触发的那次 hashchange
   if (dirty && detail && detail.editable && !confirm(LEAVE_MSG)) { location.hash = '#' + cur; return; }
   gen++; cur = decodeURIComponent(location.hash.slice(1)) || null; detail = null; dirty = false; msg = null;
-  document.getElementById('main').replaceChildren(el('p', {class: 'meta'}, cur ? '加载中…' : '选择左边的问题。'));
+  curQ = null; editing = false; sheet = null; openState = {}; shownId = null; formShown = false;
+  renderSheet();
+  document.getElementById('app').setAttribute('data-view', cur ? 'detail' : 'list');
+  document.getElementById('main').replaceChildren(el('div', {class: 'wrap'}, el('p', {class: 'mute'}, cur ? '加载中…' : '选择左边的问题。')));
   load(true); refreshList();
 }
 window.addEventListener('hashchange', route);
 window.addEventListener('beforeunload', e => { if (dirty) { e.preventDefault(); e.returnValue = LEAVE_MSG; } });
+window.addEventListener('keydown', onKey);
 route();
 setInterval(() => { refreshList(); load(false); }, 3000);
 </script></body></html>
