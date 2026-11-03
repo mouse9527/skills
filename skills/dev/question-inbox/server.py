@@ -631,14 +631,19 @@ async function load(force) {
   if (changed) { msg = {cls: 'warn', text: '问题或回答已在别处更新：你填的内容还在表单里，提交会提示冲突并自动保留为草稿，然后刷新页面。'}; renderMsg(); }
 }
 
+const LEAVE_MSG = '当前问题有未保存的输入，离开会丢失。确定离开？';
+
+// 切题前有未保存的输入：先确认，取消就留在原题并恢复 hash。前端不在后台发任何写请求
 function route() {
-  // 切题前有未保存的输入：先按原题存草稿（冲突时服务端也会保留为草稿），不丢
-  if (dirty && detail && detail.editable) api(`/api/q/${encodeURIComponent(detail.id)}/save`, {content_rev: detail.content_rev, slots: slotsFromForm(detail)});
+  const next = decodeURIComponent(location.hash.slice(1)) || null;
+  if (detail && next === cur) return;  // 取消离开时恢复 hash 触发的那次 hashchange
+  if (dirty && detail && detail.editable && !confirm(LEAVE_MSG)) { location.hash = '#' + cur; return; }
   gen++; cur = decodeURIComponent(location.hash.slice(1)) || null; detail = null; dirty = false; msg = null;
   document.getElementById('main').replaceChildren(el('p', {class: 'meta'}, cur ? '加载中…' : '选择左边的问题。'));
   load(true); refreshList();
 }
 window.addEventListener('hashchange', route);
+window.addEventListener('beforeunload', e => { if (dirty) { e.preventDefault(); e.returnValue = LEAVE_MSG; } });
 route();
 setInterval(() => { refreshList(); load(false); }, 3000);
 </script></body></html>

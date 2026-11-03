@@ -527,9 +527,14 @@ def publish(fields, lead, identity, supersedes=None):
 DELIVERED = ('sending', 'sent', 'uncertain', 'received')  # lead 可能已经拿到过回答
 
 
+def ever_delivered(meta):
+    """任一版本曾经交给 herdr 或被领取过（当前 delivery 可能因为更正、重新通知回到了 pending / held）。"""
+    return bool(meta.get('herdr_accepted_at')) or geti(meta, 'received_rev') > 0 or meta.get('delivery') in DELIVERED
+
+
 def _queue_notice(meta):
     """撤回 / Owner 关闭时，回答可能已经在 lead 手里：单独排一条通知（送不到不影响撤回或关闭本身）。"""
-    if meta.get('delivery') in DELIVERED:
+    if ever_delivered(meta):
         meta['withdraw_notice'] = 'pending'
         meta['next_try_at'] = now()
         meta['hold_count'] = '0'

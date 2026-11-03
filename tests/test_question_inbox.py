@@ -639,6 +639,89 @@ class OwnerCloseTest(Base):
         self.assertEqual((by[qid], by[lead_done]), ('owner', 'lead'))
 
 
+class NoticeHistoryTest(Base):
+    """J：关闭 / 撤回通知按投递历史判断，不只看当前 delivery。"""
+
+    def setUp(self):
+        super().setUp()
+        os.environ['QI_SCAN_INTERVAL'] = '3600'
+        self.start_server()
+
+    def close(self, qid):
+        m = self.meta(qid)
+        return self.http('POST', f'/api/q/{qid}/close', {'content_rev': int(m['content_rev']),
+                                                          'answer_rev': int(m['answer_rev']), 'reason': '不做了'})
+
+    def delivered(self, receive=True):
+        qid = self.ask()
+        qstore.submit(qid, 1, 0, self.answer_all(qid))
+        server.scan_once()
+        self.assertEqual(self.meta(qid)['delivery'], 'sent')
+        if receive:
+            self.assertEqual(self.q('receive', qid).returncode, 0)
+        return qid
+
+    def assert_notice_sent_after_close(self, qid, before_delivery):
+        self.assertEqual(self.meta(qid)['delivery'], before_delivery)
+        self.assertEqual(self.close(qid)[0], 200)
+        m = self.meta(qid)
+        self.assertEqual((m['status'], m['withdraw_notice']), ('resolved', 'pending'))
+        self.assertNotIn(m['delivery'], ('pending', 'held'))  # 待投递的更正 / 重发已取消
+        # 送不到：进 held，页面可重新通知；恢复后送达
+        self.set_herdr(panes={'demo': [pane()]}, prompt='garbage')
+        server.scan_once()
+        self.assertEqual(self.meta(qid)['withdraw_notice'], 'uncertain')
+        _, d, _ = self.http('GET', f'/api/q/{qid}')
+        self.assertTrue(d['renotify'])
+        self.assertEqual(self.http('POST', f'/api/q/{qid}/renotify', {})[0], 200)
+        self.set_herdr(panes={'demo': [pane()]}, prompt='ok')
+        server.scan_once()
+        self.assertEqual(self.meta(qid)['withdraw_notice'], 'sent')
+        self.assertIn('Owner 已在页面上关闭', self.herdr_calls()[-1][-1])
+        self.assertNotIn('Owner 已回答', self.herdr_calls()[-1][-1])
+
+    def test_received_then_correction_pending_then_close(self):
+        qid = self.delivered()
+        qstore.submit(qid, 1, 1, {'Q1': {'type': 'defer'}, 'Q2': {'type': 'defer'}})
+        self.assert_notice_sent_after_close(qid, 'pending')
+
+    def test_sent_then_renotify_pending_then_close(self):
+        qid = self.delivered(receive=False)
+        self.assertEqual(self.http('POST', f'/api/q/{qid}/renotify', {})[0], 200)
+        self.assert_notice_sent_after_close(qid, 'pending')
+
+    def test_received_then_correction_held_then_close(self):
+        qid = self.delivered()
+        qstore.submit(qid, 1, 1, {'Q1': {'type': 'defer'}, 'Q2': {'type': 'defer'}})
+        self.set_herdr(panes={'demo': [pane()]}, prompt='blocked')
+        server.scan_once()
+        self.set_herdr(panes={'demo': [pane()]}, prompt='ok')
+        self.assert_notice_sent_after_close(qid, 'held')
+
+    def test_lead_withdraw_and_supersede_use_history_too(self):
+        a = self.delivered()
+        qstore.submit(a, 1, 1, {'Q1': {'type': 'defer'}, 'Q2': {'type': 'defer'}})  # 当前 pending
+        self.assertEqual(self.q('withdraw', a, '--reason', '事实变了').returncode, 0)
+        self.assertEqual(self.meta(a)['withdraw_notice'], 'pending')
+        b = self.delivered(receive=False)
+        self.assertEqual(self.http('POST', f'/api/q/{b}/renotify', {})[0], 200)  # 当前 pending
+        c = self.ask(extra=('--supersedes', b))
+        self.assertEqual((self.meta(b)['superseded_by'], self.meta(b)['withdraw_notice']), (c, 'pending'))
+
+    def test_never_delivered_close_sends_no_notice(self):
+        qid = self.ask()
+        qstore.submit(qid, 1, 0, self.answer_all(qid))
+        self.set_herdr(panes={'demo': [pane()]}, prompt='blocked')
+        server.scan_once()  # 首次回答从没交给 herdr：held
+        self.assertEqual(self.meta(qid)['delivery'], 'held')
+        calls = len(self.herdr_calls())
+        self.assertEqual(self.close(qid)[0], 200)
+        self.assertEqual(self.meta(qid)['withdraw_notice'], '')
+        self.set_herdr(panes={'demo': [pane()]}, prompt='ok')
+        server.scan_once()
+        self.assertEqual(len(self.herdr_calls()), calls)
+
+
 SEPARATORS = {'U+2028': ' ', 'U+2029': ' ', 'U+0085': '\u0085'}
 
 
@@ -975,7 +1058,10 @@ function fetch(path, opt) { return new Promise(resolve => requests.push({path, o
 function reply(req, status, body) { req.resolve({status, json: async () => body}); }
 const flush = async () => { for (let i = 0; i < 20; i++) await new Promise(r => setImmediate(r)); };
 const rendered = [];
-const ctx = {document, window: {addEventListener() {}}, location: {hash: ''}, fetch, setInterval() {}, Node: Elem,
+const listeners = {}, confirms = [];
+let confirmAnswer = true;
+const ctx = {document, window: {addEventListener(k, f) { listeners[k] = f; }}, location: {hash: ''}, fetch, setInterval() {}, Node: Elem,
+  confirm(m) { confirms.push(m); return confirmAnswer; },
   console, __rendered: rendered,
   __buildForm(d) {
     form.values = {}; form.checked = {}; form.texts = {};
@@ -1067,11 +1153,24 @@ const posts = () => requests.filter(r => r.opt.method === 'POST').map(r => ({pat
     run('load(false)'); await flush();
     answer('/api/q/demo-0001', 200, fresh); await flush();
     out.textAfterPoll = form.texts.Q1; out.rebuiltAfterPoll = rendered.length - initialRenders;
-  } else if (scenario === 'route-autosave') {
+  } else if (scenario === 'route-confirm') {
+    // 切题前确认：cancel = dirty 时用户取消；ok = dirty 时用户确认；clean = 没有未保存输入
+    const mode = process.argv[4];
     answer('/api/q/demo-0001', 200, mkDetail('demo-0001')); await flush();
-    form.texts.Q1 = '没保存就切题'; run('markDirty()');
-    ctx.location.hash = '#demo-0002'; run('route()');
-    out.posts = posts();
+    if (mode !== 'clean') { form.texts.Q1 = '没保存的输入'; run('markDirty()'); }
+    confirmAnswer = mode !== 'cancel';
+    const before = requests.length;
+    const ev = {returnValue: undefined, prevented: false, preventDefault() { this.prevented = true; }};
+    listeners.beforeunload(ev);
+    out.unloadPrompt = ev.prevented;
+    ctx.location.hash = '#demo-0002'; listeners.hashchange(); await flush();
+    out.hashAfter = ctx.location.hash;
+    if (mode === 'cancel') listeners.hashchange();  // 恢复 hash 引起的那次 hashchange
+    await flush();
+    out.cur = run('cur'); out.displayed = run('detail && detail.id');
+    out.text = form.texts.Q1; out.dirty = run('dirty');
+    out.confirms = confirms.slice();
+    out.newRequests = requests.slice(before).map(r => ({path: r.path, method: r.opt.method || 'GET'}));
   }
   for (const r of requests) if (r.path === '/api/list' && !r.done) { r.done = true; reply(r, 200, LIST); }
   await flush();
@@ -1146,11 +1245,31 @@ class PageScriptTest(unittest.TestCase):
                 self.assertEqual(out['textAfterPoll'], 'POST 成功后继续写的新回答')
                 self.assertEqual(out['rebuiltAfterPoll'], 0)
 
-    def test_route_away_autosaves_unsaved_input(self):
-        out = self.run_page('route-autosave')
-        self.assertEqual(len(out['posts']), 1)
-        self.assertEqual(out['posts'][0]['path'], '/api/q/demo-0001/save')
-        self.assertEqual(out['posts'][0]['body']['slots']['Q1'], {'type': 'free', 'text': '没保存就切题'})
+    def test_route_dirty_cancel_stays_without_requests(self):
+        out = self.run_page('route-confirm', 'cancel')
+        self.assertEqual(len(out['confirms']), 1)
+        self.assertIn('未保存的输入', out['confirms'][0])
+        self.assertEqual(out['hashAfter'], '#demo-0001')  # hash 恢复原样
+        self.assertEqual((out['cur'], out['displayed']), ('demo-0001', 'demo-0001'))
+        self.assertEqual(out['text'], '没保存的输入')
+        self.assertTrue(out['dirty'])
+        self.assertEqual(out['newRequests'], [])
+        self.assertTrue(out['unloadPrompt'])
+
+    def test_route_dirty_confirm_leaves_without_writes(self):
+        out = self.run_page('route-confirm', 'ok')
+        self.assertEqual(len(out['confirms']), 1)
+        self.assertEqual(out['cur'], 'demo-0002')
+        self.assertFalse(out['dirty'])
+        self.assertEqual([r for r in out['newRequests'] if r['method'] == 'POST'], [])
+        self.assertIn({'path': '/api/q/demo-0002', 'method': 'GET'}, out['newRequests'])
+
+    def test_route_clean_switches_without_confirm(self):
+        out = self.run_page('route-confirm', 'clean')
+        self.assertEqual(out['confirms'], [])
+        self.assertFalse(out['unloadPrompt'])
+        self.assertEqual(out['cur'], 'demo-0002')
+        self.assertEqual([r for r in out['newRequests'] if r['method'] == 'POST'], [])
 
 
 if __name__ == '__main__':
