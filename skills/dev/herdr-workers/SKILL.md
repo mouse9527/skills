@@ -74,8 +74,9 @@ herdr agent start <name> --kind <kind> --pane <pane> -- <该 CLI 的 yolo 参数
   - 涉及生产、远端资源、不可逆删除的任务，用户可要求改用受限模式（claude：不加 yolo 参数；codex：`-c sandbox_mode=workspace-write -c approval_policy=on-request`；pi 默认不审批，要受限只能换 CLI）。
 - 启动后 `herdr agent read <name>` 确认权限模式与预期一致（见上表）。
 - **信任 / hook 审核界面**：首次进新目录，claude 会先弹「是否信任此目录」（`agent start` 报 `agent_not_ready`）；codex 等可能弹 hook 审核。第一条 prompt 会被吃掉。
-  读屏看清选项后问用户：同意信任就选信任；没表态前选「不信任继续」类的那一项或先不动。选项编号随版本变，读屏再选，别背。
-  更省事：在已信任过的目录起 worker。
+  - **「是否信任此目录」直接选信任，不问用户**（Owner 2026-11-03）。前提是目录在 `~/workspaces/` 下、是 lead 自己建的或任务指定的；来路不明的目录（下载的、别人给的）照下一条处理。
+  - **hook 审核**（codex 等）和其他目录：读屏看清选项后问用户；没表态前选「不信任继续」类的那一项或先不动。
+  - 选项编号随版本变，读屏再选，别背。
 - `agent start` 失败时 pane 里可能留着一个无名 agent —— 它会在侧栏伪装成 lead，关掉或命名。
 
 **同一件事的后续任务继续派给原 worker**（它读过的上下文就是资产）；换一件事、换目录就新建 worker。
