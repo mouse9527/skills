@@ -51,6 +51,10 @@ herdr pane move <pane> --tab <tab_id> --target-pane <pane> --split right --no-fo
 
 ## 2. 起 worker
 
+**名字和 cwd 带任务号**，这样不用另记「谁在做哪个任务」，看 herdr 就能算出来：
+实现 worker 叫 `w-<号>`（同一任务多个就 `w-<号>-<用途>`），审查 worker 叫 `rv-<号>-<kind>`；`--cwd` 放在 `issues/<号>/` 下（老 ws 是 `stories/<号>/`）。
+不属于任何 Issue 的临时活（讨论、调研）用描述性名字，不带号。
+
 ```bash
 herdr agent start <name> --kind <kind> --pane <pane> -- <该 CLI 的 yolo 参数> <模型参数>
 ```

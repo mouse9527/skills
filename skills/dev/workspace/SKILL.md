@@ -64,6 +64,20 @@ README 超过约 300 行就体检：每段问「是纪律还是操作手册」�
 
 ## 3. 一个 Issue 的流程
 
+**Owner 关心的是任务，不是哪个 lead / session。** 任务 = Issue（大需求是一棵 Issue 树：父子用 sub-issue，先后用依赖，相关写 `Relates to <owner>/<repo>#<号>`，三种关系不混用）。
+lead、worker 只是「当前谁在做」，可以换；状态从 Issue + PR + checks + 收件箱现算。
+
+**一句话需求**：Owner 对任何 lead 说一句就算交给你了，不用他选 ws、找仓库。收到的 lead 当场评估：
+
+1. 查重：已有 Issue 的补充就补到那个 Issue，不另开。
+2. 判断做不做、归哪个 ws（按各 ws README 的 Issue repo）、要不要拆。拆只拆**能独立验收或独立授权**的结果，实现步骤留在任务书里。
+3. **当天落地**，二选一，都不只停在聊天里：
+   - 做：在对应 repo 开 Issue（不是本 ws 的就开在那个 ws 的 repo，正文写明归谁接）；
+   - 不做：同样开 Issue 写清一句理由，然后以 **not planned** 关闭——留痕，Owner 不同意就 reopen。低价值的不做不用先问 Owner。
+4. 回复 Owner 一行：`<owner>/<repo>#<号> · 做 / 不做 · 下一步`。
+
+只有业务取舍、优先级冲突、扩大授权范围、不可逆或对外动作才进问题收件箱问 Owner；做不做、怎么拆本身不出题。
+
 开工前先看 README 第 8 项：没有接入检查记录、或仓库表里有 repo 不在记录里，先按第 11 节查一遍。
 
 ```
@@ -79,7 +93,12 @@ README 超过约 300 行就体检：每段问「是纪律还是操作手册」�
 看状态从 Issue + PR + checks 现算（`gh issue view` / `gh pr list --search <issue-id>` / `gh pr checks`），不在本地记。
 范围变了先改 Issue，再改代码；Issue 里没有的不做。
 
-`.templates/issue.md` 至少含四段：**验收标准**（每条写出能区分对错的验证方式）、**不做什么**、**止损条件**（触发就停下来问）、**done 的边界**。
+`.templates/issue.md` 至少含五段：**验收标准**（每条写出能区分对错的验证方式）、**不做什么**、**止损条件**（触发就停下来问）、**done 的边界**、
+**授权范围**（Owner 原话或决定链接；lead 不用回来问就能做到哪，例如能否自己开子 Issue、合低档 PR、部署 test）。
+授权范围变大就开新的子 Issue 写新的授权，不改写旧的；父 Issue 的授权不自动传给子 Issue（例如只读分析的父 Issue 下挂的删除任务，要有自己的授权）。
+
+**回复 Owner 先锚定任务**：先说是哪个 Issue（`<owner>/<repo>#<号> 标题`）、结果 / 卡点 / 下一步，再说细节；不先报会话或 worker 的运行情况。
+`NOW.md` 只是便签：「Owner 已决定 / 待部署 / 待跟进」这类事实要落到 Issue（评论或验收项），便签里只留链接。
 
 ## 4. worktree 生命周期
 
