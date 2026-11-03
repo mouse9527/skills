@@ -1319,7 +1319,10 @@ const pick = (q, v) => { const r = radio(q, v); r.checked = true; r.dispatch('ch
 const document = {
   title: '',
   createElement: t => new Elem(t),
-  createTextNode: t => new Text(t),
+  createTextNode: t => {  // 数组 / 节点被 String() 转成文字时，真 DOM 会显示 [object ...]
+    if (/\[object /.test(String(t))) throw new Error('对象被当成文字渲染：' + String(t).slice(0, 80));
+    return new Text(t);
+  },
   querySelector(sel) {
     if (sel === 'meta[name=qi-token]') return {content: 'tok'};
     let m = sel.match(/^input\[name="([^"]+)"\]:checked$/);
@@ -1417,6 +1420,19 @@ const text = e => (e ? e.textContent : null);
       title: text(s.children[0]), ws: findAll(e => e.tagName === 'H3', s).map(text),
       items: findAll(e => e.tagName === 'A', s).map(a => a.attrs.href)}));
     out.firstItem = text(find(e => e.tagName === 'A' && e.attrs.href === '#a-0001', side));
+  } else if (scenario === 'help-detail') {
+    await open(answeredFrom(mkDetail('demo-0001', 2), {Q1: {type: 'defer'}, Q2: {type: 'option', choice: 'A. 甲方案 2'}},
+      {timeline: ['2026-11-03T10:00 发布', '2026-11-03T10:05 Owner 提交 Rev 1'], answer_rev: 2,
+       revs: [{rev: 1, at: '2026-11-03T10:05:00+08:00', corrected_by: 2, slots: {Q1: {type: 'defer'}, Q2: {type: 'defer', text: '旧补充'}}},
+              {rev: 2, at: '2026-11-03T10:06:00+08:00', corrected_by: 0, slots: {Q1: {type: 'defer'}, Q2: {type: 'option', choice: 'A. 甲方案 2'}}}]}));
+    key('?');
+    out.helpOpen = 'data-open' in byId('help').attrs;
+    out.help = text(byId('help'));
+    out.helpKeys = findAll(e => e.tagName === 'KBD', byId('help')).map(text);
+    out.info = findAll(e => e.tagName === 'SPAN', byId('f_info')).map(text);
+    out.timeline = findAll(e => e.tagName === 'DIV', byId('f_tl')).map(text);
+    out.revs = text(byId('f_revs'));
+    key('Escape'); out.helpClosed = !('data-open' in byId('help').attrs);
   } else if (scenario === 'escape') {
     const d = mkDetail('demo-0001', 2, {title: '<script>alert(1)</script>'});
     const slots = {Q1: {type: 'free', text: '<script>answer()</script>'}, Q2: {type: 'option', choice: 'A. 甲方案 2', text: '<b>补充</b>'}};
@@ -1536,6 +1552,21 @@ class PageUiTest(unittest.TestCase):
         self.assertEqual(out['groups'][1]['items'], ['#a-0003'])
         self.assertIn('alpha · #01 · 7 问', out['firstItem'])
 
+    def test_help_and_detail_render_readable_text(self):
+        out = self.run_page('help-detail')
+        self.assertTrue(out['helpOpen'])
+        self.assertNotIn('[object', out['help'])
+        self.assertEqual(out['helpKeys'], ['1 – 9', 's', 'j / k', '⌘↵ / Ctrl+↵', '?', 'Esc'])
+        self.assertIn('选当前卡片的第 n 个选项', out['help'])
+        self.assertIn('下一张 / 上一张卡片', out['help'])
+        info = dict(zip(out['info'][::2], out['info'][1::2]))
+        self.assertEqual((info['id'], info['状态'], info['issue'], info['content_rev'], info['answer_rev']),
+                         ('demo-0001', 'answered', 'owner/repo#592', '1', '2'))
+        self.assertEqual(out['timeline'], ['2026-11-03T10:00 发布', '2026-11-03T10:05 Owner 提交 Rev 1'])
+        self.assertIn('Rev 1（已被 Rev 2 更正）', out['revs'])
+        self.assertIn('补充：旧补充', out['revs'])
+        self.assertTrue(out['helpClosed'])
+
     def test_script_and_answer_text_render_as_text(self):
         out = self.run_page('escape')
         allowed = {'<p>背景原文</p>', '<ul><li>证据一条</li></ul>', '<p>答完之后做 X</p>'}
@@ -1613,6 +1644,19 @@ class UiViewTest(Base):
         self.assertEqual((todo[a]['n_questions'], todo[a]['has_draft'], todo[a]['content_rev']), (3, True, 1))
         self.assertEqual((todo[b]['n_questions'], todo[b]['has_draft'], todo[b]['content_rev']), (1, False, 2))
         self.assertEqual(todo[a]['issue'], 'none')
+
+
+class PageStyleTest(unittest.TestCase):
+    def test_text_inputs_are_at_least_16px(self):
+        css = server.PAGE[server.PAGE.index('<style>'):server.PAGE.index('</style>')]
+        # font 简写的最后一项必须是字体族；写成 `font:16px/1.5 inherit` 整条会被浏览器丢弃
+        self.assertEqual(re.findall(r'font:\s*[^;}]*\d+px[^;}]*\binherit\b', css), [])
+        rules = re.findall(r'(?:^|[}\n])\s*([^{}@]*\btextarea\b[^{}]*)\{([^}]*)\}', css)
+        self.assertTrue(rules)
+        sizes = [m for _, body in rules for m in re.findall(r'font-size:\s*(\d+)px', body)]
+        self.assertIn('16', sizes)
+        self.assertTrue(all(int(x) >= 16 for x in sizes), sizes)
+        self.assertNotRegex(css, r'input\[type=text\]|<input type="text"')  # 页面没有别的文本输入框
 
 
 class DuplicateSubmitTest(Base):

@@ -543,7 +543,7 @@ kbd{font:12px/1.4 ui-monospace,Menlo,monospace;border:1px solid var(--border);bo
 .fold>summary::-webkit-details-marker{display:none}
 .others{display:flex;flex-wrap:wrap;gap:8px;margin-top:6px}
 .others .opt{flex:1 1 180px}
-textarea{width:100%;min-height:56px;font:16px/1.5 inherit;font-family:inherit;background:var(--bg);color:var(--text);border:1px solid var(--muted);border-radius:8px;padding:8px 10px;margin-top:6px}
+textarea{width:100%;min-height:56px;font-family:inherit;font-size:16px;line-height:1.5;background:var(--bg);color:var(--text);border:1px solid var(--muted);border-radius:8px;padding:8px 10px;margin-top:6px}
 button{font:inherit;font-size:15px;min-height:40px;padding:6px 14px;border-radius:8px;border:1px solid var(--muted);background:var(--surface);color:var(--text);cursor:pointer}
 button.pri{background:var(--accent);color:var(--on-accent);border-color:var(--accent);font-weight:600}
 button.pri kbd{background:transparent;color:inherit;border-color:currentColor;margin-left:6px;opacity:.8}
@@ -618,7 +618,7 @@ function el(tag, attrs, ...kids) {
     if (k === 'class') e.className = v; else if (k.startsWith('on')) e.addEventListener(k.slice(2), v);
     else if (v !== false && v != null) e.setAttribute(k, v === true ? '' : v);
   }
-  for (const c of kids.flat()) if (c != null) e.append(c instanceof Node ? c : document.createTextNode(String(c)));
+  for (const c of kids.flat(Infinity)) if (c != null) e.append(c instanceof Node ? c : document.createTextNode(String(c)));
   return e;
 }
 function html(s) { const d = document.createElement('div'); d.innerHTML = s; return d; } // 只用于服务端已 escape 的白名单 HTML
