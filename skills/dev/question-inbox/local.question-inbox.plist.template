@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- 问题收件箱服务（用户级 LaunchAgent）。占位符由 SKILL.md「安装」一节的 sed 命令替换：
+     __PYTHON__ python3 绝对路径；__SERVER__ server.py 绝对路径；__HERDR__ herdr 绝对路径；__HOME__ 家目录 -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>local.question-inbox</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__PYTHON__</string>
+    <string>__SERVER__</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__HOME__/.local/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>HERDR_BIN_PATH</key>
+    <string>__HERDR__</string>
+    <key>HOME</key>
+    <string>__HOME__</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>WorkingDirectory</key>
+  <string>__HOME__</string>
+  <key>StandardOutPath</key>
+  <string>__HOME__/.local/state/question-inbox/launchd.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/.local/state/question-inbox/launchd.err.log</string>
+</dict>
+</plist>

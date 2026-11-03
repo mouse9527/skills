@@ -103,7 +103,8 @@ herdr agent start <name> --kind <kind> --pane <pane> -- <该 CLI 的 yolo 参数
 - 「自己做，不要起子 agent / fork」—— worker 的 fork 会卡在 blocked，外面诊断不了
 - 「小步落盘，每步简短报进度」—— 断线后知道做到哪；**调查类任务给落盘时限**（如「N 分钟内先写结论，拿不准的标待核」），否则会无限深挖
 - 文字报告第一行写 `STATUS: in-progress | done | blocked（原因）`，随进度更新 —— 它是交接信号，不是完成判据
-- 需要用户决定的问题写进交付文件交回，不自己定
+- 需要用户决定的问题写进交付文件的 `## 需要 Owner 决定` 段交回，不自己定；每条带 现象 / 证据（文件:行号、命令输出）/ 选项 / 建议，不写「见上文」。
+  lead 分拣：已有授权且证据够的自己答；可补查的退回补查；剩下的用 skill `question-inbox` 提问。worker 不直接写收件箱。
 
 ```bash
 herdr agent prompt <name> "读 <任务书绝对路径> 并照做。"   # 不加 --wait，否则阻塞后续派发
