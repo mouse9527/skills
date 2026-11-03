@@ -64,6 +64,23 @@ README 超过约 300 行就体检：每段问「是纪律还是操作手册」�
 
 ## 3. 一个 Issue 的流程
 
+**Owner 关心的是任务，不是哪个 lead / session。** 任务 = Issue（大需求是一棵 Issue 树：父子用 sub-issue，先后用依赖，相关写 `Relates to <owner>/<repo>#<号>`，三种关系不混用）。
+lead、worker 只是「当前谁在做」，可以换；状态从 Issue + PR + checks + 收件箱现算。
+
+**一句话需求**：Owner 对任何 lead 说一句就算交给你了，不用他选 ws、找仓库。收到的 lead 当场评估：
+
+1. 查重：已有 Issue 的补充就补到那个 Issue，不另开。
+2. 判断做不做、归哪个 ws（按各 ws README 的 Issue repo）、要不要拆。拆只拆**能独立验收或独立授权**的结果，实现步骤留在任务书里。
+3. **当天落地**，二选一，都不只停在聊天里：
+   - 做：在对应 repo 开 Issue（按 `.templates/issue.md`）。**不是本 ws 的**：开在那个 ws 的 repo 后，收话的 lead 要么自己派 worker 去做（worktree 开在那个 ws 下），
+     要么明确回 Owner「这单要 <ws> 的 lead 接，那边现在没人在场」——不许只开 Issue 就算交出去。
+     跨 repo 挂父子：先建子 Issue，再 `gh issue edit <父> -R <父 repo> --add-sub-issue <子 URL>`。
+   - 不做：同样开 Issue，只写一句理由和结论（不套模板），然后 `gh issue close --reason "not planned"`——留痕，Owner 不同意就 reopen。低价值的不做不用先问 Owner。
+     它是某个父 Issue 的子项时，在父 Issue 正文的清单里单列一行「不做：#<号> 理由」：GitHub 把 not planned 也算进子项完成数，父 Issue 的进度不能当成「都做完了」。
+4. 回复 Owner 一行：`<owner>/<repo>#<号> · 做 / 不做 · 下一步`。
+
+以上「做不做、怎么拆」的判断本身不出题；其余要 Owner 决定的事照第 8 节走问题收件箱。
+
 开工前先看 README 第 8 项：没有接入检查记录、或仓库表里有 repo 不在记录里，先按第 11 节查一遍。
 
 ```
@@ -79,7 +96,12 @@ README 超过约 300 行就体检：每段问「是纪律还是操作手册」�
 看状态从 Issue + PR + checks 现算（`gh issue view` / `gh pr list --search <issue-id>` / `gh pr checks`），不在本地记。
 范围变了先改 Issue，再改代码；Issue 里没有的不做。
 
-`.templates/issue.md` 至少含四段：**验收标准**（每条写出能区分对错的验证方式）、**不做什么**、**止损条件**（触发就停下来问）、**done 的边界**。
+`.templates/issue.md` 至少含五段：**验收标准**（每条写出能区分对错的验证方式）、**不做什么**、**止损条件**（触发就停下来问）、**done 的边界**、
+**授权范围**（Owner 原话或决定链接；lead 不用回来问就能做到哪，例如能否自己开子 Issue、合低档 PR、部署 test）。
+授权范围变大就开新的子 Issue 写新的授权，不改写旧的；父 Issue 的授权不自动传给子 Issue（例如只读分析的父 Issue 下挂的删除任务，要有自己的授权）。
+
+**回复 Owner 先锚定任务**：先说是哪个 Issue（`<owner>/<repo>#<号> 标题`）、结果 / 卡点 / 下一步，再说细节；不先报会话或 worker 的运行情况。
+`NOW.md` 只是便签：「Owner 已决定 / 待部署 / 待跟进」这类事实要落到 Issue（评论或验收项），便签里只留链接。
 
 ## 4. worktree 生命周期
 
