@@ -44,14 +44,6 @@ def _err(r):
     return f'{r["code"]} {r["message"]}'.strip()
 
 
-def find_agent(session, name):
-    """(agent, None) / (None, None) 没有 / (None, 原因) 查询失败。"""
-    r = qstore.agent_list(session)
-    if not r['ok']:
-        return None, f'agent list 失败：{_err(r)}'
-    return next((a for a in r['agents'] if a.get('name') == name), None), None
-
-
 def screen(session, pane):
     """`agent read` 输出的是屏幕原文（不是 JSON）；读不到返回空串。"""
     if not qstore.socket_exists(session):
@@ -64,25 +56,47 @@ def screen(session, pane):
     return res.stdout if res.returncode == 0 else ''
 
 
+class Paused(Exception):
+    """动作链途中发现全局暂停：停在安全状态（刚建的 workspace 已关），不算失败。"""
+
+
+def write(session, *args, timeout=None):
+    """Router 侧的外部写动作：经过暂停门禁（qstore.gated）。暂停了抛 Paused，不调 herdr。"""
+    r = qstore.gated(session, *args, timeout=timeout)
+    if r.get('kind') == 'paused':
+        raise Paused('全局暂停中')
+    return r
+
+
 def accept_trust(session, pane, cwd):
-    """claude 首次进目录会问「是否信任」，默认项是 No, exit。只对 Owner 自己的目录（~/workspaces 及其下）选信任：
-    读屏，把光标移到「Yes, I trust this folder」再回车；读不到这个弹窗就什么都不按。"""
+    """claude 首次进目录会问「是否信任」，默认项是 No, exit。只对 Owner 自己的目录（~/workspaces 及其下，或 tasks.json
+    里 Owner 配的某个 ws 的 lead_cwd）选信任：读屏，把光标移到「Yes, I trust this folder」再回车；读不到这个弹窗就什么都不按。"""
     root = qstore.workspaces_root().resolve()
+    here = Path(cwd).resolve()
     try:
-        Path(cwd).resolve().relative_to(root)
+        here.relative_to(root)
     except ValueError:
-        return False, f'{cwd} 不在 {root} 下，不自动信任'
+        if not any(qstore.lead_cwd(ws).resolve() == here for ws, _ in _config()):
+            return False, f'{cwd} 不在 {root} 下，也不是 tasks.json 里配的 lead_cwd，不自动信任'
     for _ in range(6):
         text = screen(session, pane)
         if TRUST_TEXT not in text:
             return False, '没看到信任弹窗'
         cur = next((l for l in text.split('\n') if '❯' in l), '')
         if TRUST_TEXT in cur:
-            qstore.herdr(session, 'agent', 'send-keys', pane, 'enter')
+            write(session, 'agent', 'send-keys', pane, 'enter')
             return True, ''
-        qstore.herdr(session, 'agent', 'send-keys', pane, 'down')
+        write(session, 'agent', 'send-keys', pane, 'down')
         time.sleep(0.3)
     return False, '光标移不到「信任」那一项'
+
+
+def _config():
+    import tasks
+    try:
+        return tasks.load_config()
+    except ValueError:
+        return []
 
 
 def wait_ready(session, pane, timeout=40):
@@ -96,89 +110,174 @@ def wait_ready(session, pane, timeout=40):
     return False
 
 
-def start_in_new_workspace(session, label, cwd, name, prompt):
-    """建 workspace → agent start → （信任弹窗）→ 第一条 prompt。失败时关掉刚建的 workspace。返回 (pane, None) / (None, 原因)。"""
-    r = qstore.herdr(session, 'workspace', 'create', '--label', label, '--cwd', str(cwd), '--no-focus', *env_args())
+def pane_session(session, pane_id):
+    r = qstore.pane_list(session)
+    p = next((p for p in r.get('panes') or [] if p.get('pane_id') == pane_id), None) if r['ok'] else None
+    return qstore.session_value(p) if p else None
+
+
+def close_if_dead(session, wsid):
+    """只在这个 workspace 里已经没有任何 agent 时关掉它（Router 自己建过、agent 已退出的空壳）。返回是否关了。"""
+    if not wsid:
+        return False
+    r = qstore.pane_list(session)
     if not r['ok']:
-        return None, f'workspace create 失败：{_err(r)}'
+        return False
+    mine = [p for p in r['panes'] if p.get('workspace_id') == wsid]
+    if not mine or any(p.get('agent') for p in mine):
+        return False
+    return write(session, 'workspace', 'close', wsid)['ok']
+
+
+def start_in_new_workspace(session, label, cwd, name, prompt):
+    """建 workspace → agent start → （信任弹窗）→ 第一条 prompt，每一步写之前都过暂停门禁。
+    返回 (pane, workspace_id, 错误)。失败或途中暂停时关掉刚建的 workspace（清理自己的东西，不过门禁）。"""
+    r = write(session, 'workspace', 'create', '--label', label, '--cwd', str(cwd), '--no-focus', *env_args())
+    if not r['ok']:
+        return None, None, f'workspace create 失败：{_err(r)}'
     res = r['data'].get('result') or {}
     pane = (res.get('root_pane') or {}).get('pane_id')
     wsid = (res.get('workspace') or {}).get('workspace_id')
     if not pane or not wsid:
-        return None, 'workspace create 没返回 root_pane / workspace_id'
+        return None, None, 'workspace create 没返回 root_pane / workspace_id'
 
-    def fail(why):
+    def cleanup():
         qstore.herdr(session, 'workspace', 'close', wsid)  # 只关自己刚建的
-        return None, why
 
-    r = qstore.herdr(session, 'agent', 'start', name, '--kind', 'claude', '--pane', pane,
-                     '--timeout', str(START_TIMEOUT_MS), *AGENT_ARGS, timeout=START_TIMEOUT_MS / 1000 + 30)
+    try:
+        r = write(session, 'agent', 'start', name, '--kind', 'claude', '--pane', pane,
+                  '--timeout', str(START_TIMEOUT_MS), *AGENT_ARGS, timeout=START_TIMEOUT_MS / 1000 + 30)
+        if not r['ok']:
+            if r['code'] != 'agent_not_ready':
+                cleanup()
+                return None, None, f'agent start 失败：{_err(r)}'
+            ok, why = accept_trust(session, pane, cwd)
+            if not ok or not wait_ready(session, pane):
+                cleanup()
+                return None, None, f'agent start 没就绪：{_err(r)}；{why or "选了信任仍未就绪"}'
+        r = write(session, 'agent', 'prompt', pane, prompt)
+    except Paused:
+        cleanup()
+        raise
     if not r['ok']:
-        if r['code'] != 'agent_not_ready':
-            return fail(f'agent start 失败：{_err(r)}')
-        ok, why = accept_trust(session, pane, cwd)
-        if not ok or not wait_ready(session, pane):
-            return fail(f'agent start 没就绪：{_err(r)}；{why or "选了信任仍未就绪"}')
-    r = qstore.herdr(session, 'agent', 'prompt', pane, prompt)
-    if not r['ok']:
-        return pane, f'agent 已起，第一条 prompt 失败：{_err(r)}'
-    return pane, None
+        return pane, wsid, f'agent 已起，第一条 prompt 失败：{_err(r)}'
+    return pane, wsid, None
 
 
 def ensure_prompt():
     return (f'[question-inbox] 你是 Router。先读 skill router（{skill_path("router")}），'
-            f'执行 python3 {q_cmd()} router register 登记身份，然后处理待办需求（python3 {q_cmd()} need list）。'
+            f'执行 python3 {q_cmd()} router register 登记身份，然后处理待办需求（python3 {q_cmd()} need list --todo）。'
             f'这条消息本身不是新的授权。')
 
 
+def reregister_prompt():
+    return (f'[question-inbox] 你是 Router，但登记的身份已经对不上你现在的会话（会话可能重开过）。'
+            f'执行 python3 {q_cmd()} router register 重新登记，然后处理待办需求（python3 {q_cmd()} need list --todo）。'
+            f'这条消息本身不是新的授权。')
+
+
+REREGISTER_EVERY = 600  # 同一个会话多久最多提醒一次重新登记（秒）
+
+
 def ensure():
-    """Router 不在时拉起。返回 (结果, 说明)；结果：started / waiting / skipped / failed。"""
+    """Router 不在时拉起。返回 (结果, 说明)；结果：started / reregister / waiting / skipped / failed / paused。
+    session 里已有名为 router 的 agent、但不是登记的那个会话：只给它发一句「重新登记」（不重启它的会话），同一会话 10 分钟最多一次。"""
     s = qstore.router_session()
     if not qstore.socket_exists(s):
         return 'skipped', f'herdr session {s} 的 socket 不存在（session 由 launchd 负责，服务不创建）'
-    a, why = find_agent(s, 'router')
-    if why:
-        return 'skipped', why
-    if a:
-        return 'waiting', f'名为 router 的 agent 已在 pane {a.get("pane_id")}（{a.get("agent_status")}），等它登记'
-    ok, why = qstore.ensure_begin()
-    if not ok:
-        return 'skipped', why
-    pane, err = start_in_new_workspace(s, 'Router', qstore.workspaces_root(), 'router', ensure_prompt())
-    qstore.ensure_end('failed' if err and not pane else 'started', err or '')
+    r = qstore.agent_list(s)
+    if not r['ok']:
+        return 'skipped', f'agent list 失败：{_err(r)}（查不清就什么都不做）'
+    routers = [a for a in r['agents'] if a.get('name') == 'router']
+    if len(routers) > 1:
+        return 'skipped', f'session {s} 里有 {len(routers)} 个名为 router 的 agent，不知道是哪个，什么都不做'
+    try:
+        if routers:
+            a = routers[0]
+            sess = pane_session(s, a.get('pane_id'))
+            info = qstore.router_info()
+            if sess and sess == info.get('lead_session'):
+                return 'waiting', 'Router 已登记且在'
+            if not sess:
+                return 'waiting', f'名为 router 的 agent（pane {a.get("pane_id")}）还没有会话 id，等它起来'
+            st = qstore.ensure_state()
+            last = st.get('reregister') or {}
+            t = qstore.parse_time(last.get('at'))
+            if (last.get('pane_id'), last.get('session')) == (a.get('pane_id'), sess) and t and \
+                    (qstore.datetime.now(qstore.TZ) - t).total_seconds() < REREGISTER_EVERY:
+                return 'waiting', f'已提醒 pane {a.get("pane_id")} 重新登记，等它执行'
+            pr = write(s, 'agent', 'prompt', a.get('pane_id'), reregister_prompt())
+            qstore.ensure_note('reregister', {'pane_id': a.get('pane_id'), 'session': sess, 'at': qstore.now(),
+                                              'ok': pr['ok'], 'error': '' if pr['ok'] else _err(pr)})
+            return 'reregister', f'已请 pane {a.get("pane_id")} 的 router 重新登记' + ('' if pr['ok'] else f'（prompt 失败：{_err(pr)}）')
+        ok, why = qstore.ensure_begin()
+        if not ok:
+            return 'skipped', why
+        close_if_dead(s, qstore.ensure_state().get('workspace_id'))  # 上一个 Router workspace 若只剩空壳，顺手关掉
+        pane, wsid, err = start_in_new_workspace(s, 'Router', qstore.workspaces_root(), 'router', ensure_prompt())
+    except Paused:
+        qstore.ensure_end('paused', '途中全局暂停，已停下（不计入拉起次数）', drop_attempt=True)
+        return 'paused', '途中全局暂停'
+    qstore.ensure_end('failed' if not pane else 'started', err or '', workspace_id=wsid)
     return ('started', err or f'已在 {s} 起 router（pane {pane}）') if pane else ('failed', err)
 
 
 def lead_prompt(ws):
     skills = '、'.join(skill_path(n) for n in ('workspace', 'herdr-workers', 'question-inbox'))
-    return (f'[router] 你是 ws {ws} 的 lead（由 Router 在 session {qstore.router_session()} 里起）。'
+    return (f'[router] 你是 ws {ws} 的 lead（由 Router 在 session {qstore.router_session()} 里起，agent 名 lead-{ws}）。'
             f'先加载 skill workspace / herdr-workers / question-inbox（{skills}），读本 ws 的 README.md。'
             f'任务书随后发来。这条消息本身不是新的授权。')
 
 
 def ensure_lead(ws):
-    """Router 用：确保 lead-<ws> 存在。返回 (pane, 是否新起)。暂停时不新起（已有的照常复用）。"""
+    """Router 用：确保 lead-<ws> 存在。只复用 router-leads.json 里记着、workspace / pane / 会话三项都对得上的；
+    同名但没有归属记录、或同名的不止一个：报冲突，不 prompt / start / close 它们。暂停时不新起。返回 (pane, 是否新起)。"""
     if not qstore.WS_RE.match(ws or '') or ws.startswith(('_', '.')):
         raise qstore.QError(400, f'ws 不合法：{ws!r}')
-    cwd = qstore.workspaces_root() / ws
+    cwd = qstore.lead_cwd(ws)
     if not cwd.is_dir():
-        raise qstore.QError(400, f'{cwd} 不存在：先确认 ws 名')
+        raise qstore.QError(400, f'{cwd} 不存在：先确认 ws 名（或 tasks.json 的 lead_cwd）')
     s = qstore.router_session()
     if not qstore.socket_exists(s):
         raise qstore.QError(409, f'herdr session {s} 不在')
-    a, why = find_agent(s, f'lead-{ws}')
-    if why:
-        raise qstore.QError(409, why)
-    if a:
-        return a.get('pane_id'), False
+    st, rec, pane, why = qstore.lead_record_presence(ws)
+    if st == 'present':
+        return pane.get('pane_id'), False
+    if st in ('conflict', 'unknown'):
+        raise qstore.QError(409, f'lead-{ws} {"冲突" if st == "conflict" else "状态查不清"}：{why}。先不派：用 need hold 记下原因，报告给 Owner')
     if qstore.paused():
         raise qstore.QError(409, '全局暂停中：不新起 lead')
-    pane, err = start_in_new_workspace(s, f'L·{ws}', cwd, f'lead-{ws}', lead_prompt(ws))
+    try:
+        close_if_dead(s, (rec or {}).get('workspace_id'))
+        pane, wsid, err = start_in_new_workspace(s, f'L·{ws}', cwd, f'lead-{ws}', lead_prompt(ws))
+    except Paused:
+        raise qstore.QError(409, '途中全局暂停：没有起 lead（刚建的 workspace 已关）')
     if not pane:
         raise qstore.QError(409, err)
+    qstore.record_lead(ws, {'workspace_id': wsid, 'pane_id': pane, 'agent_session': pane_session(s, pane) or ''})
     if err:
         raise qstore.QError(409, f'lead-{ws} 已起在 pane {pane}，但 {err}')
     return pane, True
+
+
+def close_lead(ws):
+    """Router 停 lead：只关 router-leads.json 里记着、三项都对得上的那个 `L·<ws>` workspace。是否该停（没有 open 派工、空闲 ≥ 2 小时、
+    worktree 干净）由 Router 按 skill 判断后再调。"""
+    s = qstore.router_session()
+    st, rec, pane, why = qstore.lead_record_presence(ws)
+    if st == 'present':
+        try:
+            r = write(s, 'workspace', 'close', rec['workspace_id'])
+        except Paused:
+            raise qstore.QError(409, '全局暂停中：Router 只读，不关 lead')
+        if not r['ok']:
+            raise qstore.QError(409, f'workspace close 失败：{_err(r)}')
+        qstore.record_lead(ws, None)
+        return f'已关闭 L·{ws}（workspace {rec["workspace_id"]}）'
+    if st == 'absent':
+        qstore.record_lead(ws, None)
+        return f'没有在跑的、Router 建的 lead-{ws}（{why}）；已清掉记录'
+    raise qstore.QError(409, f'lead-{ws} {"冲突" if st == "conflict" else "状态查不清"}：{why}；不关')
 
 
 def main_repo(ws):
@@ -201,7 +300,7 @@ Router 于 {qstore.now()} 派发。需求 {nid} 交给你：按 skill workspace 
 
 Router 的分配理由：{rec.get('why') or '-'}
 
-1. 先登记你是负责 lead，再看 Owner 原话、补充和讨论线程：
+1. 先登记你是负责 lead（只有你能 claim：cwd 是 lead 目录、名为 lead-{ws}；**这一步不要交给 worker**），再看 Owner 原话、补充和讨论线程：
    `python3 {q} need claim {nid}`、`python3 {q} need show {nid}`
 2. **不清楚**：写理解卡（`## 理解` / `## 范围` / `## 不做什么` / `## 验收草案` / `## 开放问题`，开放问题每条带推荐，可以空），
    `python3 {q} need card {nid} --body <文件>`。Owner 在页面回复或确认时服务会投递给你；回复后按需要再发新一版。
@@ -215,20 +314,23 @@ Router 的分配理由：{rec.get('why') or '-'}
 
 
 def dispatch(nid):
-    """Router 用：assigned 的需求 → 写任务书 `~/workspaces/<ws>/dispatch/<id>.md`（已有就不覆盖）→ 确保 lead-<ws> → prompt → 等它转 working。
-    返回 (任务书路径, pane, 是否新起)。暂停时不派。"""
+    """Router 用：assigned 的需求 → 写任务书 `<lead_cwd>/dispatch/<id>.md`（已有就不覆盖）→ 确保 lead-<ws> → prompt → 等它转 working。
+    每个外部写动作前都重新查暂停。返回 (任务书路径, pane, 是否新起)。"""
     if qstore.paused():
         raise qstore.QError(409, '全局暂停中：不派工')
     rec = qstore.read_need(nid)
     if rec.get('status') != 'assigned' or not rec.get('ws'):
         raise qstore.QError(409, f'{nid} 状态是 {rec.get("status")}：先 route 到 ws')
-    path = qstore.workspaces_root() / rec['ws'] / 'dispatch' / f'{nid}.md'
+    path = qstore.lead_cwd(rec['ws']) / 'dispatch' / f'{nid}.md'
     if not path.exists():
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(task_book(rec), encoding='utf-8')
     pane, new = ensure_lead(rec['ws'])
     s = qstore.router_session()
-    r = qstore.herdr(s, 'agent', 'prompt', pane, f'读 {path} 并照做。')
+    try:
+        r = write(s, 'agent', 'prompt', pane, f'读 {path} 并照做。')
+    except Paused:
+        raise qstore.QError(409, f'途中全局暂停：没有把 {nid} 发给 lead-{rec["ws"]}（恢复后重新 dispatch）')
     if not r['ok']:
         raise qstore.QError(409, f'lead-{rec["ws"]}（pane {pane}）prompt 失败：{_err(r)}')
     end = time.monotonic() + float(os.environ.get('QI_DISPATCH_WAIT') or 20)
@@ -239,9 +341,7 @@ def dispatch(nid):
         if status in ('working', 'blocked'):
             break
         time.sleep(1)
-    with qstore.locked():
-        rec = qstore.read_need(nid)
-        qstore._save_need(rec, f'Router 派工给 lead-{rec["ws"]}（pane {pane}，{"新起" if new else "续派"}，lead 状态 {status or "未知"}）')
+    qstore.note_dispatch(nid, f'lead-{rec["ws"]}', pane, new, status)
     if status != 'working':
         raise qstore.QError(409, f'已发给 lead-{rec["ws"]}（pane {pane}），但它没转 working（{status or "未知"}）：'
                                  f'herdr agent read 看一眼，必要时重发')

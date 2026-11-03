@@ -25,8 +25,21 @@ def page_url(qid=''):
 
 
 def caller(args):
+    """旧命令（ask / receive / resolve / withdraw / erratum / status）：按原规格允许 --herdr-session / --pane 显式指定，
+    会现场核对目标 pane 存在、是 claude，且 receive / resolve 等还要和发题时记下的 lead 会话一致。"""
     return qstore.identify(args.herdr_session or os.environ.get('HERDR_SESSION'),
                            args.pane or os.environ.get('HERDR_PANE_ID'))
+
+
+def privileged(args):
+    """Router / 负责 lead 的特权命令：身份**只取调用者自己的** $HERDR_SESSION / $HERDR_PANE_ID。
+    环境变量缺失、或者显式参数和环境变量不一致，一律身份不符（退出码 4），什么都不改。"""
+    env_s, env_p = os.environ.get('HERDR_SESSION'), os.environ.get('HERDR_PANE_ID')
+    if not env_s or not env_p:
+        raise qstore.QError(403, '这是 Router / 负责 lead 的命令：必须在自己的 herdr pane 里执行（拿不到 $HERDR_SESSION / $HERDR_PANE_ID）')
+    if (args.herdr_session and args.herdr_session != env_s) or (args.pane and args.pane != env_p):
+        raise qstore.QError(403, '这类命令不接受用 --herdr-session / --pane 指定别的身份：只认执行命令的这个 pane')
+    return qstore.identify(env_s, env_p)
 
 
 def cmd_ask(args):
@@ -215,7 +228,7 @@ def cmd_need_show(args):
 
 
 def each(args, fn):
-    ident = caller(args)
+    ident = privileged(args)
     rc = 0
     for i, nid in enumerate(args.ids):
         try:
@@ -235,42 +248,44 @@ def cmd_need_take(args):
 
 
 def cmd_need_route(args):
-    rec = qstore.route(args.id, args.ws, args.why, caller(args))
+    rec = qstore.route(args.id, args.ws, args.why, privileged(args))
     print(f'{rec["id"]} 已分到 ws {rec["ws"]}；下一步：python3 {routerctl.q_cmd()} router dispatch {rec["id"]}')
 
 
 def cmd_need_note(args):
-    qstore.router_note(args.id, args.text, caller(args))
+    qstore.router_note(args.id, args.text, privileged(args))
     print(f'{args.id} 已记录说明（之前的 Owner 补充记为已处理）')
 
 
 def cmd_need_hold(args):
-    qstore.hold(args.id, args.why, caller(args))
+    qstore.hold(args.id, args.why, privileged(args))
     print(f'{args.id} 已标为 held（页面会显示卡住的原因）')
 
 
 def cmd_need_claim(args):
-    rec = qstore.claim_need(args.id, caller(args), takeover=args.takeover)
+    rec = qstore.claim_need(args.id, privileged(args), takeover=args.takeover)
     print(need_text(rec))
 
 
 def cmd_need_card(args):
-    rec = qstore.card(args.id, Path(args.body).read_text(encoding='utf-8'), caller(args))
+    rec = qstore.card(args.id, Path(args.body).read_text(encoding='utf-8'), privileged(args))
     print(f'{rec["id"]} 已发理解卡 v{rec["card_rev"]}，等 Owner 在页面回复或确认：{page_url("needs:" + rec["id"])}')
 
 
 def cmd_need_link(args):
-    rec = qstore.link(args.id, args.issue, caller(args))
+    rec = qstore.read_need(args.id)
+    rec = qstore.link(args.id, args.issue, privileged(args), issue_info=tasks.issue_body,
+                      main_repo=routerctl.main_repo(rec.get('ws') or ''))
     print(f'{rec["id"]} 已立项（filed），关联 {len(rec["issues"])} 个 Issue；讨论线程已封存')
 
 
 def cmd_need_drop(args):
-    qstore.drop(args.id, args.issue, args.why, caller(args), tasks.issue_state)
+    qstore.drop(args.id, args.issue, args.why, privileged(args), tasks.issue_state)
     print(f'{args.id} 已标为不做（dropped）')
 
 
 def cmd_router_register(args):
-    info = qstore.register_router(caller(args))
+    info = qstore.register_router(privileged(args))
     print(f'已登记 Router：session {info["herdr_session"]} pane {info["pane_id"]}')
     if qstore.paused():
         print('⚠️ 全局暂停中：只读，不领新需求、不新起 lead')
@@ -293,13 +308,18 @@ def cmd_router_status(_args):
 
 
 def cmd_router_lead(args):
-    qstore.check_router(caller(args))
+    qstore.check_router(privileged(args))
     pane, new = routerctl.ensure_lead(args.ws)
     print(f'lead-{args.ws}：pane {pane}（{"新起，已发加载 skill 的第一条 prompt" if new else "已有，续派给它"}）')
 
 
+def cmd_router_close_lead(args):
+    qstore.check_router(privileged(args))
+    print(routerctl.close_lead(args.ws))
+
+
 def cmd_router_dispatch(args):
-    qstore.check_router(caller(args))
+    qstore.check_router(privileged(args))
     path, pane, new = routerctl.dispatch(args.id)
     print(f'{args.id} 已交给 lead-{qstore.read_need(args.id)["ws"]}（pane {pane}，{"新起" if new else "续派"}）；任务书 {path}')
 
@@ -496,6 +516,8 @@ def main(argv=None):
     rt('paused', cmd_router_paused, '全局暂停开关（只读）', ident=False)
     rt('status', cmd_router_status, '登记、拉起次数、最近投递', ident=False)
     r = rt('lead', cmd_router_lead, f'确保 lead-<ws> 存在（只在 session {qstore.router_session()} 里；已有就复用）')
+    r.add_argument('ws')
+    r = rt('close-lead', cmd_router_close_lead, '关闭 Router 自己建的 L·<ws> workspace（只认 router-leads.json 里的记录，三项对得上才关）')
     r.add_argument('ws')
     r = rt('dispatch', cmd_router_dispatch, '把 assigned 的需求交给 lead-<ws>：写任务书 dispatch/<id>.md、确保 lead 在、prompt 它')
     r.add_argument('id')

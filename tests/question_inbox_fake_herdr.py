@@ -4,7 +4,7 @@ State: JSON file at $FAKE_HERDR_STATE, re-read on every call so a test can chang
   {"panes": {"<session>": [<pane>, ...]},           # sessions not listed answer server_not_running
    "prompt": "ok" | "blocked" | "gone" | "timeout" | "garbage" | "error:<code>",
    "sleep": <seconds for "timeout">,
-   "pane_list_fail": {"<session>": "timeout" | "error:<code>"},   # 只让这个 session 的 pane list 失败
+   "pane_list_fail": {"<session>": "timeout" | "error:<code>"},   # 只让这个 session 的 pane list / agent list 失败
    "start": "ok" | "trust" | "error:<code>",       # agent start：就绪 / 先弹「是否信任」（默认项 No）/ 失败
    "workspace_create": "ok" | "error:<code>",
    "prompt_working": true}                          # 收到 prompt 后把目标 pane 改成 working
@@ -93,6 +93,11 @@ def main(argv):
         save(state)
         out({'id': 'cli:workspace:close', 'result': {'type': 'ok'}})
     if rest[:2] == ['agent', 'list']:
+        bad = state.get('pane_list_fail', {}).get(session)  # 同一个 session 的 list 一起失败
+        if bad == 'timeout':
+            time.sleep(float(state.get('sleep', 30)))
+        elif bad:
+            fail(bad[6:] if bad.startswith('error:') else bad, 'fake agent list error', 'cli:agent:list')
         out({'id': 'cli:agent:list', 'result': {'type': 'agent_list', 'agents': [p for p in panes[session] if p.get('agent')]}})
     if rest[:2] in (['agent', 'get'], ['agent', 'read'], ['agent', 'send-keys']):
         p = target_of(panes[session], rest[2])

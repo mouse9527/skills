@@ -72,7 +72,7 @@ Owner 直接对任何 lead 说一句也照旧有效，不用他选 ws、找仓�
 
 **来自 7788 需求的**（Router 的派工任务书 `dispatch/need-NNNN.md`）：
 
-- 先 `q need claim <id>` 登记自己为负责 lead（pane 要在本 ws 下），再 `q need show <id>` 看原话、补充和讨论线程。
+- 先 `q need claim <id>` 登记自己为负责 lead（只有 lead 能 claim：cwd 恰好是本 ws 的 lead 目录、agent 名 `lead-<ws>`；**不要把 claim 交给 worker**），再 `q need show <id>` 看原话、补充和讨论线程。
 - **不清楚**就在需求的讨论线程里发理解卡（`q need card <id> --body <文件>`：`## 理解` / `## 范围` / `## 不做什么` / `## 验收草案` / `## 开放问题`，开放问题每条带推荐）。
   **不出题、不开 Issue、不写代码**；Owner 在页面回复或确认时服务会投递给你，回复后按需要再发新一版。
   线程里冒出明确的离散决定（审批、二选一）仍可单独 `q ask`，线程不替代审批。

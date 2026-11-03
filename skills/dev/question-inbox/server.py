@@ -107,6 +107,9 @@ def router_prompt(kind, recs):
         return (f'[question-inbox] Owner 确认了理解卡：{ids}。这条消息本身不是新的授权。\n'
                 f'先执行：python3 {q_cmd()} need show {args}；按已确认的那一版理解卡在本 ws 主 repo 建根 Issue'
                 f'（正文第一行「需求：<id>」），然后 need link。')
+    if kind == 'unclaimed':
+        return (f'[question-inbox] 需求已分到 ws，但一直没有 lead claim：{ids}。这条消息本身不是新的授权。\n'
+                f'先执行：python3 {q_cmd()} need show {args}；看对应的 lead-<ws> 在不在、有没有收到派工书，必要时 router dispatch 重发。')
     if kind == 'note':
         return (f'[question-inbox] 需求有 Owner 的新补充：{ids}。这条消息本身不是新的授权。\n'
                 f'先执行：python3 {q_cmd()} need show {args}；按 skill router 处理，处理完用 need note 记一句。')
@@ -115,23 +118,17 @@ def router_prompt(kind, recs):
 
 
 def router_presence(info):
-    """(pane, 原因, 该不该拉起)。只有「没登记」「登记的 pane 没了 / agent 已退出」才拉起；
-    pane 还在但换了会话（有人接手、手动重启）就只暂缓，不碰它。"""
+    """(pane, 原因, 该不该拉起)。用三态判断：登记的会话在 → 投；**确认不在**（没登记、pane 没了、换了会话、agent 已退出）→ 拉起
+    （ensure 见到名为 router 的 agent 只请它重新登记，不重启它的会话）；**查不清**（查询失败、超时、多个匹配）→ 只暂缓，不拉起。"""
     s = qstore.router_session()
     if not info.get('lead_session') or info.get('herdr_session') != s:
         return None, 'Router 还没登记', True
-    pane, why = qstore.find_lead(s, info['lead_session'])
-    if pane:
+    st, pane, why = qstore.presence(s, info['lead_session'])
+    if st == 'present':
         return pane, '', False
-    r = qstore.pane_list(s)
-    if not r['ok']:
-        return None, why, False
-    p = next((p for p in r['panes'] if p.get('pane_id') == info.get('pane_id')), None)
-    if p is None:
-        return None, f'登记的 Router pane {info.get("pane_id")} 已不存在', True
-    if not p.get('agent'):
-        return None, f'登记的 Router pane {info.get("pane_id")} 里 agent 已退出', True
-    return None, why, False
+    if st == 'unknown':
+        return None, f'核对不了 Router 是否还在（{why}）', False
+    return None, f'登记的 Router 会话不在了（{why}）', True
 
 
 def _ensure_thread():
@@ -157,16 +154,14 @@ def kick_ensure():
 
 
 def scan_needs():
-    if qstore.paused():  # 暂停：不投递、不拉起
-        return
+    for nid in qstore.nudge_unclaimed():  # 分到 ws 太久没人 claim：补投给 Router 一次
+        log.info('need %s unclaimed, nudging router', nid)
     due = qstore.needs_due()
-    if not due:
-        return
     to_lead = [r for r in due if r.get('delivery_to') == 'lead']
     due = [r for r in due if r.get('delivery_to') != 'lead']
-    if to_lead:
+    if to_lead:  # Owner 对讨论的回复 / 确认：给已在跑的 lead，暂停不拦（暂停只停 Router 侧）
         scan_lead_needs(to_lead)
-    if not due:
+    if not due or qstore.paused():  # 暂停：不投给 Router、不拉起
         return
     s = qstore.router_session()
     refs = [(r['id'], qstore.geti(r, 'delivery_seq')) for r in due]
@@ -204,12 +199,18 @@ def scan_lead_needs(due):
 
 
 def deliver_router(session, pane, lead, kind, recs):
-    """投给 Router（lead 非空）或负责 lead（lead 为空），同一套写前记账。"""
+    """投给 Router（lead 非空）或负责 lead（lead 为空），同一套写前记账。投给 Router 的那一下过暂停门禁：
+    记了 sending 之后才发现暂停，就退回 pending（恢复后发一次），不留在 sending。"""
     claimed = qstore.need_claim([(r['id'], qstore.geti(r, 'delivery_seq')) for r in recs])
     if not claimed:
         return
     ids = {c[0] for c in claimed}
-    r = qstore.herdr(session, 'agent', 'prompt', pane['pane_id'], router_prompt(kind, [x for x in recs if x['id'] in ids]))
+    text = router_prompt(kind, [x for x in recs if x['id'] in ids])
+    r = (qstore.gated if lead else qstore.herdr)(session, 'agent', 'prompt', pane['pane_id'], text)
+    if r.get('kind') == 'paused':
+        qstore.need_unclaim(claimed, '全局暂停，没有发出')
+        log.info('need %s paused before prompt %s', kind, ','.join(sorted(ids)))
+        return
     if r['ok']:
         outcome, err = 'sent', ''
     elif r['kind'] in ('no_socket', 'exec_error') or r['code'] in qstore.NOT_SENT_CODES:
@@ -243,7 +244,8 @@ def router_health():
             'why': why, 'pane_id': info.get('pane_id') or '', 'registered_at': info.get('registered_at') or '',
             'last_delivery_at': info.get('last_delivery_at') or '', 'ensure_total': qstore.geti(st, 'total'),
             'ensure_last_at': st.get('last_at') or '', 'ensure_last_result': st.get('last_result') or '',
-            'gave_up': bool(st.get('gave_up')), 'last_error': st.get('last_error') or '', 'paused': qstore.paused()}
+            'gave_up': bool(st.get('gave_up')), 'last_error': st.get('last_error') or '', 'paused': qstore.paused(),
+            'reregister': (st.get('reregister') or {}).get('at') or ''}
         HEALTH['at'] = time.monotonic()
         return HEALTH['data']
 
@@ -266,7 +268,9 @@ def need_summary(rec):
             'why': rec.get('why') or '', 'created': rec.get('created'), 'updated': rec.get('updated'),
             'issues': [u for u in rec.get('issues') or [] if isinstance(u, str) and qstore.ISSUE_URL_RE.match(u)],
             'notes': [{'at': n.get('at'), 'by': n.get('by'), 'text': n.get('text')} for n in rec.get('notes') or []],
-            'pending_notes': len(qstore.pending_notes(rec)), 'delivery': label, 'delivery_detail': why,
+            'pending_notes': len(qstore.pending_notes(rec)), 'delivery': label,
+            'dispatch': (f'{(rec.get("dispatch") or {}).get("lead")} · pane {(rec.get("dispatch") or {}).get("pane_id")}'
+                         if rec.get('dispatch') else ''), 'delivery_detail': why,
             'renotify': renot, 'log': (rec.get('log') or [])[-8:]}
 
 
@@ -566,7 +570,7 @@ class Handler(BaseHTTPRequestHandler):
             log.warning('rejected write %s: %s', self.path, bad)
             return self.send(403, {'error': bad})
         m = re.fullmatch(r'/api/q/([A-Za-z0-9_.-]+)/(save|submit|renotify|close)', self.path)
-        other = re.fullmatch(r'/api/(need)|/api/need/(need-\d{4,})/(reply|confirm|renotify)|/api/router/(pause|retry)', self.path)
+        other = re.fullmatch(r'/api/(need)|/api/need/(need-\d{4,})/(reply|confirm|renotify)|/api/router/(pause|retry|reregister)', self.path)
         if not m and not other:
             return self.send(404, {'error': 'not found'})
         try:
@@ -631,6 +635,11 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send(400, {'error': 'paused 必须是 true / false'})
                 qstore.set_paused(req['paused'])
                 res = {'ok': True, 'paused': req['paused']}
+            elif ctl == 'reregister':  # 不重启 Router 的会话，只请那个名为 router 的 agent 重新登记一次
+                if qstore.paused():
+                    return self.send(409, {'error': '全局暂停中'})
+                qstore.ensure_note('reregister', None)
+                res = {'ok': True, 'note': kick_ensure()}
             else:
                 qstore.ensure_retry()
                 res = {'ok': True, 'note': '已清除「起不来」标记，下次有需求要投递时会重新拉起'}
@@ -1636,10 +1645,13 @@ function routerCard(h) {
     el('div', {class: 'thead'}, el('strong', {}, 'Router'), el('span', {class: 'chip ' + st[1]}, st[0]),
       el('button', {id: 'pause_btn', disabled: !!needBusy._pause, onclick: () => needPost('_pause', '/api/router/pause', {paused: !h.paused},
         j => { needMsg = {cls: 'ok', text: j.paused ? '已全局暂停' : '已恢复'}; })}, h.paused ? '恢复' : '全局暂停'),
+      !h.present && h.socket && !h.paused && !h.gave_up ? el('button', {id: 'rereg_btn', disabled: !!needBusy._rereg,
+        onclick: () => needPost('_rereg', '/api/router/reregister', {}, j => { needMsg = {cls: 'ok', text: '已请 Router 重新登记：' + j.note, at: Date.now()}; })},
+        '让 Router 重新登记') : null,
       h.gave_up ? el('button', {id: 'retry_btn', disabled: !!needBusy._retry, onclick: () => needPost('_retry', '/api/router/retry', {},
         j => { needMsg = {cls: 'ok', text: j.note}; })}, '重新尝试拉起') : null),
     h.gave_up ? el('div', {class: 'msgbar bad'}, 'Router 起不来：1 小时内自动拉起 3 次仍不在，已停止自动拉起。' + (h.last_error ? '原因：' + h.last_error : '')) : null,
-    h.paused ? el('div', {class: 'msgbar warn'}, '全局暂停：不向 Router 投递新需求、不自动拉起 Router，Router 不新起 lead；已经在跑的 lead 不受影响。') : null,
+    h.paused ? el('div', {class: 'msgbar warn'}, '全局暂停：不向 Router 投递、不自动拉起 Router，Router 不分派、不派工、不新起 lead。已经在跑的 lead 不受影响：你在讨论线程里的回复和确认照常投给负责 lead。') : null,
     el('div', {class: 'kv small'}, rows.map(([k, v]) => [el('span', {class: 'mute'}, k), el('span', {}, v)])));
 }
 
@@ -1687,7 +1699,7 @@ function needRow(n, idx) {
   const hint = n.lead ? '回复负责 lead（进讨论线程，投递给它）' : '补充 / 纠正（还没有负责 lead：记成 note，Router 处理时会看到）';
   return el('section', {class: 'nrow' + (n.id === needFocus ? ' focus' : ''), id: 'need_' + n.id},
     el('div', {class: 't1'}, el('strong', {}, n.id), el('span', {class: 'chip ' + st[1]}, st[0]), n.ws ? el('span', {}, 'ws ' + n.ws) : null,
-      n.lead ? el('span', {}, '负责 lead：' + n.lead) : null,
+      n.lead ? el('span', {}, '负责 lead：' + n.lead) : n.dispatch ? el('span', {}, '已派给 ' + n.dispatch + '，等它 claim') : null,
       when(n.created), n.delivery ? el('span', {title: n.delivery_detail || ''}, '投递：' + n.delivery) : null,
       n.renotify ? el('button', {onclick: () => needPost('_rn' + n.id, `/api/need/${encodeURIComponent(n.id)}/renotify`, {},
         j => { needMsg = {cls: 'ok', text: j.note, at: Date.now()}; })}, '重新通知') : null,

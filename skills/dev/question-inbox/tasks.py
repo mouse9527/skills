@@ -55,7 +55,7 @@ fragment P on PullRequest{number title url state isDraft updatedAt mergedAt body
 # ---------- 配置 ----------
 
 def config_path():
-    return Path(os.environ.get('QI_TASKS_CONFIG') or Path.home() / '.config' / 'question-inbox' / 'tasks.json')
+    return qstore.tasks_config_path()
 
 
 def load_config():
@@ -64,14 +64,16 @@ def load_config():
     try:
         data = json.loads(p.read_text(encoding='utf-8'))
     except FileNotFoundError:
-        raise ValueError(f'没有配置文件 {p}（格式：{{"repos":[{{"ws":"demo","repo":"owner/repo"}}]}}）')
+        raise ValueError(f'没有配置文件 {p}（格式：{{"repos":[{{"ws":"demo","repo":"owner/repo","lead_cwd":"可选"}}]}}）')
     except (OSError, ValueError) as e:
         raise ValueError(f'配置文件 {p} 读不了：{e}')
     out = []
     for r in (data.get('repos') if isinstance(data, dict) else None) or []:
         ws, repo = (r or {}).get('ws'), (r or {}).get('repo')
+        lc = (r or {}).get('lead_cwd')  # 可选：ws 的 lead 工作目录（默认 ~/workspaces/<ws>），见 qstore.lead_cwd
         if not (isinstance(ws, str) and qstore.WS_RE.match(ws) and isinstance(repo, str)
-                and re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repo)):
+                and re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repo)
+                and (lc is None or (isinstance(lc, str) and Path(lc).expanduser().is_absolute()))):
             raise ValueError(f'配置文件 {p} 里有不合法的条目：{r!r}')
         out.append((ws, repo))
     return out
@@ -165,16 +167,17 @@ def herdr_sessions():
 
 
 def fetch_session(s):
-    """一个 session 的 [{session, pane}]。缓存和失败都以 session 为边界：这里失败只影响这个 session。"""
-    r = qstore.pane_list(s)
+    """一个 session 的 [{session, pane}]，只含有 agent 的 pane。用 `agent list`：它带 agent 名（`agent start <NAME>`），
+    `pane list` 没有这个字段（真实 herdr 0.9.5 实测）。缓存和失败都以 session 为边界：这里失败只影响这个 session。"""
+    r = qstore.agent_list(s)
     if r['ok']:
-        panes = r['panes']
-        if not isinstance(panes, list):
-            raise RuntimeError(f'herdr {s} pane list 输出不是列表')
-        return [{'session': s, 'pane': p} for p in panes if isinstance(p, dict)]
+        agents = r['agents']
+        if not isinstance(agents, list):
+            raise RuntimeError(f'herdr {s} agent list 输出不是列表')
+        return [{'session': s, 'pane': a} for a in agents if isinstance(a, dict)]
     if r['code'] in ('server_not_running', 'no_socket'):  # 残留 socket：这个 session 没在跑，不算错
         return []
-    raise RuntimeError(f'herdr {s} pane list 失败：{r["code"]} {r["message"]}'.strip())
+    raise RuntimeError(f'herdr {s} agent list 失败：{r["code"]} {r["message"]}'.strip())
 
 
 # ---------- 内存缓存：每个来源单独保留上一次成功的数据 ----------
@@ -506,9 +509,20 @@ def _group(tasks):
 
 
 def issue_state(url):
-    """(state, stateReason)，例如 ('CLOSED', 'NOT_PLANNED')；need drop 用来核对留痕 Issue。只读，argv 调用。"""
+    """(state, stateReason)，例如 ('CLOSED', 'NOT_PLANNED')；need drop 用来核对留痕 Issue。"""
+    data = issue_info(url, 'state,stateReason')
+    return (str(data.get('state') or '').upper(), str(data.get('stateReason') or '').upper())
+
+
+def issue_body(url):
+    """need link 用来核对根 Issue 正文第一行。"""
+    return issue_info(url, 'body')
+
+
+def issue_info(url, fields):
+    """`gh issue view <url> --json <fields>`；只读，argv 调用。查不到抛 QError(409)。"""
     try:
-        res = subprocess.run([gh_bin(), 'issue', 'view', url, '--json', 'state,stateReason'], capture_output=True,
+        res = subprocess.run([gh_bin(), 'issue', 'view', url, '--json', fields], capture_output=True,
                              text=True, encoding='utf-8', timeout=gh_timeout())
     except subprocess.TimeoutExpired:
         raise qstore.QError(409, 'gh 超时，无法核对 Issue 状态')
@@ -520,7 +534,7 @@ def issue_state(url):
         data = None
     if res.returncode != 0 or not isinstance(data, dict):
         raise qstore.QError(409, f'gh 查不到 {url}：{(res.stderr or res.stdout).strip()[:200]}')
-    return (str(data.get('state') or '').upper(), str(data.get('stateReason') or '').upper())
+    return data
 
 
 def view(refresh=False, now=None):

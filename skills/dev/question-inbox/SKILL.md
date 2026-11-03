@@ -152,25 +152,36 @@ Owner 在页面「需求」栏提交一句话 → `needs/need-NNNN.json` → 服
 |---|---|---|
 | `$Q need list [--todo] [--status S] [--json]` / `$Q need show <id>…` | 任何人 | 只读（show 含讨论线程） |
 | `$Q need take <id>…` / `$Q need route <id> --ws W --why "…"` / `$Q need note` | 只有登记的 Router | 领取 / 分到 ws / 记说明 |
-| `$Q router dispatch <id>` / `$Q router lead <ws>` | 只有 Router | 写任务书并交给 `lead-<ws>`（只在 session router 里起 lead；暂停时不派） |
-| `$Q need claim <id> [--takeover]` | 那个 ws 的 lead（pane 在 `~/workspaces/<ws>/` 下） | 登记为负责 lead；takeover 只在原负责 lead 已不在 herdr 里时可用 |
+| `$Q router dispatch <id>` / `$Q router lead <ws>` / `$Q router close-lead <ws>` | 只有 Router | 写任务书并交给 `lead-<ws>`；起 / 关 lead（只在 session router 里，只认 `router-leads.json` 里自己建的；暂停时不派、不新起） |
+| `$Q need claim <id> [--takeover]` | 那个 ws 的 lead：pane 的 cwd **恰好**是 lead 目录、agent 名 `lead-<ws>`（worker 在子目录里，不能 claim） | 登记为负责 lead；takeover 只在原负责 lead **确认**不在时可用（查询失败、超时、多个匹配都算查不清，拒绝） |
 | `$Q need card <id> --body <文件>` | 只有负责 lead | 发理解卡：`## 理解` / `## 范围` / `## 不做什么` / `## 验收草案` / `## 开放问题`（开放问题每条带推荐，可空）；每发一张版本 + 1 |
-| `$Q need link <id> --issue <URL>…` / `$Q need drop <id> --issue <URL> --why "…"` | 只有负责 lead | 建好 Issue 后登记（讨论过的必须已确认）/ 不做 |
+| `$Q need link <id> --issue <URL>…` / `$Q need drop <id> --issue <URL> --why "…"` | 只有负责 lead | 建好 Issue 后登记（讨论过的必须已确认；第一次 link 时核对根 Issue 在本 ws 主 repo、正文第一个非空行是 `需求：need-NNNN`）/ 不做 |
 | `$Q need hold <id> --why "…"` | Router（routing）或负责 lead | 卡住，页面显示原因 |
 | `$Q router register` / `$Q router paused` / `$Q router status` | Router / 任何人 | 登记身份；暂停开关；登记、拉起次数、最近投递 |
 
-身份不符一律退出码 4，状态不允许退出码 3。
+身份不符一律退出码 4，状态不允许退出码 3。上面这些 Router / 负责 lead 的命令，身份**只取执行者自己 pane 的** `$HERDR_SESSION` / `$HERDR_PANE_ID`：
+环境变量缺失、或 `--herdr-session` / `--pane` 和它们不一致，都是退出码 4、什么都不改。
+（`ask` / `receive` / `resolve` / `withdraw` / `erratum` 按收件箱原规格仍可用这两个参数显式指定，因为它们会和发题时记下的 lead 会话核对；新增的特权命令没有这层，所以不开放。）
+
+**lead 目录**：默认 `~/workspaces/<ws>`；tasks.json 的条目可以加可选字段 `"lead_cwd": "<绝对路径或 ~/…>"`（例如 ws 本身就是线上代码目录时）。
+Router 起 lead、写派工书（`<lead 目录>/dispatch/`）、claim 校验都按它。
 
 - **Owner 在页面上**：对还没有负责 lead 的需求写的是「补充 / 纠正」（记成 note，Router 正在处理时投给 Router）；有负责 lead 之后写的是「回复」，
   进讨论线程并投给负责 lead；「确认理解卡 vN」只能确认**最新**一张（绑定版本，过期 409），确认后投给负责 lead 去建 Issue。
   等 Owner 回复或确认的需求出现在「待我决定」最上面的「需求讨论」一栏。
+- 还没 lead claim 的需求（assigned）：Owner 的补充投给 Router；分派后 30 分钟（`QI_UNCLAIMED_AFTER` 秒）仍没人 claim，服务自动补投 Router 一次，页面也给「重新通知」。
 - 投递和回答投递同一套机制：按 agent_session 定位、写前记账、held / uncertain、退避、不重复发，同一批最多合并 5 条。
   投给负责 lead 时找不到它（pane 关了、换了会话）只暂缓，不改投别的 lead、也不拉起谁（由 Router 的看门狗处理）。
 - **Router 不在时自动拉起**（没登记、或登记的 pane 没了 / agent 已退出）：服务在 session router 里建 workspace `Router`（cwd `~/workspaces`）、
   `agent start router --kind claude -- --dangerously-skip-permissions --model opus`，信任弹窗读屏后选「信任」，再发「读 skill router、register、处理待办」。
   session 的 socket 不在就只报暂缓、不创建；同一时间只拉一次，1 小时最多 3 次，超过页面标红「Router 起不来」并停止自动拉起（页面可重试，Router 登记后自动解除）。
-  登记的 pane 还在但换了会话（有人接手）时只暂缓，不起新的、不碰它。绝不在别的 session 起 agent。
-- **全局暂停**（页面开关）：不投递需求（包括讨论线程的回复）、不拉起 Router，Router 不 take、不派工、不新起 lead；已在跑的 lead 不受影响。
+  在不在用三态判断：**确认不在**才拉起；查询失败、超时、多个匹配算**查不清**，只暂缓。
+  session 里已有名为 router 的 agent、但会话不是登记的那个（会话重开过）：不重启它，只给它发一句「重新登记」，同一会话 10 分钟最多一次；页面有「让 Router 重新登记」按钮。
+  拉起前，上一次建的 Router workspace 若只剩没有 agent 的空壳就关掉。绝不在别的 session 起 agent。
+- **全局暂停**（页面开关）：不投给 Router、不拉起 Router，Router 不 take、不 route、不派工、不新起 lead。
+  已在跑的 lead 不受影响：Owner 在讨论线程里的回复 / 确认照常投给负责 lead。
+  暂停在 Router 侧每一次外部写动作（建 workspace、起 agent、按键、prompt、关 workspace）之前都重新检查，且和这些动作互斥：
+  暂停提交之后不会再有新的启动 / 投递 / 派工；途中被暂停的投递退回排队，恢复后发一次。
 
 ## 5. 服务（网页 + 投递）
 

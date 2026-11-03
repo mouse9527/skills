@@ -11,6 +11,7 @@ import sys
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import test_question_inbox as base  # noqa: E402
@@ -89,11 +90,20 @@ class RouterBase(base.Base):
 
     def lead_panes(self, gone=()):
         ws = self.tmp / 'ws'
-        ps = [dict(base.pane('w1:p1', lead='lead-a'), cwd=str(ws / 'demo')), dict(base.pane('w1:p2', lead='lead-b'), cwd=str(ws / 'demo' / 'issues' / '3')),
-              dict(base.pane('w1:p3', lead='lead-c'), cwd=str(ws / 'other'))]
+        # w1:p1 demo 的 lead；w1:p2 也叫 lead-demo、cwd 正确（接手用）；w1:p3 别的 ws 的 lead；w1:p4 demo 的 worker（子目录）
+        ps = [dict(base.pane('w1:p1', lead='lead-a'), cwd=str(ws / 'demo'), name='lead-demo'),
+              dict(base.pane('w1:p2', lead='lead-b'), cwd=str(ws / 'demo'), name='lead-demo'),
+              dict(base.pane('w1:p3', lead='lead-c'), cwd=str(ws / 'other'), name='lead-other'),
+              dict(base.pane('w1:p4', lead='lead-w'), cwd=str(ws / 'demo' / 'issues' / '3'), name='w-3')]
         st = self.herdr_state()
         st['panes']['demo'] = [x for x in ps if x['pane_id'] not in gone]
         (self.tmp / 'herdr.json').write_text(json.dumps(st))
+
+    def issue_bodies(self, **bodies):
+        """假 gh 的 issue view：{号: 正文}；state 默认 OPEN。"""
+        data = json.loads((self.tmp / 'gh.json').read_text())
+        data.setdefault('issues', {}).update({ISSUE + n: {'body': b, 'state': 'OPEN', 'stateReason': ''} for n, b in bodies.items()})
+        (self.tmp / 'gh.json').write_text(json.dumps(data, ensure_ascii=False))
 
     def as_lead(self, *args, pane='w1:p1'):
         return self.q(*args, env={'HERDR_SESSION': 'demo', 'HERDR_PANE_ID': pane})
@@ -181,13 +191,18 @@ class NeedStoreTest(RouterBase):
         nid = self.assigned()
         self.assertEqual(self.as_lead('need', 'card', nid, '--body', self.card_file()).returncode, 4)  # 还没 claim
         self.assertEqual(self.as_lead('need', 'claim', nid, pane='w1:p3').returncode, 4)  # pane 在别的 ws
+        self.assertEqual(self.as_lead('need', 'claim', nid, pane='w1:p4').returncode, 4)  # demo 的 worker（子目录）不行
+        self.assertEqual(self.need(nid)['lead'], {})
         r = self.as_lead('need', 'claim', nid)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(self.need(nid)['lead']['lead_session'], 'lead-a')
         self.assertEqual(self.as_lead('need', 'claim', nid).returncode, 0)  # 幂等
         for args in (('card', nid, '--body', self.card_file()), ('link', nid, '--issue', ISSUE + '1'),
                      ('drop', nid, '--issue', ISSUE + '1', '--why', 'x'), ('hold', nid, '--why', 'x')):
-            r = self.as_lead('need', *args, pane='w1:p2')  # 同 ws 的别的 lead、不是负责 lead
+            for pane in ('w1:p2', 'w1:p4'):  # 同名的另一个 lead、worker 都不是负责 lead
+                r = self.as_lead('need', *args, pane=pane)
+                self.assertEqual(r.returncode, 4, (args, pane, r.stderr))
+            r = self.as_lead('need', *args, pane='w1:p2')
             self.assertEqual(r.returncode, 4, (args, r.stderr))
         self.assertEqual(self.as_router('need', 'link', nid, '--issue', ISSUE + '1').returncode, 4)  # Router 也不行
         self.assertEqual(self.as_lead('need', 'claim', nid, pane='w1:p2').returncode, 4)  # 没 --takeover
@@ -224,6 +239,11 @@ class NeedStoreTest(RouterBase):
         rec, _ = qstore.owner_confirm(nid, 2, 'req-conf-0002')
         self.assertEqual((rec['status'], rec['confirmed_rev'], rec['delivery_to'], rec['delivery_kind']), ('confirmed', 2, 'lead', 'confirm'))
         self.assertFalse(qstore.owner_confirm(nid, 2, 'req-conf-0002')[1])  # 同一个 request_id 重放：返回原记录
+        self.issue_bodies(**{'30': f'\n需求：{nid}\n\n## 验收标准\n…', '29': '# 标题\n需求：' + nid})
+        r = self.as_lead('need', 'link', nid, '--issue', ISSUE + '29')  # 第一行不是「需求：」：拒绝
+        self.assertEqual(r.returncode, 1, r.stderr)
+        r = self.as_lead('need', 'link', nid, '--issue', 'https://github.com/someone/else/issues/30')  # 根不在主 repo
+        self.assertEqual(r.returncode, 1, r.stderr)
         r = self.as_lead('need', 'link', nid, '--issue', ISSUE + '30')
         self.assertEqual(r.returncode, 0, r.stderr)
         rec = self.need(nid)
@@ -239,6 +259,7 @@ class NeedStoreTest(RouterBase):
     def test_clear_need_links_without_discussion(self):
         nid = self.assigned()
         self.as_lead('need', 'claim', nid)
+        self.issue_bodies(**{'7': f'需求：{nid}'})
         r = self.as_lead('need', 'link', nid, '--issue', ISSUE + '7', '--issue', ISSUE + '8')
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual((self.need(nid)['status'], self.need(nid)['issues']), ('filed', [ISSUE + '7', ISSUE + '8']))
@@ -258,9 +279,10 @@ class NeedStoreTest(RouterBase):
         rec = self.need(nid)
         self.assertEqual((qstore.pending_notes(rec), rec['delivery']), ([], 'received'))
         self.as_router('need', 'route', nid, '--ws', 'demo', '--why', 'x')
-        qstore.owner_reply(nid, 'assigned、还没 lead 时的补充')
-        self.assertEqual(self.need(nid)['delivery'], 'received')  # 不投：lead claim 时会看到
-        self.assertEqual(self.need(nid)['thread'], [])
+        self.assertEqual(self.need(nid)['delivery'], 'received')
+        qstore.owner_reply(nid, 'assigned、还没 lead 时的补充')  # 还没人 claim：Router 仍是负责人，投给它（审查 DS 2）
+        rec = self.need(nid)
+        self.assertEqual((rec['delivery'], rec['delivery_to'], rec['delivery_kind'], rec['thread']), ('pending', 'router', 'note', []))
 
     def test_drop_requires_not_planned_issue_and_hold(self):
         a, b = self.assigned('a'), self.new_need('b')
@@ -496,20 +518,43 @@ class EnsureTest(RouterBase):
         time.sleep(1.2)
         self.assertEqual(self.all_calls(), [])
 
-    def test_registered_pane_gone_restarts_but_session_switch_does_not(self):
+    def test_session_switch_asks_router_to_reregister_once_then_pane_gone_restarts(self):
         self.set_herdr(panes={'demo': [base.pane()], RT: [router_pane()]})
         self.register()
-        # pane 还在、换成了别的会话（有人接手）：只暂缓，不起新的，不碰它
-        self.set_herdr(panes={'demo': [base.pane()], RT: [router_pane(sess='sess-someone-else')]})
+        # 同一个 pane 里的 router 换了会话（重开过）：不重启它，只发一句「重新登记」（审查 DS 3）
+        self.set_herdr(panes={'demo': [base.pane()], RT: [router_pane(sess='sess-reopened')]})
+        self.start_server()
+        nid = self.new_need()
+        self.wait_for(lambda: [c for c in self.all_calls() if 'prompt' in c], msg='reregister prompt')
+        time.sleep(1.2)
+        prompts = [c for c in self.all_calls() if 'prompt' in c]
+        self.assertEqual(len(prompts), 1, prompts)  # 同一会话 10 分钟内只提醒一次
+        self.assertEqual(prompts[0][4], 'r1:p1')
+        self.assertIn('router register', prompts[0][-1])
+        self.assertEqual(self.started(), [])
+        self.assertEqual(self.need(nid)['delivery'], 'held')
+        st, h, _ = self.http('GET', '/api/needs')
+        self.assertTrue(h['router']['reregister'])
+        st, j, _ = self.post('/api/router/reregister', {})  # 页面按钮：清掉提醒记录，再请一次
+        self.assertEqual(st, 200, j)
+        self.wait_for(lambda: len([c for c in self.all_calls() if 'prompt' in c]) == 2, msg='second reregister')
+        self.register('r1:p1')  # 它照做后，暂缓的需求投给新会话
+        self.wait_for(lambda: self.need(nid)['delivery'] == 'sent', msg='delivered after reregister')
+        # 登记的 pane 不见了：拉起新的
+        n2 = self.new_need('第二条')
+        self.set_herdr(panes={'demo': [base.pane()], RT: []})
+        self.wait_for(lambda: self.started(), timeout=15, msg='restarted')
+
+    def test_unknown_presence_is_not_absent(self):
+        self.set_herdr(panes={'demo': [base.pane()], RT: [router_pane()]})
+        self.register()
+        self.patch_herdr(pane_list_fail={RT: 'error:internal'})  # 查不清：只暂缓，不拉起、不提醒
         self.start_server()
         nid = self.new_need()
         self.wait_for(lambda: self.need(nid)['delivery'] == 'held', msg='held')
-        time.sleep(0.8)
-        self.assertEqual(self.started(), [])
+        self.assertIn('核对不了', self.need(nid)['last_error'])
+        time.sleep(1)
         self.assertEqual([c for c in self.all_calls() if c[2:4] not in (['pane', 'list'], ['agent', 'list'])], [])
-        # 登记的 pane 不见了：拉起
-        self.set_herdr(panes={'demo': [base.pane()], RT: []})
-        self.wait_for(lambda: self.started(), timeout=15, msg='restarted')
 
 
 class DispatchTest(RouterBase):
@@ -650,6 +695,372 @@ class TasksNeedTest(RouterBase):
         self.assertEqual([(t['number'], t['depth']) for t in v['needs']['need-0007']], [(30, 0), (31, 1)])
         self.assertNotIn('need-0009', v['needs'])
         self.assertNotIn('body', json.dumps(flat[30]))  # 正文不进页面数据
+
+
+# ---------- 第 1 轮审查后的修复（A–G），含并发屏障 ----------
+
+def snapshot(tmp):
+    """收件箱和状态目录里所有文件的字节（判断「什么都没改」）。"""
+    out = {}
+    for d in ('inbox', 'state'):
+        for f in sorted((tmp / d).rglob('*')):
+            if f.is_file() and f.name not in ('server.log', '.lock', 'control.lock'):
+                out[str(f.relative_to(tmp))] = f.read_bytes()
+    return out
+
+
+class R1IdentityTest(RouterBase):
+    """A1：特权命令只认调用者自己的环境变量；A2：claim 只认 lead 目录 + lead-<ws>；B：未知不当不在。"""
+
+    def writes(self):
+        return [c for c in self.all_calls() if c[2:4] not in (['pane', 'list'], ['agent', 'list'], ['agent', 'get'])]
+
+    def test_a1_flags_cannot_borrow_router_or_lead_identity(self):
+        nid = self.assigned()
+        self.as_lead('need', 'claim', nid)
+        n2 = self.new_need('另一条')
+        before, calls = snapshot(self.tmp), len(self.all_calls())
+        router = ('--herdr-session', RT, '--pane', 'r1:p1')
+        lead = ('--herdr-session', 'demo', '--pane', 'w1:p1')
+        cmds = [('need', 'take', n2, *router), ('need', 'route', nid, '--ws', 'other', '--why', 'x', *router),
+                ('need', 'note', nid, '--text', 'x', *router), ('need', 'hold', n2, '--why', 'x', *router),
+                ('need', 'claim', nid, '--takeover', *lead), ('need', 'card', nid, '--body', self.card_file(), *lead),
+                ('need', 'link', nid, '--issue', ISSUE + '1', *lead), ('need', 'drop', nid, '--issue', ISSUE + '1', '--why', 'x', *lead),
+                ('router', 'register', *router), ('router', 'lead', 'demo', *router), ('router', 'dispatch', nid, *router),
+                ('router', 'close-lead', 'demo', *router)]
+        for args in cmds:
+            for env in ({'HERDR_SESSION': '', 'HERDR_PANE_ID': ''},                 # 普通 shell
+                        {'HERDR_SESSION': 'demo', 'HERDR_PANE_ID': 'w1:p3'}):       # 别的 lead 的 pane
+                r = self.q(*args, env=env)
+                self.assertEqual(r.returncode, 4, (args, env, r.stderr))
+        self.assertEqual(snapshot(self.tmp), before)                    # 持久文件逐字节不变
+        self.assertEqual([c for c in self.all_calls()[calls:] if c[2:4] not in (['pane', 'list'], ['agent', 'list'])], [])
+        r = self.as_router('need', 'take', n2, '--herdr-session', RT, '--pane', 'r1:p1')  # 参数和自己的环境一致：照常
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_a2_claim_requires_exact_lead_dir_and_lead_name(self):
+        nid = self.assigned()
+        ws = self.tmp / 'ws' / 'demo'
+        st = self.herdr_state()
+        st['panes']['demo'] += [dict(base.pane('w1:p5', lead='lead-x'), cwd=str(ws), name='w-9'),        # 目录对、名字不对
+                                dict(base.pane('w1:p6', lead='lead-y'), cwd=str(ws / 'repo'), name='lead-demo')]  # 名字对、在子目录
+        (self.tmp / 'herdr.json').write_text(json.dumps(st))
+        for pane in ('w1:p4', 'w1:p5', 'w1:p6'):
+            r = self.as_lead('need', 'claim', nid, pane=pane)
+            self.assertEqual(r.returncode, 4, (pane, r.stderr))
+        self.assertEqual(self.need(nid)['lead'], {})
+        self.assertEqual(self.as_lead('need', 'claim', nid).returncode, 0)
+
+    def test_b_takeover_refused_when_original_unknown(self):
+        nid = self.assigned()
+        self.as_lead('need', 'claim', nid)
+        # 接手的 lead 在另一个 session（rt2），原 lead 所在的 demo 查询失败：未知，拒绝
+        (self.tmp / 'sock' / 'rt2').mkdir()
+        (self.tmp / 'sock' / 'rt2' / 'herdr.sock').write_text('')
+        st = self.herdr_state()
+        st['panes']['rt2'] = [dict(base.pane('z1:p1', lead='lead-z'), cwd=str(self.tmp / 'ws' / 'demo'), name='lead-demo')]
+        (self.tmp / 'herdr.json').write_text(json.dumps(st))
+        before = snapshot(self.tmp)
+        for bad in ('error:internal', 'timeout'):
+            self.patch_herdr(pane_list_fail={'demo': bad}, sleep=5)
+            r = self.q('need', 'claim', nid, '--takeover', env={'HERDR_SESSION': 'rt2', 'HERDR_PANE_ID': 'z1:p1'})
+            self.assertEqual(r.returncode, 4, (bad, r.stderr))
+            self.assertIn('核对不了', r.stderr)
+        self.assertEqual(snapshot(self.tmp), before)
+        # 同一个会话出现在两个 pane：也算查不清
+        self.patch_herdr(pane_list_fail={})
+        st = self.herdr_state()
+        st['panes']['demo'].append(dict(base.pane('w1:p9', lead='lead-a'), cwd='/tmp'))
+        (self.tmp / 'herdr.json').write_text(json.dumps(st))
+        r = self.q('need', 'claim', nid, '--takeover', env={'HERDR_SESSION': 'rt2', 'HERDR_PANE_ID': 'z1:p1'})
+        self.assertEqual(r.returncode, 4, r.stderr)
+        # 原 lead 的 session 确认没在跑：可以接手
+        st['panes'].pop('demo')
+        (self.tmp / 'herdr.json').write_text(json.dumps(st))
+        r = self.q('need', 'claim', nid, '--takeover', env={'HERDR_SESSION': 'rt2', 'HERDR_PANE_ID': 'z1:p1'})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.need(nid)['lead']['lead_session'], 'lead-z')
+
+    def test_b_register_refused_when_old_router_unknown(self):
+        self.set_herdr(panes={'demo': [base.pane()], RT: [router_pane(), router_pane('r3:p1', 'sess-y', 'router')]})
+        self.register()
+        self.set_herdr(panes={'demo': [base.pane()], RT: [router_pane('r3:p1', 'sess-y', 'router')]})
+        info = qstore.router_info()
+        real = qstore.presence
+        with mock.patch.object(qstore, 'presence', lambda s, l: ('unknown', None, 'pane list 超时')):
+            with self.assertRaises(qstore.QError) as e:
+                qstore.register_router(qstore.identify(RT, 'r3:p1'))
+        self.assertEqual(e.exception.code, 409)
+        self.assertEqual(qstore.router_info(), info)
+        self.assertEqual(real(RT, 'sess-router-1')[0], 'absent')
+
+
+class R1OwnershipTest(RouterBase):
+    """A3：Router 只复用 / 关闭自己建、三项对得上的 lead；人工同名 pane、重复同名都不碰。"""
+
+    def setUp(self):
+        super().setUp()
+        os.environ['QI_DISPATCH_WAIT'] = '2'
+        self.addCleanup(os.environ.pop, 'QI_DISPATCH_WAIT', None)
+        self.register()
+
+    def touched(self, pane):
+        return [c for c in self.all_calls() if pane in c and c[2:4] not in (['agent', 'get'],)]
+
+    def human_lead(self, pane='human:p1', sess='sess-human', ws_id='manual'):
+        return dict(base.pane(pane, lead=sess), cwd=str(self.tmp / 'ws' / 'demo'), name='lead-demo', workspace_id=ws_id)
+
+    def test_manual_same_name_pane_is_conflict_not_prompted(self):
+        self.set_herdr(panes={'demo': [base.pane()], RT: [router_pane(), self.human_lead()]}, prompt_working=True)
+        nid = self.assigned()
+        r = self.as_router('router', 'dispatch', nid)
+        self.assertEqual(r.returncode, 3, r.stderr)
+        self.assertIn('不是 Router 建的', r.stderr)
+        r = self.as_router('need', 'hold', nid, '--why', r.stderr.strip()[:200])  # skill：冲突时 hold，页面显示原因
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.need(nid)['status'], 'held')
+        self.assertEqual(self.touched('human:p1'), [])
+        self.assertEqual([c for c in self.all_calls() if c[2:4] in (['agent', 'start'], ['workspace', 'create'], ['workspace', 'close'])], [])
+        self.assertEqual(self.as_router('router', 'close-lead', 'demo').returncode, 3)
+        self.assertEqual(self.touched('human:p1'), [])
+
+    def test_duplicate_same_name_is_conflict(self):
+        self.set_herdr(panes={'demo': [base.pane()], RT: [router_pane()]}, prompt_working=True)
+        a = self.assigned('a')
+        self.assertEqual(self.as_router('router', 'dispatch', a).returncode, 0)
+        rec = qstore.router_leads()['demo']
+        st = self.herdr_state()
+        st['panes'][RT].append(self.human_lead('human:p2'))
+        (self.tmp / 'herdr.json').write_text(json.dumps(st))
+        b = self.assigned('b')
+        r = self.as_router('router', 'dispatch', b)
+        self.assertEqual(r.returncode, 3, r.stderr)
+        self.assertIn('2 个名为 lead-demo', r.stderr)
+        self.assertEqual(self.touched('human:p2'), [])
+        prompts = [c for c in self.all_calls() if c[2:4] == ['agent', 'prompt']]
+        self.assertFalse(any(c[4] == rec['pane_id'] and b in c[-1] for c in prompts))  # 冲突时连托管的也不派
+
+    def test_recorded_lead_reused_only_while_identity_matches_and_close(self):
+        self.set_herdr(panes={'demo': [base.pane()], RT: [router_pane()]}, prompt_working=True)
+        a, b, c = self.assigned('a'), self.assigned('b'), self.assigned('c')
+        self.assertEqual(self.as_router('router', 'dispatch', a).returncode, 0)
+        rec = qstore.router_leads()['demo']
+        self.assertEqual(set(rec), {'workspace_id', 'pane_id', 'agent_session', 'created_at'})
+        self.assertTrue(rec['agent_session'])
+        r = self.as_router('router', 'dispatch', b)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('续派', r.stdout)
+        # 同一个 pane 被换成了别的会话（人工在里面重开）：不再算 Router 的，冲突
+        st = self.herdr_state()
+        p = next(x for x in st['panes'][RT] if x['pane_id'] == rec['pane_id'])
+        p['agent_session']['value'] = 'sess-someone'
+        (self.tmp / 'herdr.json').write_text(json.dumps(st))
+        self.assertEqual(self.as_router('router', 'dispatch', c).returncode, 3)
+        self.assertEqual(self.as_router('router', 'close-lead', 'demo').returncode, 3)
+        p['agent_session']['value'] = rec['agent_session']
+        (self.tmp / 'herdr.json').write_text(json.dumps(st))
+        r = self.as_router('router', 'close-lead', 'demo')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        closes = [x for x in self.all_calls() if x[2:4] == ['workspace', 'close']]
+        self.assertEqual([x[4] for x in closes], [rec['workspace_id']])
+        self.assertNotIn('demo', qstore.router_leads())
+
+
+class R1PauseTest(RouterBase):
+    """C：暂停在动作链中途提交，之后不再有新的启动 / 投递 / 派工；停在可恢复的状态；恢复后只投一次。"""
+
+    def pause_after(self, target, match):
+        """包住 target（模块, 名字）：被调用且参数命中 match 时，在它返回之后（没有持任何锁）提交暂停。"""
+        mod, name = target
+        real = getattr(mod, name)
+
+        def wrapper(*a, **k):
+            out = real(*a, **k)
+            if match(a):
+                qstore.set_paused(True)
+            return out
+        return mock.patch.object(mod, name, wrapper)
+
+    def test_pause_between_create_and_start(self):
+        self.set_herdr(panes={'demo': [base.pane()], RT: []})
+        with self.pause_after((qstore, 'gated'), lambda a: list(a[1:3]) == ['workspace', 'create']):
+            result, why = server.routerctl.ensure()
+        self.assertEqual(result, 'paused', why)
+        calls = self.all_calls()
+        self.assertEqual([c[2:4] for c in calls if c[2:4] in (['agent', 'start'], ['agent', 'prompt'])], [])
+        self.assertEqual(self.herdr_state()['panes'][RT], [])  # 刚建的 workspace 已关
+        self.assertEqual(qstore.geti(qstore.ensure_state(), 'total'), 0)  # 不计拉起次数
+        self.assertFalse(qstore.ensure_state().get('gave_up'))
+
+    def test_pause_between_identity_lookup_and_prompt(self):
+        self.register()
+        nid = self.new_need()
+        with self.pause_after((qstore, 'presence'), lambda a: True):
+            server.scan_needs()
+        self.assertEqual(self.router_prompts(), [])
+        rec = self.need(nid)
+        self.assertEqual(rec['delivery'], 'pending')  # 不卡在 sending
+        server.scan_needs()  # 还在暂停：仍不发
+        self.assertEqual(self.router_prompts(), [])
+        qstore.set_paused(False)
+        server.scan_needs()
+        server.scan_needs()
+        self.assertEqual(len(self.router_prompts()), 1)  # 恢复后只发一次
+        self.assertEqual(self.need(nid)['delivery'], 'sent')
+
+    def test_pause_between_ensure_lead_and_dispatch_prompt(self):
+        self.set_herdr(panes={'demo': [base.pane()], RT: [router_pane()]}, prompt_working=True)
+        self.register()
+        nid = self.assigned()
+        with self.pause_after((server.routerctl, 'ensure_lead'), lambda a: True):
+            with self.assertRaises(qstore.QError) as e:
+                server.routerctl.dispatch(nid)
+        self.assertIn('暂停', e.exception.message)
+        prompts = [c for c in self.all_calls() if c[2:4] == ['agent', 'prompt']]
+        self.assertFalse(any('dispatch' in c[-1] and nid in c[-1] for c in prompts), prompts)
+        self.assertNotIn('dispatch', self.need(nid))
+
+    def test_pause_waits_for_inflight_write_and_blocks_later_ones(self):
+        """门禁是真的锁：暂停要等正在进行的那一次写完才提交，提交之后的写一律不发。"""
+        import threading
+        self.set_herdr(panes={'demo': [base.pane()], RT: [router_pane()]}, prompt='timeout', sleep=1.5)
+        t0 = time.monotonic()
+        th = threading.Thread(target=lambda: qstore.gated(RT, 'agent', 'prompt', 'r1:p1', 'x', timeout=5))
+        th.start()
+        time.sleep(0.4)
+        qstore.set_paused(True)
+        waited = time.monotonic() - t0
+        th.join()
+        self.assertGreater(waited, 1.2)
+        self.assertEqual(qstore.gated(RT, 'agent', 'prompt', 'r1:p1', 'y')['kind'], 'paused')
+        self.assertEqual(len([c for c in self.all_calls() if 'prompt' in c]), 1)
+
+    def test_lead_replies_continue_during_pause_and_route_is_blocked(self):
+        nid = self.assigned()
+        self.as_lead('need', 'claim', nid)
+        self.as_lead('need', 'card', nid, '--body', self.card_file())
+        n2 = self.new_need('另一条')
+        self.as_router('need', 'take', n2)
+        qstore.set_paused(True)
+        self.assertEqual(self.as_router('need', 'route', n2, '--ws', 'demo', '--why', 'x').returncode, 3)  # DS Nit 1
+        qstore.owner_reply(nid, '暂停期间的回复')
+        server.scan_needs()
+        p = [c for c in self.herdr_calls() if c[1] == 'demo']
+        self.assertEqual(len(p), 1)  # 已在跑的 lead 不受影响（DS Nit 2）
+        self.assertEqual(p[0][4], 'w1:p1')
+
+
+class R1RaceTest(RouterBase):
+    """D：claim 与 route 并发（屏障插在 claim 查 herdr 之后、写之前）。"""
+
+    def test_route_between_claim_checks_and_write_is_409(self):
+        nid = self.assigned()
+        router = qstore.identify(RT, 'r1:p1')
+        lead = qstore.identify('demo', 'w1:p1')
+        real = qstore.agent_name
+
+        def barrier(session, pane):
+            qstore.route(nid, 'other', '改派到 other', router)  # 合法的并发改派
+            return real(session, pane)
+        with mock.patch.object(qstore, 'agent_name', barrier):
+            with self.assertRaises(qstore.QError) as e:
+                qstore.claim_need(nid, lead)
+        self.assertEqual(e.exception.code, 409)
+        rec = self.need(nid)
+        self.assertEqual((rec['ws'], rec['lead']), ('other', {}))  # 不会出现 ws=other、lead=demo 的 lead
+
+    def test_lead_change_between_checks_and_write_is_409(self):
+        nid = self.assigned()
+        real = qstore.agent_name
+        first = qstore.identify('demo', 'w1:p1')
+        second = qstore.identify('demo', 'w1:p2')
+
+        def barrier(session, pane):
+            if pane == 'w1:p2':
+                qstore.claim_need(nid, first)
+            return real(session, pane)
+        with mock.patch.object(qstore, 'agent_name', barrier):
+            with self.assertRaises(qstore.QError) as e:
+                qstore.claim_need(nid, second)
+        self.assertEqual(e.exception.code, 409)
+        self.assertEqual(self.need(nid)['lead']['lead_session'], 'lead-a')
+
+
+class R1StuckTest(RouterBase):
+    """E1：assigned 没人 claim 的补充投给 Router、超时自动补投一次、页面能重新通知。"""
+
+    def test_unclaimed_nudged_once_and_renotify(self):
+        os.environ['QI_UNCLAIMED_AFTER'] = '3'
+        self.addCleanup(os.environ.pop, 'QI_UNCLAIMED_AFTER', None)
+        nid = self.assigned()
+        self.assertEqual(qstore.need_delivery_view(self.need(nid))[0], '已分到 ws，等 lead claim')
+        self.assertTrue(qstore.need_delivery_view(self.need(nid))[2])  # 页面给「重新通知」
+        server.scan_needs()
+        self.assertEqual(self.router_prompts(), [])  # 还没到时间
+        time.sleep(3.2)
+        server.scan_needs()
+        server.scan_needs()
+        ps = self.router_prompts()
+        self.assertEqual(len(ps), 1)
+        self.assertIn('一直没有 lead claim', ps[0][-1])
+        time.sleep(3.2)
+        server.scan_needs()
+        self.assertEqual(len(self.router_prompts()), 1)  # 每次分派只自动补投一次
+        qstore.need_renotify(nid)  # Owner 点「重新通知」
+        server.scan_needs()
+        self.assertEqual(len(self.router_prompts()), 2)
+        self.as_lead('need', 'claim', nid)
+        self.assertFalse(qstore.need_delivery_view(self.need(nid))[2])
+
+
+class R1MiscTest(RouterBase):
+    """F Nit 5、G1、G2。"""
+
+    def test_dead_router_workspace_closed_before_new_one(self):
+        self.set_herdr(panes={'demo': [base.pane()], RT: [{'pane_id': 'old:p1', 'workspace_id': 'old', 'cwd': '/tmp', 'agent_status': 'unknown'},
+                                                          {'pane_id': 'keep:p1', 'workspace_id': 'keep', 'cwd': '/tmp', 'agent_status': 'unknown'}]})
+        qstore.ensure_end('started', '', workspace_id='old')
+        result, why = server.routerctl.ensure()
+        self.assertEqual(result, 'started', why)
+        closes = [c[4] for c in self.all_calls() if c[2:4] == ['workspace', 'close']]
+        self.assertEqual(closes, ['old'])  # 只关自己记着的那个空壳，别的空 workspace 不碰
+
+    def test_g1_task_view_uses_agent_list_names(self):
+        self.set_herdr(panes={'demo': [dict(base.pane('w1:p7', lead='x'), name='w-42', cwd='/tmp')]})
+        agents = tbase.tasks.fetch_session('demo')
+        self.assertEqual([a['pane']['name'] for a in agents], ['w-42'])
+        self.assertEqual([c[2:4] for c in self.all_calls()], [['agent', 'list']])
+        refs = tbase.tasks.agent_refs(agents, [])
+        self.assertIn(('demo', 42), refs)
+
+    def test_g2_lead_cwd_from_tasks_json(self):
+        lc = self.tmp / 'leads' / 'demo-lead'
+        lc.mkdir(parents=True)
+        (self.tmp / 'tasks.json').write_text(json.dumps({'repos': [{'ws': 'demo', 'repo': 'owner/repo', 'lead_cwd': str(lc)}]}))
+        self.assertEqual(qstore.lead_cwd('demo'), lc)
+        self.assertEqual(qstore.lead_cwd('other'), self.tmp / 'ws' / 'other')
+        self.set_herdr(panes={'demo': [base.pane(), dict(base.pane('w1:p1', lead='lead-a'), cwd=str(self.tmp / 'ws' / 'demo'), name='lead-demo')],
+                              RT: [router_pane()]}, prompt_working=True)
+        self.set_herdr(panes={'demo': [dict(base.pane('w1:p1', lead='lead-a'), cwd=str(self.tmp / 'ws' / 'demo'), name='lead-demo')],
+                              RT: [router_pane()]}, prompt_working=True)
+        os.environ['QI_DISPATCH_WAIT'] = '2'
+        self.addCleanup(os.environ.pop, 'QI_DISPATCH_WAIT', None)
+        self.register()
+        nid = self.assigned()
+        r = self.as_router('router', 'dispatch', nid)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue((lc / 'dispatch' / f'{nid}.md').is_file())
+        self.assertFalse((self.tmp / 'ws' / 'demo' / 'dispatch').exists())
+        create = next(c for c in self.all_calls() if c[2:4] == ['workspace', 'create'])
+        self.assertEqual(create[create.index('--cwd') + 1], str(lc))
+        self.assertEqual(self.as_lead('need', 'claim', nid).returncode, 4)  # ~/workspaces/demo 不再是 lead 目录
+        rec = qstore.router_leads()['demo']
+        r = self.as_router('need', 'show', nid)
+        r = self.q('need', 'claim', nid, env={'HERDR_SESSION': RT, 'HERDR_PANE_ID': rec['pane_id']})
+        self.assertEqual(r.returncode, 0, r.stderr)  # Router 起的 lead-demo（cwd = lead_cwd）可以 claim
+        (self.tmp / 'tasks.json').write_text(json.dumps({'repos': [{'ws': 'demo', 'repo': 'owner/repo', 'lead_cwd': 'relative/x'}]}))
+        with self.assertRaises(ValueError):
+            tbase.tasks.load_config()
 
 
 # ---------- node：需求页、审批页、任务页筛选 ----------
@@ -811,6 +1222,13 @@ class RouterPageTest(unittest.TestCase):
         self.assertIn('bad', out['cardCls'])
         self.assertIn('Router 起不来', out['text'])
         self.assertIn('重新尝试拉起', out['buttons'])
+
+    def test_reregister_button_when_router_absent(self):
+        out = self.run_page('needs', {'router': {'present': False, 'why': '登记的 Router 会话不在了'}})
+        self.assertIn('让 Router 重新登记', out['buttons'])
+        self.assertIn('登记的 Router 会话不在了', out['text'])
+        out = self.run_page('needs')
+        self.assertNotIn('让 Router 重新登记', out['buttons'])  # 在线时不显示
 
     def test_approval_page(self):
         out = self.run_page('approval')

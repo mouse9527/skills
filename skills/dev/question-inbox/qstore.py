@@ -57,6 +57,23 @@ STALE_IDLE, STALE_WORKING = 120, 900  # sent 之后多久没 receive 算「未�
 
 # ---------- 常量 ----------
 
+def tasks_config_path():
+    return Path(os.environ.get('QI_TASKS_CONFIG') or Path.home() / '.config' / 'question-inbox' / 'tasks.json')
+
+
+def lead_cwd(ws):
+    """ws 的 lead 工作目录：tasks.json 条目里的可选 `lead_cwd`（可写 ~），默认 ~/workspaces/<ws>。
+    Router 起 lead、写派工书（<lead_cwd>/dispatch/）、claim 校验都按它。"""
+    try:
+        data = json.loads(tasks_config_path().read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        data = {}
+    for r in (data.get('repos') if isinstance(data, dict) else None) or []:
+        if isinstance(r, dict) and r.get('ws') == ws and isinstance(r.get('lead_cwd'), str) and r['lead_cwd'].strip():
+            return Path(r['lead_cwd']).expanduser()
+    return workspaces_root() / ws
+
+
 def router_session():
     """Router 所在的 herdr session；真机自查时指向临时 session，绝不在别的 session 起 agent。"""
     return os.environ.get('QI_ROUTER_SESSION') or 'router'
@@ -1094,6 +1111,29 @@ def find_lead(session, lead_session):
     return hits[0], None
 
 
+ABSENT_CODES = ('no_socket', 'server_not_running', 'session_not_found')  # herdr 明确答复「这个 session 没在跑」
+
+
+def presence(session, lead_session):
+    """(结论, pane, 说明)。结论三选一：present（恰好一个 claude pane 是这个会话）/ absent（确认不在：查询成功且零匹配，
+    或 session 根本没在跑）/ unknown（查询失败、超时、输出坏、多个匹配）。**unknown 不能当成 absent 用。**"""
+    if not session or not lead_session:
+        return 'absent', None, '没有身份记录'
+    r = pane_list(session)
+    if not r['ok']:
+        if r['code'] in ABSENT_CODES:
+            return 'absent', None, f'herdr session {session} 没在跑（{r["code"]}）'
+        return 'unknown', None, f'pane list 失败：{r["code"]} {r["message"]}'.strip()
+    if not isinstance(r['panes'], list):
+        return 'unknown', None, 'pane list 输出不是列表'
+    hits = [p for p in r['panes'] if isinstance(p, dict) and p.get('agent') == 'claude' and session_value(p) == lead_session]
+    if len(hits) == 1:
+        return 'present', hits[0], ''
+    if hits:
+        return 'unknown', None, f'有 {len(hits)} 个 pane 是同一个会话'
+    return 'absent', None, '找不到这个会话（pane 已关闭或换成了别的会话）'
+
+
 def identify(session, pane_id):
     """调用者身份；失败抛 QError(403)。"""
     if not session or not pane_id:
@@ -1175,7 +1215,7 @@ NEED_STATUSES = ('new', 'routing', 'assigned', 'discussing', 'confirmed', 'filed
 DISCUSS = ('', 'waiting_owner', 'waiting_lead')
 SEALED = ('filed', 'dropped')  # 线程只读封存
 LEAD_STATES = ('assigned', 'discussing', 'confirmed', 'held')  # 负责 lead 能发卡 / link / drop / hold 的状态
-NEED_KINDS = ('new', 'note', 'reply', 'confirm')  # new / note 投给 Router；reply / confirm 投给负责 lead
+NEED_KINDS = ('new', 'note', 'unclaimed', 'reply', 'confirm')  # reply / confirm 投给负责 lead，其余投给 Router
 CARD_SECTIONS = ('理解', '范围', '不做什么', '验收草案', '开放问题')
 ISSUE_URL_RE = re.compile(r'^https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/issues/(\d+)$')
 REQUEST_ID_RE = re.compile(r'^[A-Za-z0-9_-]{8,64}$')
@@ -1331,10 +1371,10 @@ def owner_reply(nid, text, request_id=''):
             _save_need(rec, 'Owner 回复，投给负责 lead')
         else:
             rec['notes'].append({'at': now(), 'by': 'owner', 'text': text, **extra})
-            to_router = rec.get('status') in ('routing', 'held')
+            to_router = rec.get('status') in ('routing', 'held', 'assigned')  # 还没 lead claim：Router 仍是负责人
             if to_router:
                 _queue_need(rec, 'note')
-            _save_need(rec, 'Owner 补充' + ('，投给 Router' if to_router else '（处理的人会在 take / claim 时看到）'))
+            _save_need(rec, 'Owner 补充' + ('，投给 Router' if to_router else '（Router take 时会一起看到）'))
         return rec, True
 
 
@@ -1408,12 +1448,16 @@ def register_router(ident):
     name = agent_name(ident['herdr_session'], ident['pane_id'])
     if name != 'router':
         raise QError(403, f'pane {ident["pane_id"]} 的 agent 名字是 {name or "（无）"}，只有名为 router 的 agent 能登记')
+    old = router_info()
+    if old.get('lead_session') and old.get('lead_session') != ident['lead_session']:
+        st, pane, why = presence(old.get('herdr_session'), old['lead_session'])  # 查 herdr 不持锁
+        if st == 'present':
+            raise QError(403, f'已登记的 Router（pane {pane.get("pane_id")}）还在，不能顶替')
+        if st == 'unknown':
+            raise QError(409, f'核对不了已登记的 Router 是否还在（{why}），先不顶替，稍后重试')
     with locked():
-        old = router_info()
-        if old.get('lead_session') and old.get('lead_session') != ident['lead_session']:
-            pane, _ = find_lead(old.get('herdr_session'), old['lead_session'])
-            if pane:
-                raise QError(403, f'已登记的 Router（pane {pane.get("pane_id")}）还在，不能顶替')
+        if router_info() != old:
+            raise QError(409, 'Router 登记刚刚变了，请重试')
         info = {'herdr_session': ident['herdr_session'], 'lead_session': ident['lead_session'],
                 'pane_id': ident['pane_id'], 'registered_at': now(),
                 'last_delivery_at': old.get('last_delivery_at', '')}
@@ -1439,15 +1483,88 @@ def check_router(ident):
         raise QError(403, '身份不符：只有登记的 Router 会话能 take / route 需求')
 
 
+# ----- Router 建的 lead：$QI_STATE_DIR/router-leads.json -----
+# {ws: {workspace_id, pane_id, agent_session, created_at}}。Router 只复用 / 关闭这里记着、且三项都对得上的 lead。
+
+def router_leads():
+    return _read_state('router-leads.json')
+
+
+def record_lead(ws, info):
+    with locked():
+        data = router_leads()
+        if info:
+            data[ws] = dict(info, created_at=now())
+        else:
+            data.pop(ws, None)
+        _write_state('router-leads.json', data)
+
+
+def lead_record_presence(ws, agents=None):
+    """(结论, 记录, pane, 说明)：present 记录里的 workspace / pane / agent_session 三项都对得上；
+    absent 确认不在；unknown 查不清；conflict 有同名 lead-<ws> 但不是记录里那个，或同名的不止一个。"""
+    rec = router_leads().get(ws) or {}
+    s = router_session()
+    if agents is None:
+        r = agent_list(s)
+        if not r['ok']:
+            return ('absent' if r['code'] in ABSENT_CODES else 'unknown'), rec, None, f'agent list 失败：{r["code"]} {r["message"]}'
+        agents = r['agents']
+    same = [a for a in agents if isinstance(a, dict) and a.get('name') == f'lead-{ws}']
+    r = pane_list(s)
+    if not r['ok']:
+        return ('absent' if r['code'] in ABSENT_CODES else 'unknown'), rec, None, f'pane list 失败：{r["code"]} {r["message"]}'
+    panes = {p.get('pane_id'): p for p in r['panes'] if isinstance(p, dict)}
+    mine = None
+    if rec:
+        p = panes.get(rec.get('pane_id'))
+        if p and p.get('workspace_id') == rec.get('workspace_id') and session_value(p) == rec.get('agent_session'):
+            mine = p
+    if len(same) > 1:
+        return 'conflict', rec, None, f'session {s} 里有 {len(same)} 个名为 lead-{ws} 的 agent'
+    if same and (not mine or same[0].get('pane_id') != mine.get('pane_id')):
+        return 'conflict', rec, None, (f'session {s} 里的 lead-{ws}（pane {same[0].get("pane_id")}）不是 Router 建的'
+                                      f'（没有归属记录或 workspace / 会话对不上）')
+    if mine and same:
+        return 'present', rec, mine, ''
+    return 'absent', rec, None, '没有 Router 建的 lead-' + ws
+
+
 # ----- 全局暂停：$QI_STATE_DIR/control.json -----
 
 def paused():
     return bool(_read_state('control.json').get('paused'))
 
 
+@contextmanager
+def _control_lock(mode):
+    d = state_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    with open(d / 'control.lock', 'a') as f:
+        fcntl.flock(f, mode)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
 def set_paused(on):
-    with locked():
-        _write_state('control.json', {'paused': bool(on), 'at': now()})
+    """暂停要等正在进行的外部写动作（gated 里的那一次 herdr 调用）做完才提交；提交之后不会再有新的。"""
+    with _control_lock(fcntl.LOCK_EX):
+        with locked():
+            _write_state('control.json', {'paused': bool(on), 'at': now()})
+
+
+PAUSED = {'ok': False, 'kind': 'paused', 'code': 'paused', 'message': '全局暂停中'}
+
+
+def gated(session, *args, timeout=None):
+    """Router 侧的每一次外部写动作（建 workspace、起 agent、send-keys、prompt、关 workspace）都走这里：
+    持共享锁现查暂停，暂停了就不调 herdr、返回 PAUSED。set_paused 持独占锁，所以两者不会交错。"""
+    with _control_lock(fcntl.LOCK_SH):
+        if paused():
+            return dict(PAUSED)
+        return herdr(session, *args, timeout=timeout)
 
 
 # ----- 状态转换：Router 侧（take / route / hold / note） -----
@@ -1481,15 +1598,17 @@ def take(nid, ident):
 def route(nid, ws, why, ident):
     """routing → assigned：分到 ws（必须是 ~/workspaces 下已有的目录）。还没有 lead claim 的 assigned 可以改派。"""
     why = one_line(_clean_text(why, '分配理由'))[:500]
-    if not WS_RE.match(ws or '') or ws.startswith(('_', '.')) or not (workspaces_root() / ws).is_dir():
-        raise QError(400, f'ws 不合法或 {workspaces_root()}/{ws} 不存在：{ws!r}')
+    if not WS_RE.match(ws or '') or ws.startswith(('_', '.')) or not lead_cwd(ws).is_dir():
+        raise QError(400, f'ws 不合法或它的 lead 目录不存在：{ws!r}')
     with locked():
         check_router(ident)
+        if paused():  # route 是派工的前一半
+            raise QError(409, '全局暂停中：不分派')
         rec = read_need(nid)
         if not (rec.get('status') == 'routing' or (rec.get('status') == 'assigned' and not rec['lead'])):
             raise QError(409, f'{nid} 状态是 {rec.get("status")}：先 take；已有 lead claim 的不能改派')
         old = rec.get('ws')
-        rec.update({'status': 'assigned', 'ws': ws, 'why': why})
+        rec.update({'status': 'assigned', 'ws': ws, 'why': why, 'assigned_at': now(), 'nudged_at': ''})
         rec['notes_acked'] = len(rec['notes'])
         _ack_delivery(rec, 'router')
         _save_need(rec, f'Router 分到 ws {ws}' + (f'（原 {old}）' if old and old != ws else '') + f'：{why}')
@@ -1510,12 +1629,12 @@ def router_note(nid, text, ident):
 
 
 def hold(nid, why, ident):
-    """Router（routing 时）或负责 lead（assigned / discussing / confirmed 时）找不到路、卡住 → held，页面显示原因。"""
+    """Router（routing，或 assigned 但还没 lead claim 时）或负责 lead（assigned / discussing / confirmed 时）找不到路、卡住 → held，页面显示原因。"""
     why = one_line(_clean_text(why, '原因'))[:500]
     with locked():
         rec = read_need(nid)
         st = rec.get('status')
-        if st == 'routing':
+        if st == 'routing' or (st == 'assigned' and not rec['lead']):  # 还没 lead claim：Router 仍是负责人
             check_router(ident)
             by = 'router'
         elif st in LEAD_STATES and st != 'held' and rec['lead']:
@@ -1544,34 +1663,45 @@ def _check_lead(rec, ident):
                           f'只有它能发理解卡 / link / drop。lead 换人时新 lead 用 need claim --takeover（原 lead 不在时才行）')
 
 
-def claim_need(nid, ident, takeover=False):
-    """ws 的 lead 在自己的 pane 里登记为负责 lead。pane 的 cwd 必须在 ~/workspaces/<需求的 ws>/ 下。
-    已有负责 lead 时：同一个会话幂等；别的会话要 --takeover，且原 lead 已不在 herdr 里（现场核对）。"""
-    with locked():
-        rec = read_need(nid)
+def claim_need(nid, ident, takeover=False, name_of=None):
+    """该 ws 的 lead 在自己的 pane 里登记为负责 lead：pane 的 cwd **恰好**是这个 ws 的 lead 目录（lead_cwd，worker 在子目录里，
+    不算），且 agent 名是 `lead-<ws>`。已有负责 lead 时：同一个会话幂等；别的会话要 --takeover，且原 lead **确认**不在
+    （查询失败 / 多匹配算未知，拒绝）。查 herdr 不持锁；写之前在锁内重新核对 status / ws / lead，有变化就 409。"""
+    rec = read_need(nid)
     if rec.get('status') not in LEAD_STATES:
         raise QError(409, f'{nid} 状态是 {rec.get("status")}：只有 Router 分到 ws 之后（assigned）才能 claim')
-    ws = ws_from_cwd(ident.get('cwd') or '')
-    if ws != rec.get('ws'):
-        raise QError(403, f'{nid} 分给了 ws {rec.get("ws")}，你的 pane 在 {ws or ident.get("cwd") or "?"}：只有那个 ws 的 lead 能 claim')
+    ws = rec.get('ws') or ''
+    want = lead_cwd(ws).resolve()
+    try:
+        here = Path(ident.get('cwd') or '').resolve() if ident.get('cwd') else None
+    except OSError:
+        here = None
+    if here != want:
+        raise QError(403, f'{nid} 分给了 ws {ws}：只有 cwd 恰好是 {want} 的 lead 能 claim（你的 pane 在 {ident.get("cwd") or "?"}；'
+                          f'worker 在子目录里，不能 claim）')
+    name = (name_of or agent_name)(ident['herdr_session'], ident['pane_id'])
+    if name != f'lead-{ws}':
+        raise QError(403, f'只有名为 lead-{ws} 的 agent 能 claim {nid}（你的 pane 是 {name or "无名"}）')
     old = rec.get('lead') or {}
     same = (old.get('herdr_session'), old.get('lead_session')) == (ident['herdr_session'], ident['lead_session'])
     if old and not same:
         if not takeover:
             raise QError(403, f'{nid} 已由 {old.get("herdr_session")} pane {old.get("pane_id")} 负责；接手要 --takeover')
-        pane, _ = find_lead(old.get('herdr_session'), old.get('lead_session'))  # 查 herdr 不持锁
-        if pane:
+        st, pane, why = presence(old.get('herdr_session'), old.get('lead_session'))
+        if st == 'present':
             raise QError(403, f'原负责 lead 还在（pane {pane.get("pane_id")}），不能 takeover')
+        if st == 'unknown':
+            raise QError(403, f'核对不了原负责 lead 是否还在（{why}），不能 takeover；稍后重试')
     with locked():
-        rec = read_need(nid)
-        if rec.get('lead') != old:
-            raise QError(409, f'{nid} 的负责 lead 刚刚变了，请重试')
-        rec['lead'] = {'herdr_session': ident['herdr_session'], 'lead_session': ident['lead_session'],
+        cur = read_need(nid)
+        if cur.get('status') not in LEAD_STATES or cur.get('ws') != ws or (cur.get('lead') or {}) != old:
+            raise QError(409, f'{nid} 刚刚变了（现在 ws {cur.get("ws")}、状态 {cur.get("status")}），请重新 need show 后再 claim')
+        cur['lead'] = {'herdr_session': ident['herdr_session'], 'lead_session': ident['lead_session'],
                        'pane_id': ident['pane_id'], 'claimed_at': now()}
-        _ack_delivery(rec, 'lead')
+        _ack_delivery(cur, 'lead')
         if not same:
-            _save_need(rec, ('lead 接手（takeover）' if old else 'lead claim') + f'：{ident["herdr_session"]} pane {ident["pane_id"]}')
-        return rec
+            _save_need(cur, ('lead 接手（takeover）' if old else 'lead claim') + f'：{ident["herdr_session"]} pane {ident["pane_id"]}')
+        return cur
 
 
 def parse_card(text):
@@ -1607,7 +1737,7 @@ def card(nid, text, ident):
         return rec
 
 
-def link(nid, urls, ident):
+def link(nid, urls, ident, issue_info=None, main_repo=''):
     """负责 lead 建好 Issue 后登记（完整 URL，第一个是根）→ filed，线程封存。讨论过的必须先 confirmed；
     filed 之后还可以追加子 Issue。"""
     urls = [u.strip() for u in urls or [] if u and u.strip()]
@@ -1616,6 +1746,17 @@ def link(nid, urls, ident):
     for u in urls:
         if not ISSUE_URL_RE.match(u):
             raise QError(400, f'Issue 必须是完整 URL（https://github.com/<owner>/<repo>/issues/<号>）：{u!r}')
+    with locked():
+        rec = read_need(nid)
+        _check_lead(rec, ident)
+    if issue_info and not rec['issues']:  # 第一次 link：核对根 Issue（查 GitHub 不持锁，只读）
+        m = ISSUE_URL_RE.match(urls[0])
+        if main_repo and f'{m.group(1)}/{m.group(2)}'.lower() != main_repo.lower():
+            raise QError(400, f'根 Issue 要建在本 ws 的主 repo {main_repo}（你给的是 {m.group(1)}/{m.group(2)}）；跨 repo 的部分作子 Issue')
+        body = (issue_info(urls[0]).get('body') or '')
+        first = next((l.strip() for l in body.split('\n') if l.strip()), '')
+        if first != f'需求：{nid}':
+            raise QError(400, f'根 Issue 正文第一行必须是「需求：{nid}」（现在是 {first[:60]!r}），任务页靠它归组')
     with locked():
         rec = read_need(nid)
         _check_lead(rec, ident)
@@ -1734,12 +1875,53 @@ def need_renotify(nid):
     with locked():
         rec = read_need(nid)
         stale = rec.get('delivery') == 'sent' and need_stale(rec)
+        if unclaimed(rec) and rec.get('delivery') in ('received', 'sent', 'uncertain', 'none', None):
+            _queue_need(rec, 'unclaimed')  # 分到 ws 但没人 claim：叫醒 Router 去看 lead
+            _save_need(rec, 'Owner 点了重新通知：还没人 claim，投给 Router')
+            return
         if rec.get('delivery') not in ('uncertain', 'held') and not stale:
             raise QError(409, f'{nid} 当前不需要重新通知（delivery {rec.get("delivery")}）')
         old = rec.get('last_error') or ''
         rec.update({'delivery': 'pending', 'next_try_at': now(), 'hold_count': 0,
                     'last_error': _append_error(old, '重新通知：这条可能已经在对方的队列里')})
         _save_need(rec, f'Owner 点了重新通知（之前：{old or "无记录"}）')
+
+
+def unclaimed_after():
+    return float(os.environ.get('QI_UNCLAIMED_AFTER') or 1800)
+
+
+def unclaimed(rec):
+    return rec.get('status') == 'assigned' and not rec.get('lead')
+
+
+def nudge_unclaimed(at=None):
+    """分到 ws 超过 QI_UNCLAIMED_AFTER 秒（默认 30 分钟）还没人 claim：每次分派只自动补投一次给 Router。返回补投的 id。"""
+    at = at or datetime.now(TZ)
+    out = []
+    with locked():
+        for nid, rec in all_needs().items():
+            t = parse_time(rec.get('assigned_at'))
+            if (unclaimed(rec) and not rec.get('nudged_at') and t and (at - t).total_seconds() >= unclaimed_after()
+                    and rec.get('delivery') not in ('pending', 'sending', 'held')):
+                rec['nudged_at'] = now()
+                _queue_need(rec, 'unclaimed')
+                _save_need(rec, f'分到 ws {rec.get("ws")} 后 {int(unclaimed_after() // 60)} 分钟没人 claim，补投给 Router')
+                out.append(nid)
+    return out
+
+
+def need_unclaim(claimed, why):
+    """记了 sending 但发之前发现暂停了：退回 pending（恢复后再发一次），不留在 sending。"""
+    with locked():
+        for nid, seq, aid in claimed:
+            try:
+                rec = read_need(nid)
+            except QError:
+                continue
+            if rec.get('attempt_id') == aid and rec.get('delivery') == 'sending' and geti(rec, 'delivery_seq') == seq:
+                rec.update({'delivery': 'pending', 'attempt_id': '', 'last_error': one_line(why)[:300]})
+                _save_need(rec, f'没有发出（{why}），退回排队')
 
 
 def need_stale(rec, at=None):
@@ -1784,12 +1966,36 @@ def ensure_begin(at=None):
         return True, ''
 
 
-def ensure_end(result, error=''):
+def ensure_end(result, error='', drop_attempt=False, workspace_id=None):
+    """drop_attempt：途中暂停停下的那次不算拉起次数。workspace_id：这次建的 Router workspace（下次若只剩空壳就关掉）。"""
     with locked():
         st = ensure_state()
         st['last_result'] = result
         st['last_error'] = one_line(error)[:300] if error else ''
+        if drop_attempt and st.get('attempts'):
+            st['attempts'] = st['attempts'][:-1]
+            st['total'] = max(0, geti(st, 'total') - 1)
+        if workspace_id:
+            st['workspace_id'] = workspace_id
         _write_state('router-ensure.json', st)
+
+
+def ensure_note(key, value):
+    with locked():
+        st = ensure_state()
+        if value is None:
+            st.pop(key, None)
+        else:
+            st[key] = value
+        _write_state('router-ensure.json', st)
+
+
+def note_dispatch(nid, lead, pane, new, status):
+    """记下这条需求派给了哪个 lead（页面显示「已派给 lead-<ws>」）；这是分派记录，不是进度。"""
+    with locked():
+        rec = read_need(nid)
+        rec['dispatch'] = {'lead': lead, 'pane_id': pane, 'at': now(), 'new': bool(new), 'status': status or ''}
+        _save_need(rec, f'Router 派工给 {lead}（pane {pane}，{"新起" if new else "续派"}，lead 状态 {status or "未知"}）')
 
 
 def ensure_retry():
@@ -1804,6 +2010,8 @@ def need_delivery_view(rec, at=None):
     d = rec.get('delivery')
     err = rec.get('last_error') or ''
     who = 'lead' if rec.get('delivery_to') == 'lead' else 'Router'
+    if unclaimed(rec) and d in ('received', 'sent', 'uncertain'):
+        return '已分到 ws，等 lead claim', f'分派于 {rec.get("assigned_at")}', True
     if d == 'received':
         return f'{who} 已领取', '', False
     if d == 'sent':
