@@ -19,6 +19,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import qstore  # noqa: E402
+import tasks  # noqa: E402
 
 log = logging.getLogger('question-inbox')
 MAX_BODY = 1 << 20
@@ -338,7 +339,7 @@ class Handler(BaseHTTPRequestHandler):
         bad = self.guard(write=False)
         if bad:
             return self.send(403, {'error': bad})
-        path = self.path.split('?', 1)[0]
+        path, _, query = self.path.partition('?')
         try:
             if path == '/':
                 nonce = secrets.token_urlsafe(12)
@@ -348,6 +349,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(200, page.encode(), 'text/html; charset=utf-8', {'Content-Security-Policy': csp})
             if path == '/api/list':
                 return self.send(200, list_view())
+            if path == '/api/tasks':  # 只读；refresh=1 只是跳过 60 秒缓存，不写任何东西
+                try:
+                    return self.send(200, tasks.view(refresh='refresh=1' in query.split('&')))
+                except Exception as e:  # noqa: BLE001 页面显示「无法刷新：原因」，不当成没有任务
+                    log.exception('tasks view failed')
+                    return self.send(500, {'error': f'任务视图出错：{type(e).__name__} {e}'[:300]})
             m = re.fullmatch(r'/api/q/([A-Za-z0-9_.-]+)', path)
             if m:
                 return self.send(200, detail_view(m.group(1)))
@@ -461,7 +468,24 @@ PAGE = r'''<!doctype html>
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--text);font:16px/1.65 -apple-system,BlinkMacSystemFont,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",system-ui,sans-serif}
 a{color:var(--accent)}
-#app{display:grid;grid-template-columns:280px minmax(0,1fr);height:100vh}
+#modes{display:flex;gap:4px;align-items:center;height:44px;padding:0 12px;border-bottom:1px solid var(--border);background:var(--surface)}
+#modes a{padding:6px 12px;border-radius:8px;text-decoration:none;color:var(--muted);font-size:14px;font-weight:600}
+#modes a[aria-current]{background:var(--accent-weak);color:var(--accent)}
+#app{display:grid;grid-template-columns:280px minmax(0,1fr);height:calc(100vh - 44px)}
+#app[data-view=tasks]{grid-template-columns:minmax(0,1fr)}
+#app[data-view=tasks] #side{display:none}
+.tasks{max-width:1040px}
+.tgrp h2{font-size:15px;margin:24px 0 6px;display:flex;gap:8px;align-items:baseline}
+.tgrp.you h2{color:var(--warn-text)}.tgrp.stuck h2{color:var(--bad-text)}.tgrp.closed{opacity:.8}
+.tgrp h3{font-size:13px;color:var(--muted);margin:10px 0 2px;font-weight:600}
+.trow{padding:8px 10px;border-radius:8px;border:1px solid var(--border);background:var(--surface);margin:6px 0;font-size:14px;line-height:1.5}
+.trow.d1{margin-left:24px}.trow.d2{margin-left:48px}
+.trow.pref{background:transparent;border-style:dashed;color:var(--muted)}
+.trow .t1{display:flex;flex-wrap:wrap;gap:6px;align-items:center;color:var(--muted);font-size:13px}
+.trow .t2{font-weight:600;margin:2px 0}
+.trow .t3{color:var(--muted);font-size:13px;display:flex;flex-wrap:wrap;gap:4px 12px}
+.chip.info{background:var(--accent-weak);color:var(--accent)}.chip.mute{background:var(--bg);color:var(--muted);border:1px solid var(--border)}
+.thead{display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center}
 #side{border-right:1px solid var(--border);overflow:auto;padding:14px 10px 24px;background:var(--surface)}
 #main{overflow:auto;position:relative}
 .brand{display:flex;justify-content:space-between;align-items:baseline;font-weight:600;padding:0 8px 6px}
@@ -577,6 +601,8 @@ button:focus-visible,.opt:has(input:focus-visible),a:focus-visible,summary:focus
 .keys{display:grid;grid-template-columns:max-content 1fr;gap:6px 16px;margin:10px 0}
 @media (max-width:760px){
   #app{display:block;height:auto}
+  #modes{position:sticky;top:0;z-index:6}
+  .trow.d1{margin-left:12px}.trow.d2{margin-left:24px}
   #app[data-view=detail] #side{display:none}
   #app[data-view=list] #main{display:none}
   #side{border-right:0;min-height:100vh}
@@ -597,6 +623,7 @@ button:focus-visible,.opt:has(input:focus-visible),a:focus-visible,summary:focus
   .srow{padding:8px 10px}
 }
 </style></head><body>
+<nav id="modes" aria-label="切换视图"></nav>
 <div id="app" data-view="list"><nav id="side"></nav><main id="main"><div class="wrap"><p class="mute">选择左边的问题。</p></div></main></div>
 <div id="sheet" role="dialog" aria-modal="true" aria-label="提交前确认"></div>
 <div id="help" role="dialog" aria-label="快捷键"></div>
@@ -686,6 +713,7 @@ async function refreshList() {
   const {status, j} = await api('/api/list');
   if (seq !== listSeq || status !== 200) return;  // 迟到的旧列表不覆盖新的
   openCount = j.open_count;
+  renderModes();
   document.title = (j.open_count ? `(${j.open_count}) ` : '') + '问题收件箱';
   const side = document.getElementById('side'), top = side.scrollTop, todo = j.groups.todo;
   const parts = [
@@ -1161,6 +1189,88 @@ async function load(force) {
   if (changed) { msg = {cls: 'warn', text: '问题或回答已在别处更新：你填的内容还在表单里，提交会提示冲突并自动保留为草稿，然后刷新页面。'}; renderMsg(); }
 }
 
+// ---------- 任务视图（只读：除了刷新、链接、跳到题，没有任何输入控件，也不发写请求） ----------
+
+const TASKS = 'tasks';
+let mode = 'inbox', tasksData = null, tasksErr = '', tasksSeq = 0, tasksLoading = false, tasksAt = 0;
+const STAGE_CLS = {answer: 'hot', merge: 'hot', accept: 'hot', stuck: 'bad', doing: 'info', todo: 'mute', hold: 'mute', done: 'ok', dropped: 'mute'};
+
+function renderModes() {
+  const box = document.getElementById('modes'); if (!box) return;
+  const link = (href, label, on) => el('a', {href, 'aria-current': on ? 'page' : null}, label);
+  box.replaceChildren(link('#', `待我决定（${openCount}）`, mode === 'inbox'), link('#' + TASKS, '任务', mode === 'tasks'));
+}
+
+// 只放行 https://github.com/ 的链接；别的一律当文字
+function ghLink(url, text) {
+  return typeof url === 'string' && url.startsWith('https://github.com/')
+    ? el('a', {href: url, target: '_blank', rel: 'noopener noreferrer'}, text) : el('span', {}, text);
+}
+
+async function loadTasks(refresh) {
+  const seq = ++tasksSeq;
+  tasksLoading = true; if (mode === 'tasks') renderTasks();
+  let status = 0, j = {};
+  try { ({status, j} = await api('/api/tasks' + (refresh ? '?refresh=1' : ''))); } catch (e) { j = {error: String(e)}; }
+  if (seq !== tasksSeq) return;
+  tasksLoading = false; tasksAt = Date.now();
+  if (status === 200) { tasksData = j; tasksErr = ''; } else tasksErr = j.error || ('错误 ' + status);  // 失败时保留上一次的数据
+  if (mode === 'tasks') renderTasks();
+}
+
+function taskRow(t) {
+  if (t.kind === 'parent') {
+    return el('div', {class: 'trow pref d' + t.depth},
+      el('div', {class: 't1'}, '父 ', ghLink(t.url, `${t.repo}#${t.number}`), t.stage ? ` · 在「${t.stage}」` : ' · 不在列表里',
+        t.sub ? ` · 子 Issue ${t.sub.completed}/${t.sub.total} 已关` : ''),
+      t.title ? el('div', {}, t.title) : null);
+  }
+  const why = t.why || [];
+  return el('div', {class: 'trow d' + t.depth},
+    el('div', {class: 't1'}, el('span', {}, t.ws), '·', ghLink(t.url, `${t.repo}#${t.number}`),
+      el('span', {class: 'chip ' + (STAGE_CLS[t.stage.key] || 'mute'), title: why[0] || ''}, t.stage.label),
+      (t.tags || []).map(x => el('span', {class: 'tag', title: x.why}, x.label)),
+      t.sub ? el('span', {class: 'tag', title: '子 Issue 全关不等于父 Issue 完成'}, `子 Issue ${t.sub.completed}/${t.sub.total} 已关`) : null),
+    el('div', {class: 't2'}, t.title),
+    el('div', {class: 't3'}, el('span', {}, '依据：' + (why[0] || '—')),
+      (t.questions || []).map(q => el('a', {href: '#' + q.id, title: q.title}, `去回答 ${q.id} →`)),
+      (t.prs || []).filter(p => p.state === 'OPEN' || p.state === 'MERGED').map(p =>
+        ghLink(p.url, `PR ${p.repo === t.repo.toLowerCase() ? '' : p.full}#${p.number}${p.state === 'MERGED' ? '（已合并）' : p.draft ? '（草稿）' : ''}`)),
+      t.updated ? el('span', {}, 'Issue 更新 ', when(t.closed || t.updated)) : null));
+}
+
+function renderTasks() {
+  const main = document.getElementById('main'), v = tasksData, top = main.scrollTop;
+  const wrap = el('div', {class: 'wrap tasks'});
+  wrap.append(el('header', {}, el('h1', {}, '任务'),
+    el('div', {class: 'thead state'},
+      el('span', {}, '数据时间：', v ? when(v.generated_at) : '—'),
+      el('button', {id: 'tasks_refresh', disabled: tasksLoading, onclick: () => loadTasks(true)}, tasksLoading ? '刷新中…' : '刷新'),
+      el('span', {class: 'small'}, '只读：状态以 GitHub 为准，这里每次现查，不存任何东西。'))));
+  if (tasksErr) wrap.append(el('div', {class: 'msgbar bad'}, `无法刷新：${tasksErr}` + (v ? `；下面是 ${v.generated_at} 的数据` : '')));
+  if (v && v.config_error) wrap.append(el('div', {class: 'msgbar bad'}, v.config_error));
+  for (const s of (v && v.sources) || []) {
+    if (s.error) wrap.append(el('div', {class: 'msgbar bad'}, `无法刷新 ${s.name}：${s.error}；` +
+      (s.has_data ? `显示的是 ${s.at} 的数据` : '没有可用数据（不代表没有任务）')));
+    for (const m of s.more || []) wrap.append(el('div', {class: 'msgbar warn'}, `${s.name}：${m}`));
+  }
+  if (!v) { wrap.append(el('p', {class: 'mute'}, tasksErr ? '还没有拿到过数据。' : '加载中…')); main.replaceChildren(wrap); return; }
+  for (const g of v.groups) {
+    const box = el('section', {class: 'tgrp ' + g.key}, el('h2', {}, g.title, el('span', {class: 'n mute small'}, `${g.count} 个`)));
+    for (const w of g.ws) box.append(el('h3', {}, w.ws), ...w.tasks.map(taskRow));
+    wrap.append(box);
+  }
+  if ((v.unlinked || []).length) {
+    wrap.append(el('section', {class: 'tgrp'}, el('h2', {}, '未关联的待答题', el('span', {class: 'n mute small'}, `${v.unlinked.length} 题`)),
+      v.unlinked.map(q => el('div', {class: 'trow'}, el('div', {class: 't1'}, q.ws, '·', q.issue === 'none' ? '无 Issue' : q.issue),
+        el('a', {href: '#' + q.id}, `${q.id} · ${q.title} →`)))));
+  }
+  const ok = (v.sources || []).every(s => !s.error) && !v.config_error;
+  if (!v.groups.length && !(v.unlinked || []).length) wrap.append(el('p', {class: 'mute'}, ok ? '没有任务。' : '没有可显示的任务（有来源查询失败，见上）。'));
+  main.replaceChildren(wrap);
+  main.scrollTop = top;
+}
+
 const LEAVE_MSG = '当前问题有未保存的输入，离开会丢失。确定离开？';
 
 // 切题前有未保存的输入：先确认，取消就留在原题并恢复 hash。前端不在后台发任何写请求
@@ -1168,10 +1278,13 @@ function route() {
   const next = decodeURIComponent(location.hash.slice(1)) || null;
   if (detail && next === cur) return;  // 取消离开时恢复 hash 触发的那次 hashchange
   if (dirty && detail && detail.editable && !confirm(LEAVE_MSG)) { location.hash = '#' + cur; return; }
-  gen++; cur = decodeURIComponent(location.hash.slice(1)) || null; detail = null; dirty = false; msg = null;
+  const toTasks = next === TASKS;  // 题号形如 <ws>-NNNN，不会和 #tasks 撞
+  gen++; cur = toTasks ? null : next; detail = null; dirty = false; msg = null;
   curQ = null; editing = false; sheet = null; openState = {}; shownId = null; formShown = false;
-  renderSheet();
-  document.getElementById('app').setAttribute('data-view', cur ? 'detail' : 'list');
+  mode = toTasks ? 'tasks' : 'inbox';
+  renderSheet(); renderModes();
+  document.getElementById('app').setAttribute('data-view', toTasks ? 'tasks' : cur ? 'detail' : 'list');
+  if (toTasks) { renderTasks(); loadTasks(false); refreshList(); return; }
   document.getElementById('main').replaceChildren(el('div', {class: 'wrap'}, el('p', {class: 'mute'}, cur ? '加载中…' : '选择左边的问题。')));
   load(true); refreshList();
 }
@@ -1179,7 +1292,10 @@ window.addEventListener('hashchange', route);
 window.addEventListener('beforeunload', e => { if (dirty) { e.preventDefault(); e.returnValue = LEAVE_MSG; } });
 window.addEventListener('keydown', onKey);
 route();
-setInterval(() => { refreshList(); load(false); }, 3000);
+setInterval(() => {
+  refreshList(); load(false);
+  if (mode === 'tasks' && !tasksLoading && Date.now() - tasksAt > 60000) loadTasks(false);  // 服务端也有 60 秒缓存
+}, 3000);
 </script></body></html>
 '''
 

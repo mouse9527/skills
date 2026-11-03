@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!-- 问题收件箱服务（用户级 LaunchAgent）。占位符由 SKILL.md「安装」一节的 sed 命令替换：
-     __PYTHON__ python3 绝对路径；__SERVER__ server.py 绝对路径；__HERDR__ herdr 绝对路径；__HOME__ 家目录 -->
+     __PYTHON__ python3 绝对路径；__SERVER__ server.py 绝对路径；__HERDR__ herdr 绝对路径；__GH__ gh 绝对路径（任务视图用，launchd 的 PATH 里通常没有）；__HOME__ 家目录 -->
 <plist version="1.0">
 <dict>
   <key>Label</key>
@@ -17,6 +17,8 @@
     <string>__HOME__/.local/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     <key>HERDR_BIN_PATH</key>
     <string>__HERDR__</string>
+    <key>GH_BIN_PATH</key>
+    <string>__GH__</string>
     <key>HOME</key>
     <string>__HOME__</string>
   </dict>
