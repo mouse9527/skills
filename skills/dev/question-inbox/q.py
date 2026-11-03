@@ -473,9 +473,9 @@ def main(argv=None):
         def add2(n, fn, h, ident=True):
             sp = g.add_parser(n, help=h)
             sp.set_defaults(fn=fn)
-            if ident:
-                sp.add_argument('--herdr-session', help='默认取 $HERDR_SESSION（会现场核对）')
-                sp.add_argument('--pane', help='默认取 $HERDR_PANE_ID（会现场核对）')
+            if ident:  # 特权命令：身份只取自己 pane 的环境变量，这两个参数只能写成和它们一样（写别的就是退出码 4）
+                sp.add_argument('--herdr-session', help='只能等于你自己的 $HERDR_SESSION；不能指定别人的身份')
+                sp.add_argument('--pane', help='只能等于你自己的 $HERDR_PANE_ID；不能指定别人的身份')
             return sp
         return add2
 
@@ -498,7 +498,8 @@ def main(argv=None):
     r = n('hold', cmd_need_hold, 'Router（routing）或负责 lead：找不到路 / 卡住 → held')
     r.add_argument('id')
     r.add_argument('--why', required=True)
-    r = n('claim', cmd_need_claim, 'ws 的 lead：登记自己为负责 lead（pane 要在 ~/workspaces/<ws>/ 下）')
+    r = n('claim', cmd_need_claim, 'ws 的 lead：登记自己为负责 lead（pane 的 cwd 恰好是该 ws 的 lead 目录，默认 ~/workspaces/<ws>，'
+                                   '可由 tasks.json 的 lead_cwd 改；agent 名必须是 lead-<ws>；worker 不能 claim）')
     r.add_argument('id')
     r.add_argument('--takeover', action='store_true', help='原负责 lead 已不在 herdr 里时接手')
     r = n('card', cmd_need_card, '负责 lead：发理解卡（## 理解 / 范围 / 不做什么 / 验收草案 / 开放问题）')

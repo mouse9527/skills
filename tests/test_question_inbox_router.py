@@ -845,19 +845,27 @@ class R1OwnershipTest(RouterBase):
         a, b, c = self.assigned('a'), self.assigned('b'), self.assigned('c')
         self.assertEqual(self.as_router('router', 'dispatch', a).returncode, 0)
         rec = qstore.router_leads()['demo']
-        self.assertEqual(set(rec), {'workspace_id', 'pane_id', 'agent_session', 'created_at'})
+        self.assertEqual(set(rec), {'workspace_id', 'pane_id', 'agent_session', 'created_at', 'pending'})
+        self.assertFalse(rec['pending'])
         self.assertTrue(rec['agent_session'])
         r = self.as_router('router', 'dispatch', b)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn('续派', r.stdout)
-        # 同一个 pane 被换成了别的会话（人工在里面重开）：不再算 Router 的，冲突
+        # 同一个 pane、同名、同 cwd，只是会话重开过：归属没变，刷新记录后继续派（审查 DS N1 / 任务书 I）
         st = self.herdr_state()
         p = next(x for x in st['panes'][RT] if x['pane_id'] == rec['pane_id'])
-        p['agent_session']['value'] = 'sess-someone'
+        p['agent_session']['value'] = 'sess-reopened'
         (self.tmp / 'herdr.json').write_text(json.dumps(st))
-        self.assertEqual(self.as_router('router', 'dispatch', c).returncode, 3)
+        r = self.as_router('router', 'dispatch', c)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('续派', r.stdout)
+        self.assertEqual(qstore.router_leads()['demo']['agent_session'], 'sess-reopened')
+        self.assertEqual(len([x for x in self.all_calls() if x[2:4] == ['agent', 'start']]), 1)
+        # 换了 cwd（同名 agent 被挪到别的目录）就不是同一个归属：冲突
+        p['cwd'] = str(self.tmp / 'ws' / 'other')
+        (self.tmp / 'herdr.json').write_text(json.dumps(st))
         self.assertEqual(self.as_router('router', 'close-lead', 'demo').returncode, 3)
-        p['agent_session']['value'] = rec['agent_session']
+        p['cwd'] = str(self.tmp / 'ws' / 'demo')
         (self.tmp / 'herdr.json').write_text(json.dumps(st))
         r = self.as_router('router', 'close-lead', 'demo')
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -1007,6 +1015,7 @@ class R1StuckTest(RouterBase):
         server.scan_needs()
         self.assertEqual(len(self.router_prompts()), 1)  # 每次分派只自动补投一次
         qstore.need_renotify(nid)  # Owner 点「重新通知」
+        qstore.need_renotify(nid)  # 已在排队时再点：不报错、不重复排（DS R2 Nit 3）
         server.scan_needs()
         self.assertEqual(len(self.router_prompts()), 2)
         self.as_lead('need', 'claim', nid)
@@ -1019,7 +1028,7 @@ class R1MiscTest(RouterBase):
     def test_dead_router_workspace_closed_before_new_one(self):
         self.set_herdr(panes={'demo': [base.pane()], RT: [{'pane_id': 'old:p1', 'workspace_id': 'old', 'cwd': '/tmp', 'agent_status': 'unknown'},
                                                           {'pane_id': 'keep:p1', 'workspace_id': 'keep', 'cwd': '/tmp', 'agent_status': 'unknown'}]})
-        qstore.ensure_end('started', '', workspace_id='old')
+        qstore.ensure_end('started', '', workspace_id='old', root_pane='old:p1')
         result, why = server.routerctl.ensure()
         self.assertEqual(result, 'started', why)
         closes = [c[4] for c in self.all_calls() if c[2:4] == ['workspace', 'close']]
@@ -1061,6 +1070,270 @@ class R1MiscTest(RouterBase):
         (self.tmp / 'tasks.json').write_text(json.dumps({'repos': [{'ws': 'demo', 'repo': 'owner/repo', 'lead_cwd': 'relative/x'}]}))
         with self.assertRaises(ValueError):
             tbase.tasks.load_config()
+
+
+# ---------- 第 2 轮审查后的修复（H–L） ----------
+
+BAD_SHAPES = {  # rc=0、合法 JSON，但结构不对
+    'missing list': lambda t, k: {'id': f'cli:{t}:list', 'result': {'type': f'{t}_list'}},
+    'null list': lambda t, k: {'id': f'cli:{t}:list', 'result': {'type': f'{t}_list', k: None}},
+    'empty result': lambda t, k: {'id': f'cli:{t}:list', 'result': {}},
+    'wrong type': lambda t, k: {'id': f'cli:{t}:list', 'result': {'type': 'something_else', k: []}},
+    'bad item': lambda t, k: {'id': f'cli:{t}:list', 'result': {'type': f'{t}_list', k: [{'agent': 'claude'}]}},
+    'list result': lambda t, k: {'id': f'cli:{t}:list', 'result': []},
+}
+
+
+class R2ShapeTest(RouterBase):
+    """H：结构坏了的成功响应只能算「查不清」，不能当「确认不在」。"""
+
+    def bad(self, session, which, shape):
+        t, k = ('pane', 'panes') if which == 'pane' else ('agent', 'agents')
+        st = self.herdr_state()
+        st['list_raw'] = {session: {which: BAD_SHAPES[shape](t, k)}}
+        (self.tmp / 'herdr.json').write_text(json.dumps(st))
+
+    def test_wrappers_reject_every_bad_shape_but_accept_real_empty(self):
+        for shape in BAD_SHAPES:
+            for which, fn in (('pane', qstore.pane_list), ('agent', qstore.agent_list)):
+                self.bad('demo', which, shape)
+                r = fn('demo')
+                self.assertFalse(r['ok'], (shape, which))
+                self.assertEqual(r['code'], 'bad_shape', (shape, which))
+        self.patch_herdr(list_raw={})
+        self.set_herdr(panes={'demo': []})
+        self.assertEqual((qstore.pane_list('demo')['panes'], qstore.agent_list('demo')['agents']), ([], []))
+        self.assertEqual(qstore.presence('demo', 'lead-a')[0], 'absent')  # 真正的空列表：确认不在
+
+    def test_bad_shape_blocks_takeover(self):
+        nid = self.assigned()
+        self.as_lead('need', 'claim', nid)
+        (self.tmp / 'sock' / 'rt2').mkdir()
+        (self.tmp / 'sock' / 'rt2' / 'herdr.sock').write_text('')
+        st = self.herdr_state()
+        st['panes']['rt2'] = [dict(base.pane('z1:p1', lead='lead-z'), cwd=str(self.tmp / 'ws' / 'demo'), name='lead-demo')]
+        (self.tmp / 'herdr.json').write_text(json.dumps(st))
+        before = snapshot(self.tmp)
+        for shape in BAD_SHAPES:
+            self.bad('demo', 'pane', shape)
+            self.assertEqual(qstore.presence('demo', 'lead-a')[0], 'unknown', shape)
+            r = self.q('need', 'claim', nid, '--takeover', env={'HERDR_SESSION': 'rt2', 'HERDR_PANE_ID': 'z1:p1'})
+            self.assertEqual(r.returncode, 4, (shape, r.stderr))
+        self.assertEqual(snapshot(self.tmp), before)
+
+    def test_bad_shape_blocks_ensure_register_lead_record_and_delivery(self):
+        self.set_herdr(panes={'demo': [base.pane()], RT: [router_pane()]})
+        self.register()
+        info = qstore.router_info()
+        for shape in BAD_SHAPES:
+            for which in ('agent', 'pane'):
+                self.bad(RT, which, shape)
+                calls = len(self.all_calls())
+                result, why = server.routerctl.ensure()
+                self.assertIn(result, ('skipped', 'waiting'), (shape, which, why))
+                self.assertEqual([c for c in self.all_calls()[calls:] if c[2:4] not in (['pane', 'list'], ['agent', 'list'])], [], (shape, which))
+                self.assertNotEqual(qstore.lead_record_presence('demo')[0], 'absent', (shape, which))
+                pane, why, start = server.router_presence(info)
+                if which == 'pane':
+                    self.assertEqual((pane, start), (None, False), (shape, why))  # 查不清：不拉起
+        # register：旧 Router 的 session 查询结构坏了，不顶替
+        self.patch_herdr(list_raw={})
+        self.set_herdr(panes={'demo': [base.pane()], RT: [router_pane(), router_pane('r3:p1', 'sess-y', 'router')]})
+        with mock.patch.object(qstore, 'agent_name', lambda s, p: 'router'):
+            self.bad(RT, 'pane', 'missing list')
+            with self.assertRaises(qstore.QError):
+                qstore.register_router({'herdr_session': RT, 'pane_id': 'r3:p1', 'lead_session': 'sess-y', 'agent_kind': 'claude'})
+        self.assertEqual(qstore.router_info(), info)
+        # 任务页：这个 session 算查询失败，不是「没有 agent」
+        self.bad('demo', 'agent', 'null list')
+        with self.assertRaises(RuntimeError):
+            tbase.tasks.fetch_session('demo')
+
+    def test_bad_agent_list_does_not_start_second_router(self):
+        self.set_herdr(panes={'demo': [base.pane()], RT: [router_pane()]})
+        self.bad(RT, 'agent', 'missing list')
+        self.start_server()
+        nid = self.new_need()
+        self.wait_for(lambda: self.need(nid)['delivery'] == 'held', msg='held')
+        time.sleep(1)
+        self.assertEqual([c for c in self.all_calls() if c[2:4] in (['workspace', 'create'], ['agent', 'start'])], [])
+
+
+class R2LeadRecordTest(RouterBase):
+    """I：自建 lead 的归属记录能自愈：起完读不到身份先记待核验，恢复后补全；同一个 pane 换会话照样复用。"""
+
+    def setUp(self):
+        super().setUp()
+        self.set_herdr(panes={'demo': [base.pane()], RT: [router_pane()]}, prompt_working=True)
+        os.environ['QI_DISPATCH_WAIT'] = '2'
+        self.addCleanup(os.environ.pop, 'QI_DISPATCH_WAIT', None)
+        self.register()
+
+    def flaky(self, fail_from, fail_count):
+        """让第 fail_from 次起的 fail_count 次 pane_list 超时（其余走真的假 herdr）。"""
+        real, n = qstore.pane_list, {'i': 0}
+
+        def wrapped(session):
+            n['i'] += 1
+            if fail_from <= n['i'] < fail_from + fail_count:
+                return {'ok': False, 'kind': 'timeout', 'code': 'timeout', 'message': 'herdr 调用超时'}
+            return real(session)
+        return mock.patch.object(qstore, 'pane_list', wrapped)
+
+    def test_identity_read_timeout_after_start_then_recovers(self):
+        starts = lambda: len([c for c in self.all_calls() if c[2:4] == ['agent', 'start']])
+        # agent start 回包里没有会话 id（真 herdr 的回包形状未实测）、紧接着的身份查询又连续超时：只能记待核验
+        with mock.patch.object(server.routerctl, '_start_session', lambda r, s, p: ''):
+            pane, new = server.routerctl.ensure_lead('demo')
+        self.assertTrue(new)
+        rec = qstore.router_leads()['demo']
+        self.assertEqual((rec['agent_session'], rec['pending']), ('', True))  # 没有把未知身份写成完整记录
+        with self.flaky(1, 3):
+            for _ in range(3):  # 恢复前连续几次：查不清，409，不起新的
+                with self.assertRaises(qstore.QError):
+                    server.routerctl.ensure_lead('demo')
+        self.assertEqual(starts(), 1)
+        p2, new2 = server.routerctl.ensure_lead('demo')  # 恢复：补全记录、复用原来的 lead
+        self.assertEqual((p2, new2), (pane, False))
+        rec = qstore.router_leads()['demo']
+        self.assertEqual((rec['pending'], bool(rec['agent_session'])), (False, True))
+        self.assertEqual(starts(), 1)
+        self.assertEqual(self.as_router('router', 'close-lead', 'demo').returncode, 0)
+
+    def test_start_response_session_is_used_when_lookup_fails(self):
+        with self.flaky(1, 99):
+            info, err = server.routerctl.start_in_new_workspace(RT, 'L·demo', self.tmp / 'ws' / 'demo', 'lead-demo', 'hi')
+        self.assertIsNone(err)
+        self.assertTrue(info[2].startswith('sess-lead-demo'))  # 来自 agent start 回包
+
+    def test_real_conflicts_still_409(self):
+        server.routerctl.ensure_lead('demo')
+        rec = qstore.router_leads()['demo']
+        st = self.herdr_state()
+        root = next(x for x in st['panes'][RT] if x['pane_id'] == rec['pane_id'])
+        for change in ({'workspace_id': 'elsewhere'}, {'cwd': str(self.tmp / 'ws' / 'other')}):
+            saved = dict(root)
+            root.update(change)
+            (self.tmp / 'herdr.json').write_text(json.dumps(st))
+            self.assertEqual(qstore.lead_record_presence('demo')[0], 'conflict', change)
+            root.clear(); root.update(saved)
+        (self.tmp / 'herdr.json').write_text(json.dumps(st))
+        qstore.record_lead('demo', None)  # 没有记录的同名 lead
+        self.assertEqual(qstore.lead_record_presence('demo')[0], 'conflict')
+
+
+class R2TreeTest(RouterBase):
+    """J：关 workspace 前核验整棵树，有人工 / 说不清的 pane 就不关、保留记录。"""
+
+    def setUp(self):
+        super().setUp()
+        self.set_herdr(panes={'demo': [base.pane()], RT: [router_pane()]}, prompt_working=True)
+        self.register()
+        server.routerctl.ensure_lead('demo')
+        self.rec = qstore.router_leads()['demo']
+
+    def add(self, **pane):
+        st = self.herdr_state()
+        st['panes'][RT].append(dict({'workspace_id': self.rec['workspace_id'], 'agent_status': 'idle'}, **pane))
+        (self.tmp / 'herdr.json').write_text(json.dumps(st))
+
+    def closes(self):
+        return [c for c in self.all_calls() if c[2:4] == ['workspace', 'close']]
+
+    def test_manual_claude_or_shell_in_lead_workspace_blocks_close(self):
+        lc = self.tmp / 'ws' / 'demo'
+        for extra in (dict(base.pane('man:p1', lead='human-session'), name='human-not-managed', cwd=str(lc)),  # 人工 claude
+                      {'pane_id': 'man:p2', 'cwd': str(lc)},                                                  # 普通 shell
+                      dict(base.pane('man:p3', lead='h3'), name='w-5', cwd='/tmp'),                           # worker 名但不在 lead 目录下
+                      dict(base.pane('man:p4', lead='h4'), cwd=str(lc / 'issues' / '5'))):                   # 无名 agent
+            st = self.herdr_state()
+            st['panes'][RT] = [x for x in st['panes'][RT] if not x['pane_id'].startswith('man:')]
+            (self.tmp / 'herdr.json').write_text(json.dumps(st))
+            self.add(**{k: v for k, v in extra.items() if k != 'workspace_id'})
+            r = self.as_router('router', 'close-lead', 'demo')
+            self.assertEqual(r.returncode, 3, (extra, r.stderr))
+            self.assertIn('不归 Router 管', r.stderr)
+            self.assertEqual(self.closes(), [])
+            self.assertIn('demo', qstore.router_leads())  # 记录保留
+            self.assertTrue(any(x['pane_id'] == extra['pane_id'] for x in self.herdr_state()['panes'][RT]))
+
+    def test_lead_with_its_workers_closes(self):
+        lc = self.tmp / 'ws' / 'demo'
+        self.add(**dict(base.pane('wk:p1', lead='w1'), name='w-12', cwd=str(lc / 'issues' / '12' / 'repo')))
+        self.add(**dict(base.pane('wk:p2', lead='w2'), name='rv-12-codex', cwd=str(lc / 'issues' / '12' / 'review')))
+        r = self.as_router('router', 'close-lead', 'demo')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual([c[4] for c in self.closes()], [self.rec['workspace_id']])
+
+    def test_dead_shell_cleanup_requires_only_root(self):
+        st = self.herdr_state()
+        root = next(x for x in st['panes'][RT] if x['pane_id'] == self.rec['pane_id'])
+        for k in ('agent', 'name', 'agent_session'):
+            root.pop(k, None)  # lead 退出：根 pane 成了空 shell
+        st['panes'][RT].append({'pane_id': 'man:p9', 'workspace_id': self.rec['workspace_id'], 'cwd': '/tmp'})  # 有人在里面开了个终端
+        (self.tmp / 'herdr.json').write_text(json.dumps(st))
+        ok, why = server.routerctl.close_if_dead(RT, self.rec['workspace_id'], self.rec['pane_id'])
+        self.assertFalse(ok)
+        self.assertEqual(self.closes(), [])
+        st['panes'][RT] = [x for x in st['panes'][RT] if x['pane_id'] != 'man:p9']
+        (self.tmp / 'herdr.json').write_text(json.dumps(st))
+        ok, why = server.routerctl.close_if_dead(RT, self.rec['workspace_id'], self.rec['pane_id'])
+        self.assertTrue(ok, why)
+
+
+class R2CountTest(RouterBase):
+    """K：启动计数只能退还本次自己预占、且还没执行 agent start 的那一次。"""
+
+    def three_starts(self):
+        for _ in range(3):
+            ok, aid = qstore.ensure_begin()
+            self.assertTrue(ok)
+        return dict(qstore.ensure_state())
+
+    def test_paused_reregister_does_not_touch_counts(self):
+        before = self.three_starts()
+        self.set_herdr(panes={'demo': [base.pane()], RT: [router_pane(sess='sess-reopened')]})
+        qstore.router_info()  # 没登记 / 会话不同：走重新登记分支
+        qstore.set_paused(True)
+        result, why = server.routerctl.ensure()
+        self.assertEqual(result, 'paused')
+        after = qstore.ensure_state()
+        self.assertEqual((after['attempts'], after['total']), (before['attempts'], before['total']))
+        qstore.set_paused(False)
+        self.set_herdr(panes={'demo': [base.pane()], RT: []})  # Router 不在了：第 4 次必须被限流
+        result, why = server.routerctl.ensure()
+        self.assertEqual(result, 'skipped', why)
+        self.assertTrue(qstore.ensure_state()['gave_up'])
+        self.assertEqual([c for c in self.all_calls() if c[2:4] == ['agent', 'start']], [])
+
+    def pause_after(self, match):
+        real = qstore.gated
+
+        def wrapper(*a, **k):
+            out = real(*a, **k)
+            if match(a):
+                qstore.set_paused(True)
+            return out
+        return mock.patch.object(qstore, 'gated', wrapper)
+
+    def test_pause_after_agent_start_keeps_count(self):
+        self.set_herdr(panes={'demo': [base.pane()], RT: []})
+        with self.pause_after(lambda a: list(a[1:3]) == ['agent', 'start']):
+            result, why = server.routerctl.ensure()
+        self.assertEqual(result, 'paused')
+        st = qstore.ensure_state()
+        self.assertEqual((len(st['attempts']), st['total']), (1, 1))  # 已执行过 agent start：照常计数
+
+    def test_pause_before_agent_start_refunds_only_own_attempt(self):
+        before = self.three_starts()
+        qstore.ensure_retry()  # 清掉放弃标记和本小时计数（Owner 的重试），total 保留
+        old_total = qstore.ensure_state()['total']
+        self.set_herdr(panes={'demo': [base.pane()], RT: []})
+        with self.pause_after(lambda a: list(a[1:3]) == ['workspace', 'create']):
+            result, why = server.routerctl.ensure()
+        self.assertEqual(result, 'paused')
+        st = qstore.ensure_state()
+        self.assertEqual((st['attempts'], st['total']), ([], old_total))  # 退掉的是自己那一次，不是历史
 
 
 # ---------- node：需求页、审批页、任务页筛选 ----------
@@ -1118,6 +1391,7 @@ const N = (id, over) => Object.assign({id, text: '<script>evil()</script> 第一
     byId('confirm_need-0007').dispatch('click'); byId('confirm_need-0007').dispatch('click'); await flush();
     // 暂停开关
     byId('pause_btn').dispatch('click'); await flush();
+    out.pauseBusy = text(byId('pause_btn'));
     out.posts = posts();
   } else if (scenario === 'approval') {
     ctx.location.hash = '#demo-0001';
@@ -1222,6 +1496,10 @@ class RouterPageTest(unittest.TestCase):
         self.assertIn('bad', out['cardCls'])
         self.assertIn('Router 起不来', out['text'])
         self.assertIn('重新尝试拉起', out['buttons'])
+
+    def test_pause_button_says_waiting_while_posting(self):
+        out = self.run_page('needs')
+        self.assertIn('暂停中…等当前动作做完', out['pauseBusy'])  # DS R2 Nit 2
 
     def test_reregister_button_when_router_absent(self):
         out = self.run_page('needs', {'router': {'present': False, 'why': '登记的 Router 会话不在了'}})

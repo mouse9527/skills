@@ -7,7 +7,8 @@ State: JSON file at $FAKE_HERDR_STATE, re-read on every call so a test can chang
    "pane_list_fail": {"<session>": "timeout" | "error:<code>"},   # 只让这个 session 的 pane list / agent list 失败
    "start": "ok" | "trust" | "error:<code>",       # agent start：就绪 / 先弹「是否信任」（默认项 No）/ 失败
    "workspace_create": "ok" | "error:<code>",
-   "prompt_working": true}                          # 收到 prompt 后把目标 pane 改成 working
+   "prompt_working": true,                          # 收到 prompt 后把目标 pane 改成 working
+   "list_raw": {"<session>": {"pane" | "agent": <任意 JSON>}}}   # 该 session 的 pane / agent list 原样输出这个 JSON
 Every call is appended to $FAKE_HERDR_LOG as one JSON line (the argv).
 Router 相关的命令会改写状态文件（像真 herdr 一样，pane 是活的）：workspace create 加一个空 shell pane，agent start 让它变成
 claude（名字写在 pane 的 name 上；agent list 只列有 agent 的 pane），trust 模式下先停在信任弹窗，send-keys down / enter 选择，
@@ -66,6 +67,9 @@ def main(argv):
     panes = state.get('panes', {})
     if session not in panes:
         fail('server_not_running', f'no herdr server for {session}')
+    raw = state.get('list_raw', {}).get(session, {}).get(rest[0]) if rest[1:2] == ['list'] else None
+    if raw is not None:  # 原样输出给定的 JSON（rc=0），用来模拟结构坏了的成功响应
+        out(raw)
     if rest[:2] == ['pane', 'list']:
         bad = state.get('pane_list_fail', {}).get(session)
         if bad == 'timeout':

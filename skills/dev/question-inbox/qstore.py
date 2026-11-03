@@ -1087,11 +1087,42 @@ def herdr(session, *args, timeout=None):
     return {'ok': True, 'kind': 'ok', 'code': '', 'message': '', 'data': data}
 
 
-def pane_list(session):
-    r = herdr(session, 'pane', 'list')
-    if r['ok']:
-        r['panes'] = ((r['data'].get('result') or {}).get('panes')) or []
+def _checked_list(session, cmd, rtype, key):
+    """`herdr <cmd> list` 并校验结构：result.type == rtype、result[key] 是 list、每个条目是带 str pane_id 的对象，
+    条目里有 name / agent_session 时类型也要对。不合格的（缺字段、null、空对象、条目坏、type 不对）一律当查询失败
+    （kind bad_output，code bad_shape）——**只有成功解析出的空列表才代表「确实没有」**，坏输出只能算「查不清」。
+    原始响应保留在 r['data']。"""
+    r = herdr(session, cmd, 'list')
+    if not r['ok']:
+        return r
+    res = r['data'].get('result')
+    items = res.get(key) if isinstance(res, dict) else None
+    why = ''
+    if not isinstance(res, dict):
+        why = 'result 不是对象'
+    elif res.get('type') != rtype:
+        why = f'result.type 是 {res.get("type")!r}，应为 {rtype!r}'
+    elif not isinstance(items, list):
+        why = f'result.{key} 缺失或不是列表'
+    else:
+        for it in items:
+            if not (isinstance(it, dict) and isinstance(it.get('pane_id'), str) and it['pane_id']):
+                why = f'{key} 里有缺 pane_id 的条目'
+            elif it.get('name') is not None and not isinstance(it.get('name'), str):
+                why = f'{key} 里有 name 类型不对的条目'
+            elif it.get('agent_session') is not None and not isinstance(it.get('agent_session'), dict):
+                why = f'{key} 里有 agent_session 类型不对的条目'
+            if why:
+                break
+    if why:
+        return {'ok': False, 'kind': 'bad_output', 'code': 'bad_shape', 'message': f'herdr {cmd} list 输出结构不对：{why}',
+                'data': r['data']}
+    r[key] = items
     return r
+
+
+def pane_list(session):
+    return _checked_list(session, 'pane', 'pane_list', 'panes')
 
 
 def session_value(pane):
@@ -1425,10 +1456,7 @@ def router_info():
 
 
 def agent_list(session):
-    r = herdr(session, 'agent', 'list')
-    if r['ok']:
-        r['agents'] = ((r['data'].get('result') or {}).get('agents')) or []
-    return r
+    return _checked_list(session, 'agent', 'agent_list', 'agents')
 
 
 def agent_name(session, pane_id):
@@ -1491,43 +1519,132 @@ def router_leads():
 
 
 def record_lead(ws, info):
+    """记 / 清 Router 建的 lead。info 里 agent_session 为空时记成「待核验」（pending），下次能安全对上时再补全。"""
     with locked():
         data = router_leads()
         if info:
-            data[ws] = dict(info, created_at=now())
+            data[ws] = dict(info, created_at=now(), pending=not info.get('agent_session'))
         else:
             data.pop(ws, None)
         _write_state('router-leads.json', data)
 
 
-def lead_record_presence(ws, agents=None):
-    """(结论, 记录, pane, 说明)：present 记录里的 workspace / pane / agent_session 三项都对得上；
-    absent 确认不在；unknown 查不清；conflict 有同名 lead-<ws> 但不是记录里那个，或同名的不止一个。"""
+def _refresh_lead(ws, old, session_id):
+    """归属不变（同一个 workspace、pane、名字、cwd）、只是会话 id 变了 / 第一次读到：把记录刷新成当前会话。
+    在锁内比对，记录这期间被别人改过就不动。"""
+    with locked():
+        data = router_leads()
+        if data.get(ws) != old:
+            return False
+        data[ws] = dict(old, agent_session=session_id, pending=False, refreshed_at=now())
+        _write_state('router-leads.json', data)
+        return True
+
+
+WORKER_NAME_RE = re.compile(r'^(?:w-\d+(?:-.+)?|rv-\d+-.+)$')
+
+
+def _cwd_of(item):
+    out = []
+    for k in ('cwd', 'foreground_cwd'):
+        v = item.get(k)
+        if isinstance(v, str) and v:
+            try:
+                out.append(Path(v).resolve())
+            except OSError:
+                pass
+    return out
+
+
+def _list_or_status(r):
+    """列表查询失败时：herdr 明确说 session 没在跑 → absent；其余（含结构不对）→ unknown。"""
+    return 'absent' if r['code'] in ABSENT_CODES else 'unknown'
+
+
+def lead_record_presence(ws):
+    """(结论, 记录, 根 pane, 说明)。根据 router-leads.json 判断 Router 建的 lead-<ws>：
+    - present：记录里的 workspace、pane 对得上，那个 pane 上的 agent 名是 lead-<ws>、cwd 是 lead 目录。
+      会话 id 和记录不同（同一个 pane 里重开过）或记录还是「待核验」时，刷新记录成当前会话——归属没变，不算冲突；
+    - absent：确认没有（包括记录里的 pane 还在、但 lead 已退出）；
+    - unknown：查不清（查询失败、结构不对、会话 id 还读不到）；
+    - conflict：同名 lead-<ws> 不止一个，或有同名的但不是记录里那个（没有记录 / workspace、pane、cwd 对不上）。"""
     rec = router_leads().get(ws) or {}
     s = router_session()
-    if agents is None:
-        r = agent_list(s)
+    ra = agent_list(s)
+    if not ra['ok']:
+        return _list_or_status(ra), rec, None, f'agent list 失败：{ra["code"]} {ra["message"]}'
+    rp = pane_list(s)
+    if not rp['ok']:
+        return _list_or_status(rp), rec, None, f'pane list 失败：{rp["code"]} {rp["message"]}'
+    named = {a['pane_id']: a for a in ra['agents'] if a.get('name') == f'lead-{ws}'}
+    panes = {p['pane_id']: p for p in rp['panes']}
+    if len(named) > 1:
+        return 'conflict', rec, None, f'session {s} 里有 {len(named)} 个名为 lead-{ws} 的 agent'
+    want = lead_cwd(ws).resolve()
+    root = panes.get(rec.get('pane_id')) if rec else None
+    agent = named.get(rec.get('pane_id')) if rec else None
+    root_ok = bool(root and agent and root.get('workspace_id') == rec.get('workspace_id')
+                   and want in _cwd_of(agent) + _cwd_of(root))
+    if named and not root_ok:
+        pid = next(iter(named))
+        return 'conflict', rec, None, (f'session {s} 里的 lead-{ws}（pane {pid}）不是 Router 建的'
+                                      f'（没有归属记录，或 workspace / pane / cwd 对不上）')
+    if not root_ok:
+        return 'absent', rec, root, '没有在跑的、Router 建的 lead-' + ws
+    cur = session_value(root) or session_value(agent)
+    if not cur:
+        return 'unknown', rec, None, f'lead-{ws}（pane {root["pane_id"]}）的会话 id 还读不到'
+    if cur != rec.get('agent_session'):
+        _refresh_lead(ws, rec, cur)
+        rec = router_leads().get(ws) or rec
+    return 'present', rec, root, ''
+
+
+def is_worker_of(item, ws):
+    """lead 派出去的 worker：名字 w-<号>… / rv-<号>-…，且 cwd 在这个 ws 的 lead 目录之下。"""
+    if not (isinstance(item.get('name'), str) and WORKER_NAME_RE.match(item['name'])):
+        return False
+    base = lead_cwd(ws).resolve()
+    for c in _cwd_of(item):
+        try:
+            c.relative_to(base)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def workspace_tree(session, wsid, root_pane, root='agent', ws=None):
+    """关一个 workspace 之前核验整棵树：(能不能关, 说明)。每个 pane 都必须是托管的：
+    - 记录里的根 pane：root='agent' 时上面必须有 agent（在跑的 lead）；'shell' 时必须已没有 agent（退出后的空壳）；'any' 都行
+      （刚建、启动失败的那个）；
+    - 给了 ws 时，还允许这个 lead 派出去的 worker（w-<号>… / rv-<号>-…，cwd 在 lead 目录下）。
+    人工的、归属说不清的（包括别的普通 shell）、查询失败或结构不对，一律不能关。"""
+    if not wsid or not root_pane:
+        return False, '没有 workspace / 根 pane 记录'
+    rp, ra = pane_list(session), agent_list(session)
+    for r in (rp, ra):
         if not r['ok']:
-            return ('absent' if r['code'] in ABSENT_CODES else 'unknown'), rec, None, f'agent list 失败：{r["code"]} {r["message"]}'
-        agents = r['agents']
-    same = [a for a in agents if isinstance(a, dict) and a.get('name') == f'lead-{ws}']
-    r = pane_list(s)
-    if not r['ok']:
-        return ('absent' if r['code'] in ABSENT_CODES else 'unknown'), rec, None, f'pane list 失败：{r["code"]} {r["message"]}'
-    panes = {p.get('pane_id'): p for p in r['panes'] if isinstance(p, dict)}
-    mine = None
-    if rec:
-        p = panes.get(rec.get('pane_id'))
-        if p and p.get('workspace_id') == rec.get('workspace_id') and session_value(p) == rec.get('agent_session'):
-            mine = p
-    if len(same) > 1:
-        return 'conflict', rec, None, f'session {s} 里有 {len(same)} 个名为 lead-{ws} 的 agent'
-    if same and (not mine or same[0].get('pane_id') != mine.get('pane_id')):
-        return 'conflict', rec, None, (f'session {s} 里的 lead-{ws}（pane {same[0].get("pane_id")}）不是 Router 建的'
-                                      f'（没有归属记录或 workspace / 会话对不上）')
-    if mine and same:
-        return 'present', rec, mine, ''
-    return 'absent', rec, None, '没有 Router 建的 lead-' + ws
+            return False, f'查不清这个 workspace 里有什么（{r["code"]} {r["message"]}）'
+    agents = {a['pane_id']: a for a in ra['agents']}
+    mine = [p for p in rp['panes'] if p.get('workspace_id') == wsid]
+    if not any(p['pane_id'] == root_pane for p in mine):
+        return False, f'workspace {wsid} 里找不到记录的根 pane {root_pane}'
+    bad = []
+    for p in mine:
+        pid, a = p['pane_id'], agents.get(p['pane_id'])
+        has_agent = bool(a or p.get('agent'))
+        if pid == root_pane:
+            if (root == 'agent' and not has_agent) or (root == 'shell' and has_agent):
+                bad.append(f'{pid}（根 pane {"已没有 agent" if root == "agent" else "里还有 agent"}）')
+            continue
+        if a and ws and is_worker_of(dict(p, **a), ws):
+            continue
+        label = (a or {}).get('name') or (f'无名 {p.get("agent")}' if has_agent else '普通 shell')
+        bad.append(f'{pid}（{label}）')
+    if bad:
+        return False, f'workspace {wsid} 里有不归 Router 管的 pane：{"、".join(bad)}'
+    return True, ''
 
 
 # ----- 全局暂停：$QI_STATE_DIR/control.json -----
@@ -1875,6 +1992,8 @@ def need_renotify(nid):
     with locked():
         rec = read_need(nid)
         stale = rec.get('delivery') == 'sent' and need_stale(rec)
+        if unclaimed(rec) and rec.get('delivery') in ('pending', 'sending'):
+            return  # 已经在排队 / 正在发：不报错，也不重复排（页面按钮显示后状态刚好变了的那一下）
         if unclaimed(rec) and rec.get('delivery') in ('received', 'sent', 'uncertain', 'none', None):
             _queue_need(rec, 'unclaimed')  # 分到 ws 但没人 claim：叫醒 Router 去看 lead
             _save_need(rec, 'Owner 点了重新通知：还没人 claim，投给 Router')
@@ -1946,37 +2065,48 @@ def ensure_state():
     return _read_state('router-ensure.json')
 
 
+def _attempt_at(x):
+    """attempts 里的一条：{'at', 'id'}（旧文件里可能是纯时间串）。"""
+    return parse_time(x.get('at') if isinstance(x, dict) else x)
+
+
 def ensure_begin(at=None):
-    """在锁内决定这次能不能拉起：暂停、已放弃、1 小时内已 3 次都不行。能的话先记一次尝试再返回 True。"""
+    """在锁内决定这次能不能拉起：暂停、已放弃、1 小时内已 3 次都不行。能的话先**预占**一次尝试，返回 (True, attempt_id)；
+    不能返回 (False, 原因)。退还只能用 ensure_end(refund=这个 id)，没预占的分支（如请 Router 重新登记）碰不到计数。"""
     at = at or datetime.now(TZ)
     with locked():
         st = ensure_state()
         if paused() or st.get('gave_up'):
             return False, ('全局暂停中' if paused() else 'Router 起不来，已停止自动拉起')
-        recent = [t for t in st.get('attempts') or [] if (parse_time(t) or at) > at - timedelta(hours=1)]
+        recent = [x for x in st.get('attempts') or [] if (_attempt_at(x) or at) > at - timedelta(hours=1)]
         if len(recent) >= ENSURE_PER_HOUR:
             st.update({'gave_up': True, 'last_error': _append_error(st.get('last_error') or '',
                                                                    f'1 小时内已拉起 {len(recent)} 次，停止自动拉起')})
             _write_state('router-ensure.json', st)
             return False, 'Router 起不来，已停止自动拉起'
-        st['attempts'] = recent + [at.isoformat(timespec='seconds')]
+        aid = uuid.uuid4().hex[:12]
+        st['attempts'] = recent + [{'at': at.isoformat(timespec='seconds'), 'id': aid}]
         st['total'] = geti(st, 'total') + 1
         st['last_at'] = at.isoformat(timespec='seconds')
         _write_state('router-ensure.json', st)
-        return True, ''
+        return True, aid
 
 
-def ensure_end(result, error='', drop_attempt=False, workspace_id=None):
-    """drop_attempt：途中暂停停下的那次不算拉起次数。workspace_id：这次建的 Router workspace（下次若只剩空壳就关掉）。"""
+def ensure_end(result, error='', refund='', workspace_id=None, root_pane=None):
+    """refund：退还**这一次**预占的 attempt（只在还没执行过 agent start 就停下时用）；按 id 找，找不到什么都不改。
+    workspace_id / root_pane：这次建的 Router workspace 和它的根 pane（下次若只剩这个空壳就关掉）。"""
     with locked():
         st = ensure_state()
         st['last_result'] = result
         st['last_error'] = one_line(error)[:300] if error else ''
-        if drop_attempt and st.get('attempts'):
-            st['attempts'] = st['attempts'][:-1]
-            st['total'] = max(0, geti(st, 'total') - 1)
+        if refund:
+            keep = [x for x in st.get('attempts') or [] if not (isinstance(x, dict) and x.get('id') == refund)]
+            if len(keep) != len(st.get('attempts') or []):
+                st['attempts'] = keep
+                st['total'] = max(0, geti(st, 'total') - 1)
         if workspace_id:
             st['workspace_id'] = workspace_id
+            st['root_pane'] = root_pane or ''
         _write_state('router-ensure.json', st)
 
 

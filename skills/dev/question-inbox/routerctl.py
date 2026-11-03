@@ -57,7 +57,12 @@ def screen(session, pane):
 
 
 class Paused(Exception):
-    """动作链途中发现全局暂停：停在安全状态（刚建的 workspace 已关），不算失败。"""
+    """动作链途中发现全局暂停：停在安全状态（刚建的 workspace 已关），不算失败。
+    agent_started：暂停前是否已经执行过 agent start（执行过的那次拉起要照样计数，不能退还）。"""
+
+    def __init__(self, msg='全局暂停中', agent_started=False):
+        super().__init__(msg)
+        self.agent_started = agent_started
 
 
 def write(session, *args, timeout=None):
@@ -116,52 +121,62 @@ def pane_session(session, pane_id):
     return qstore.session_value(p) if p else None
 
 
-def close_if_dead(session, wsid):
-    """只在这个 workspace 里已经没有任何 agent 时关掉它（Router 自己建过、agent 已退出的空壳）。返回是否关了。"""
-    if not wsid:
-        return False
-    r = qstore.pane_list(session)
-    if not r['ok']:
-        return False
-    mine = [p for p in r['panes'] if p.get('workspace_id') == wsid]
-    if not mine or any(p.get('agent') for p in mine):
-        return False
-    return write(session, 'workspace', 'close', wsid)['ok']
+def close_if_dead(session, wsid, root_pane):
+    """Router 自己建过、agent 已退出的空壳：整棵树里只有记录的根 pane、且它已没有 agent，才关。返回 (关了没有, 说明)。"""
+    ok, why = qstore.workspace_tree(session, wsid, root_pane, root='shell')
+    if not ok:
+        return False, why
+    return write(session, 'workspace', 'close', wsid)['ok'], ''
+
+
+def _start_session(r, session, pane):
+    """agent start 回包里已经核验过的会话 id；没有就现查一次；都读不到返回空串（记录记成待核验）。"""
+    a = ((r.get('data') or {}).get('result') or {}).get('agent') if r.get('ok') else None
+    v = qstore.session_value(a) if isinstance(a, dict) else None
+    return v or pane_session(session, pane) or ''
 
 
 def start_in_new_workspace(session, label, cwd, name, prompt):
     """建 workspace → agent start → （信任弹窗）→ 第一条 prompt，每一步写之前都过暂停门禁。
-    返回 (pane, workspace_id, 错误)。失败或途中暂停时关掉刚建的 workspace（清理自己的东西，不过门禁）。"""
+    返回 ((pane, workspace_id, 会话 id), 错误) 或 (None, 错误)。失败或途中暂停时关掉刚建的 workspace（核验整棵树后，不过门禁）。
+    途中暂停抛 Paused（agent_started 表示暂停前是否执行过 agent start）。"""
     r = write(session, 'workspace', 'create', '--label', label, '--cwd', str(cwd), '--no-focus', *env_args())
     if not r['ok']:
-        return None, None, f'workspace create 失败：{_err(r)}'
+        return None, f'workspace create 失败：{_err(r)}'
     res = r['data'].get('result') or {}
     pane = (res.get('root_pane') or {}).get('pane_id')
     wsid = (res.get('workspace') or {}).get('workspace_id')
     if not pane or not wsid:
-        return None, None, 'workspace create 没返回 root_pane / workspace_id'
+        return None, 'workspace create 没返回 root_pane / workspace_id'
 
     def cleanup():
-        qstore.herdr(session, 'workspace', 'close', wsid)  # 只关自己刚建的
+        """只关自己刚建的，而且关之前核验整棵树只有这个根 pane（不过暂停门禁：这是收拾自己的东西）。"""
+        ok, why = qstore.workspace_tree(session, wsid, pane, root='any')
+        if ok:
+            qstore.herdr(session, 'workspace', 'close', wsid)
+            return ''
+        return f'；没有关 workspace {wsid}：{why}'
 
+    started = False
     try:
         r = write(session, 'agent', 'start', name, '--kind', 'claude', '--pane', pane,
                   '--timeout', str(START_TIMEOUT_MS), *AGENT_ARGS, timeout=START_TIMEOUT_MS / 1000 + 30)
+        started = True
         if not r['ok']:
             if r['code'] != 'agent_not_ready':
-                cleanup()
-                return None, None, f'agent start 失败：{_err(r)}'
+                return None, f'agent start 失败：{_err(r)}' + cleanup()
             ok, why = accept_trust(session, pane, cwd)
             if not ok or not wait_ready(session, pane):
-                cleanup()
-                return None, None, f'agent start 没就绪：{_err(r)}；{why or "选了信任仍未就绪"}'
+                return None, f'agent start 没就绪：{_err(r)}；{why or "选了信任仍未就绪"}' + cleanup()
+        start_r = r
         r = write(session, 'agent', 'prompt', pane, prompt)
-    except Paused:
+    except Paused as e:
         cleanup()
-        raise
+        raise Paused(str(e), agent_started=started)
+    sess = _start_session(start_r, session, pane)
     if not r['ok']:
-        return pane, wsid, f'agent 已起，第一条 prompt 失败：{_err(r)}'
-    return pane, wsid, None
+        return (pane, wsid, sess), f'agent 已起，第一条 prompt 失败：{_err(r)}'
+    return (pane, wsid, sess), None
 
 
 def ensure_prompt():
@@ -191,6 +206,7 @@ def ensure():
     routers = [a for a in r['agents'] if a.get('name') == 'router']
     if len(routers) > 1:
         return 'skipped', f'session {s} 里有 {len(routers)} 个名为 router 的 agent，不知道是哪个，什么都不做'
+    aid = ''
     try:
         if routers:
             a = routers[0]
@@ -210,16 +226,27 @@ def ensure():
             qstore.ensure_note('reregister', {'pane_id': a.get('pane_id'), 'session': sess, 'at': qstore.now(),
                                               'ok': pr['ok'], 'error': '' if pr['ok'] else _err(pr)})
             return 'reregister', f'已请 pane {a.get("pane_id")} 的 router 重新登记' + ('' if pr['ok'] else f'（prompt 失败：{_err(pr)}）')
-        ok, why = qstore.ensure_begin()
+        ok, aid = qstore.ensure_begin()
         if not ok:
-            return 'skipped', why
-        close_if_dead(s, qstore.ensure_state().get('workspace_id'))  # 上一个 Router workspace 若只剩空壳，顺手关掉
-        pane, wsid, err = start_in_new_workspace(s, 'Router', qstore.workspaces_root(), 'router', ensure_prompt())
-    except Paused:
-        qstore.ensure_end('paused', '途中全局暂停，已停下（不计入拉起次数）', drop_attempt=True)
+            return 'skipped', aid
+        st = qstore.ensure_state()
+        if st.get('workspace_id'):  # 上一个 Router workspace 若只剩根 pane 的空壳，顺手关掉（整棵树核验过才关）
+            close_if_dead(s, st['workspace_id'], st.get('root_pane'))
+        info, err = start_in_new_workspace(s, 'Router', qstore.workspaces_root(), 'router', ensure_prompt())
+    except Paused as e:
+        if aid and not e.agent_started:  # 只退还本次预占、而且还没执行 agent start 的那一次
+            qstore.ensure_end('paused', '途中全局暂停，已停下（还没起 agent，不计入拉起次数）', refund=aid)
+        elif aid:
+            qstore.ensure_end('paused', '途中全局暂停，已停下（agent start 已执行过，照常计数）')
+        else:
+            qstore.ensure_end('paused', '途中全局暂停，没有发出重新登记提醒')  # 没预占：计数不动
         return 'paused', '途中全局暂停'
-    qstore.ensure_end('failed' if not pane else 'started', err or '', workspace_id=wsid)
-    return ('started', err or f'已在 {s} 起 router（pane {pane}）') if pane else ('failed', err)
+    if not info:
+        qstore.ensure_end('failed', err or '')
+        return 'failed', err
+    pane, wsid, _ = info
+    qstore.ensure_end('started', err or '', workspace_id=wsid, root_pane=pane)
+    return 'started', err or f'已在 {s} 起 router（pane {pane}）'
 
 
 def lead_prompt(ws):
@@ -248,24 +275,32 @@ def ensure_lead(ws):
     if qstore.paused():
         raise qstore.QError(409, '全局暂停中：不新起 lead')
     try:
-        close_if_dead(s, (rec or {}).get('workspace_id'))
-        pane, wsid, err = start_in_new_workspace(s, f'L·{ws}', cwd, f'lead-{ws}', lead_prompt(ws))
+        if rec and rec.get('workspace_id'):  # 上一个 lead 已退出：它的 workspace 只剩根 pane 空壳时关掉
+            closed, cwhy = close_if_dead(s, rec['workspace_id'], rec.get('pane_id'))
+            if not closed:
+                qstore.record_lead(ws, None)  # 关不掉就不再认领它（里面可能有别人的东西），只清自己的记录
+        info, err = start_in_new_workspace(s, f'L·{ws}', cwd, f'lead-{ws}', lead_prompt(ws))
     except Paused:
         raise qstore.QError(409, '途中全局暂停：没有起 lead（刚建的 workspace 已关）')
-    if not pane:
+    if not info:
         raise qstore.QError(409, err)
-    qstore.record_lead(ws, {'workspace_id': wsid, 'pane_id': pane, 'agent_session': pane_session(s, pane) or ''})
+    pane, wsid, sess = info
+    qstore.record_lead(ws, {'workspace_id': wsid, 'pane_id': pane, 'agent_session': sess})  # 会话读不到就记成待核验
     if err:
         raise qstore.QError(409, f'lead-{ws} 已起在 pane {pane}，但 {err}')
     return pane, True
 
 
 def close_lead(ws):
-    """Router 停 lead：只关 router-leads.json 里记着、三项都对得上的那个 `L·<ws>` workspace。是否该停（没有 open 派工、空闲 ≥ 2 小时、
-    worktree 干净）由 Router 按 skill 判断后再调。"""
+    """Router 停 lead：只关 router-leads.json 里记着、对得上的那个 `L·<ws>` workspace，而且关之前核验整棵树：
+    每个 pane 都得是这个 lead 或它派出去的 worker，有人工的 / 普通 shell / 说不清的就不关、保留记录。
+    是否该停（没有 open 派工、空闲 ≥ 2 小时、worktree 干净）由 Router 按 skill 判断后再调。"""
     s = qstore.router_session()
     st, rec, pane, why = qstore.lead_record_presence(ws)
     if st == 'present':
+        ok, twhy = qstore.workspace_tree(s, rec['workspace_id'], rec['pane_id'], root='agent', ws=ws)
+        if not ok:
+            raise qstore.QError(409, f'不关 L·{ws}：{twhy}。记录保留，交给 Owner 处理')
         try:
             r = write(s, 'workspace', 'close', rec['workspace_id'])
         except Paused:
@@ -275,6 +310,13 @@ def close_lead(ws):
         qstore.record_lead(ws, None)
         return f'已关闭 L·{ws}（workspace {rec["workspace_id"]}）'
     if st == 'absent':
+        if rec and rec.get('workspace_id'):
+            try:
+                closed, cwhy = close_if_dead(s, rec['workspace_id'], rec.get('pane_id'))
+            except Paused:
+                raise qstore.QError(409, '全局暂停中：Router 只读，不关 lead')
+            if not closed:
+                return f'lead-{ws} 已不在；它的 workspace 没关：{cwhy}。记录保留'
         qstore.record_lead(ws, None)
         return f'没有在跑的、Router 建的 lead-{ws}（{why}）；已清掉记录'
     raise qstore.QError(409, f'lead-{ws} {"冲突" if st == "conflict" else "状态查不清"}：{why}；不关')

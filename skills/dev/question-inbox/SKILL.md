@@ -152,7 +152,7 @@ Owner 在页面「需求」栏提交一句话 → `needs/need-NNNN.json` → 服
 |---|---|---|
 | `$Q need list [--todo] [--status S] [--json]` / `$Q need show <id>…` | 任何人 | 只读（show 含讨论线程） |
 | `$Q need take <id>…` / `$Q need route <id> --ws W --why "…"` / `$Q need note` | 只有登记的 Router | 领取 / 分到 ws / 记说明 |
-| `$Q router dispatch <id>` / `$Q router lead <ws>` / `$Q router close-lead <ws>` | 只有 Router | 写任务书并交给 `lead-<ws>`；起 / 关 lead（只在 session router 里，只认 `router-leads.json` 里自己建的；暂停时不派、不新起） |
+| `$Q router dispatch <id>` / `$Q router lead <ws>` / `$Q router close-lead <ws>` | 只有 Router | 写任务书并交给 `lead-<ws>`；起 / 关 lead（只在 session router 里，只认 `router-leads.json` 里自己建的；暂停时不派、不新起；close-lead 要整个 workspace 里只有这个 lead 和它的 worker 才关） |
 | `$Q need claim <id> [--takeover]` | 那个 ws 的 lead：pane 的 cwd **恰好**是 lead 目录、agent 名 `lead-<ws>`（worker 在子目录里，不能 claim） | 登记为负责 lead；takeover 只在原负责 lead **确认**不在时可用（查询失败、超时、多个匹配都算查不清，拒绝） |
 | `$Q need card <id> --body <文件>` | 只有负责 lead | 发理解卡：`## 理解` / `## 范围` / `## 不做什么` / `## 验收草案` / `## 开放问题`（开放问题每条带推荐，可空）；每发一张版本 + 1 |
 | `$Q need link <id> --issue <URL>…` / `$Q need drop <id> --issue <URL> --why "…"` | 只有负责 lead | 建好 Issue 后登记（讨论过的必须已确认；第一次 link 时核对根 Issue 在本 ws 主 repo、正文第一个非空行是 `需求：need-NNNN`）/ 不做 |
@@ -165,6 +165,7 @@ Owner 在页面「需求」栏提交一句话 → `needs/need-NNNN.json` → 服
 
 **lead 目录**：默认 `~/workspaces/<ws>`；tasks.json 的条目可以加可选字段 `"lead_cwd": "<绝对路径或 ~/…>"`（例如 ws 本身就是线上代码目录时）。
 Router 起 lead、写派工书（`<lead 目录>/dispatch/`）、claim 校验都按它。
+**`lead_cwd` 只能指向 Owner 自己的代码**：Router 起 lead 时会对这个目录自动选「信任」（herdr-workers §2：外部内容不自动信任）。
 
 - **Owner 在页面上**：对还没有负责 lead 的需求写的是「补充 / 纠正」（记成 note，Router 正在处理时投给 Router）；有负责 lead 之后写的是「回复」，
   进讨论线程并投给负责 lead；「确认理解卡 vN」只能确认**最新**一张（绑定版本，过期 409），确认后投给负责 lead 去建 Issue。
@@ -175,7 +176,8 @@ Router 起 lead、写派工书（`<lead 目录>/dispatch/`）、claim 校验都�
 - **Router 不在时自动拉起**（没登记、或登记的 pane 没了 / agent 已退出）：服务在 session router 里建 workspace `Router`（cwd `~/workspaces`）、
   `agent start router --kind claude -- --dangerously-skip-permissions --model opus`，信任弹窗读屏后选「信任」，再发「读 skill router、register、处理待办」。
   session 的 socket 不在就只报暂缓、不创建；同一时间只拉一次，1 小时最多 3 次，超过页面标红「Router 起不来」并停止自动拉起（页面可重试，Router 登记后自动解除）。
-  在不在用三态判断：**确认不在**才拉起；查询失败、超时、多个匹配算**查不清**，只暂缓。
+  在不在用三态判断：**确认不在**才拉起；查询失败、超时、多个匹配、**输出结构不对**（缺列表字段、null、type 不对、条目缺 pane_id）算**查不清**，只暂缓。
+  只有成功解析出的空列表才代表「确实没有」。
   session 里已有名为 router 的 agent、但会话不是登记的那个（会话重开过）：不重启它，只给它发一句「重新登记」，同一会话 10 分钟最多一次；页面有「让 Router 重新登记」按钮。
   拉起前，上一次建的 Router workspace 若只剩没有 agent 的空壳就关掉。绝不在别的 session 起 agent。
 - **全局暂停**（页面开关）：不投给 Router、不拉起 Router，Router 不 take、不 route、不派工、不新起 lead。

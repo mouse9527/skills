@@ -53,11 +53,14 @@ Q="python3 $HOME/.claude/skills/question-inbox/q.py"   # 和 skill question-inbo
 
 - **起**：`$Q router dispatch` 会自动起；单独起用 `$Q router lead <ws>`。只在 session router 里：workspace `L·<ws>`、cwd 为 lead 目录、
   agent `lead-<ws>`（claude opus）；暂停时不新起。起的时候把 workspace、pane、会话记进 `$QI_STATE_DIR/router-leads.json`，
-  **只复用这份记录里三项都对得上的 lead**（续派，不另起）；同名但不是你建的、或同名的不止一个，一律当冲突，不碰。
+  **只复用这份记录里对得上的 lead**（workspace、pane、名字 `lead-<ws>`、cwd 都对得上；续派，不另起）。
+  同一个 pane 里会话重开过（只有会话 id 变了）不算换人，记录会自动刷新；刚起完一时读不到会话 id 的，先记成「待核验」，下次对上再补全。
+  同名但不是你建的、同名的不止一个、workspace / pane / cwd 对不上，一律当冲突，不碰。
   起来后它会先收到「加载 workspace / herdr-workers / question-inbox，读 README」。信任目录弹窗（`~/workspaces` 下是 Owner 自己的目录）由命令读屏后选「信任」。
 - lead 的 worker 放在 lead 自己的 workspace 里，tab 命名 `W·<号>`。
 - **停**：某个 ws 没有 open 的派工 Issue（按 `$Q tasks` 现算：没有 open、没有在做的），也没有还在讨论 / 待立项的需求（`$Q need list`），
-  且 lead 空闲 ≥ 2 小时，才关：`$Q router close-lead <ws>`（只关 router-leads.json 里记着、三项对得上的那个 workspace）；
+  且 lead 空闲 ≥ 2 小时，才关：`$Q router close-lead <ws>`（只关 router-leads.json 里记着、对得上的那个 workspace，
+  而且整个 workspace 里只能有这个 lead 和它派出去的 worker——`w-<号>` / `rv-<号>-…`、cwd 在 lead 目录下；有人工的 pane、普通 shell 就不关，记录保留，告诉 Owner）；
   关前确认它的 worktree 没有未提交或未推送的内容。不要直接 `herdr workspace close`，不碰 session router 以外的任何东西、不碰人工打开的 pane。
 
 ## 5. 看门狗
