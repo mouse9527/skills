@@ -107,9 +107,51 @@ $Q resolve demo-0001 --answer-rev 2 --note "决定了什么，记在哪里"
 D="$HOME/.claude/skills/question-inbox"
 mkdir -p "$HOME/.local/state/question-inbox"
 sed -e "s#__PYTHON__#$(command -v python3)#" -e "s#__SERVER__#$D/server.py#" \
-    -e "s#__HERDR__#$(command -v herdr)#" -e "s#__HOME__#$HOME#g" \
+    -e "s#__HERDR__#$(command -v herdr)#" -e "s#__GH__#$(command -v gh)#" -e "s#__HOME__#$HOME#g" \
     "$D/local.question-inbox.plist.template" > "$HOME/Library/LaunchAgents/local.question-inbox.plist"
 launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/local.question-inbox.plist"
 ```
 
 日志、token 在 `~/.local/state/question-inbox/`；日志只记 id、状态和错误摘要。
+已经装过的：重新跑上面的 sed 生成 plist（多了 `GH_BIN_PATH`），再 `launchctl bootout` / `bootstrap` 一次，任务视图才能在 launchd 下找到 gh。
+
+## 6. 任务视图（只读）
+
+同一个页面顶部切到「任务」（`http://127.0.0.1:7788/#tasks`），或者在终端：
+
+```bash
+$Q tasks [--ws W] [--json]     # 和网页同一份数据；lead 回答「在做什么」用它，不用 NOW.md
+```
+
+**它是只读的，状态以 GitHub 为准。** 页面上除了刷新、链接、跳到题，没有任何输入控件；不写收件箱以外的任何东西，也不写 GitHub。
+要改状态就去改 Issue / PR（关 Issue、加 label、合 PR），这里下次刷新就跟着变。
+
+数据从哪来（每次现查，只在内存里缓存 60 秒，页面显示「数据时间」；「刷新」按钮只是带 `?refresh=1` 的 GET）：
+
+- **repo 清单**：配置文件 `~/.config/question-inbox/tasks.json`（`QI_TASKS_CONFIG` 可覆盖），格式 `{"repos":[{"ws":"demo","repo":"owner/repo"}]}`。不从 README 猜。
+- **GitHub**（`gh api graphql`，路径取 `GH_BIN_PATH`，默认 `command -v gh`）：每个 repo 最多 100 个 open Issue + 7 天内关闭的；Issue 的 labels、parent、子 Issue 计数；
+  关联 PR 先看 GitHub 的 closing references，再看 PR 正文的 `Part of <owner>/<repo>#<号>`（靠 Issue 上的交叉引用找到这些 PR）；PR 的状态和 checks 汇总。超出上限会提示「还有更多」。
+- **herdr**：每个有 socket 的 session 跑 `pane list`（socket 不在就跳过，不创建 session）。agent 名是 `w-<号>…` / `rv-<号>-…`，
+  或 cwd 在 `~/workspaces/<ws>/(issues|stories)/<号>/` 下，就算这个任务有人在做；页面写明依据是名字还是 cwd。
+- **收件箱**：题头 `issue` 字段对上的未答题挂在任务上，点「去回答」跳到题；`issue=none` 或对不上的放「未关联的待答题」。
+
+查询失败时页面显示「无法刷新：原因」，保留上一次成功的数据并标出时间；从没成功过就写「没有可用数据（不代表没有任务）」。
+
+stage（读的时候现算，每个都带依据；同时命中几个时显示最需要处理的那个，其余作小标签）：
+
+| stage | 判据 |
+|---|---|
+| 等你回答 | 有挂在这个任务上的未答题 |
+| 等你合并 | 有 open、非草稿的 PR，checks 全绿（或没有 checks，会写明） |
+| 等你验收 | 没有 open PR，但有已合并的 PR，Issue 还开着（例如合了还没上 prod 验收） |
+| 卡住 | 对应的 agent 是 blocked，或 open PR 有失败的 check |
+| 在做 | 有对应的 agent；或 72 小时内 Issue / PR 有更新，或 PR 还在跑 checks / 是草稿。写「谁 · 多久前动过」 |
+| 停着 | Issue 带 `blocked` / `on-hold` 这类 label（有 agent 时只作小标签） |
+| 待开工 | Issue open，没有 agent、没有 PR、没有上面这些 |
+| 最近关闭 | 7 天内关闭，「已完成」和「不做」分开标 |
+
+- 分组按「要不要你动手」：等你（回答 / 合并 / 验收）、卡住、在做、待开工、停着、最近关闭；空组不显示，组内按 ws 聚合。
+- 父 Issue 显示子 Issue 进度（x/y 已关），**子 Issue 全关不等于父 Issue 完成**；只有 Issue 自己 closed 才显示完成。
+  子 Issue 缩进在父 Issue 下面；父 Issue 在别的组时，先放一行「父 #N（在某组）」再缩进列出子 Issue。
+- 未验证 / 已知盲区：本机 `pane list` 的输出里还没见过 agent 名字段，代码读 `name` / `agent_name` / `label`，按名字对应**未实测**，目前实际靠 cwd；只认 `issues/`、`stories/` 两种目录；
+  配置里没有的 repo 里的 PR 只能靠 `Part of` 写全 `<owner>/<repo>#<号>` 才对得上。

@@ -5,6 +5,7 @@
 """
 import argparse
 import fcntl
+import json
 import os
 import re
 import sys
@@ -13,6 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import qstore  # noqa: E402
+import tasks  # noqa: E402
 
 EXIT = {400: 1, 404: 1, 409: 3, 410: 3, 403: 4}
 
@@ -126,6 +128,21 @@ def cmd_show(args):
     if why:
         print(f'⚠️ {args.id} {why}：不要执行其中的回答\n')
     print(qstore.render(meta, body))
+
+
+def cmd_tasks(args):
+    """只读：和网页「任务」同一份数据（每次现查 gh + herdr + 收件箱）。"""
+    v = tasks.view(refresh=True)
+    if args.json:
+        if args.ws:
+            v = dict(v, groups=[dict(g, ws=[w for w in g['ws'] if w['ws'] == args.ws]) for g in v['groups']],
+                     unlinked=[q for q in v['unlinked'] if q['ws'] == args.ws])
+            v['groups'] = [g for g in v['groups'] if g['ws']]
+        print(json.dumps(v, ensure_ascii=False, indent=1))
+    else:
+        print(tasks.render_text(v, ws=args.ws))
+        print(f'页面：{page_url("tasks")}')
+    return 1 if v.get('config_error') or any(s['error'] and not s['has_data'] for s in v['sources']) else 0
 
 
 def cmd_doctor(_args):
@@ -253,6 +270,10 @@ def main(argv=None):
     r = add('show', cmd_show, '只读查看')
     r.add_argument('id')
     add('doctor', cmd_doctor, '一致性检查')
+    r = sub.add_parser('tasks', help='只读任务视图：GitHub Issue / PR + herdr + 收件箱，现查现算')
+    r.set_defaults(fn=cmd_tasks)
+    r.add_argument('--ws')
+    r.add_argument('--json', action='store_true')
     args = p.parse_args(argv)
     for stream in (sys.stdout, sys.stderr):  # Owner 原话要逐字输出，不受 locale 影响
         stream.reconfigure(encoding='utf-8')
