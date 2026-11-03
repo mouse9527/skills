@@ -21,6 +21,7 @@ ISSUE_LIMIT = 100       # 每个 repo 最多拿多少个 open Issue
 CLOSED_DAYS = 7         # 最近关闭：几天内
 ACTIVE_HOURS = 72       # 在做：多久内有 PR / Issue 更新
 REF_LIMIT = 15          # 每个 open Issue 看最近几条 PR 交叉引用（「Part of」会在 Issue 上留下交叉引用）
+LINKED_LIMIT = 10       # Issue 侧原生关联 PR、PR 侧 closing Issue 各取几条
 LINK_PREFIX = 'https://github.com/'
 HOLD_LABEL_RE = re.compile(r'^(?:status[:/]\s*)?(?:blocked|on[- ]?hold|paused)$', re.I)
 PART_OF_RE = re.compile(r'Part of\s+(?:([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+))?#(\d+)', re.I)
@@ -35,7 +36,7 @@ STAGES = {'answer': ('you', '等你回答'), 'merge': ('you', '等你合并'), '
 QUERY = '''query($owner:String!,$name:String!,$closedQ:String!){
  repository(owner:$owner,name:$name){
   issues(states:OPEN,first:%(limit)d,orderBy:{field:UPDATED_AT,direction:DESC}){totalCount nodes{...I
-   timelineItems(itemTypes:[CROSS_REFERENCED_EVENT,CONNECTED_EVENT],last:%(refs)d){nodes{
+   timelineItems(itemTypes:[CROSS_REFERENCED_EVENT,CONNECTED_EVENT],last:%(refs)d){pageInfo{hasPreviousPage} nodes{
     ...on CrossReferencedEvent{source{...on PullRequest{...P}}} ...on ConnectedEvent{subject{...on PullRequest{...P}}}}}}}
   pullRequests(states:OPEN,first:50,orderBy:{field:UPDATED_AT,direction:DESC}){totalCount nodes{...P}}
  }
@@ -43,10 +44,11 @@ QUERY = '''query($owner:String!,$name:String!,$closedQ:String!){
 }
 fragment I on Issue{number title url state stateReason updatedAt closedAt labels(first:20){nodes{name}}
  parent{number repository{nameWithOwner}} subIssuesSummary{total completed}
- closedByPullRequestsReferences(first:10,includeClosedPrs:true){nodes{...P}}}
+ closedByPullRequestsReferences(first:%(linked)d,includeClosedPrs:true){totalCount nodes{...P}}}
 fragment P on PullRequest{number title url state isDraft updatedAt mergedAt body author{login}
  repository{nameWithOwner} statusCheckRollup{state}
- closingIssuesReferences(first:10){nodes{number repository{nameWithOwner}}}}''' % {'limit': ISSUE_LIMIT, 'refs': REF_LIMIT}
+ closingIssuesReferences(first:%(linked)d){totalCount nodes{number repository{nameWithOwner}}}}''' % {
+    'limit': ISSUE_LIMIT, 'refs': REF_LIMIT, 'linked': LINKED_LIMIT}
 
 
 # ---------- 配置 ----------
@@ -121,29 +123,57 @@ def fetch_repo(repo, at=None):
     if d['closed']['issueCount'] > len(d['closed']['nodes']):
         more.append(f'{CLOSED_DAYS} 天内关闭的 Issue 还有更多（共 {d["closed"]["issueCount"]} 个）')
     prs = list(rp['pullRequests']['nodes'])
-    for n in rp['issues']['nodes']:
-        for ev in ((n.pop('timelineItems', None) or {}).get('nodes') or []):
+    cut_linked, cut_refs = [], []
+    closed = [n for n in d['closed']['nodes'] if n]
+    for n in rp['issues']['nodes'] + closed:
+        tl = n.pop('timelineItems', None) or {}
+        if (tl.get('pageInfo') or {}).get('hasPreviousPage'):
+            cut_refs.append(n['number'])
+        for ev in tl.get('nodes') or []:
             pr = (ev or {}).get('source') or (ev or {}).get('subject')
             if pr and pr.get('number'):
                 prs.append(pr)
-        prs += [pr for pr in ((n.get('closedByPullRequestsReferences') or {}).get('nodes') or []) if pr]
-    return {'open': rp['issues']['nodes'], 'closed': [n for n in d['closed']['nodes'] if n], 'prs': prs, 'more': more}
+        # Issue 侧原生关联（linked / closing）：逐条记下这条边，build 时优先直接挂，不再靠 PR 侧（可能被截断）反推
+        conn = n.pop('closedByPullRequestsReferences', None) or {}
+        linked = [pr for pr in conn.get('nodes') or [] if pr and pr.get('number')]
+        n['_linked'] = [(_repo_of(pr, repo), pr['number']) for pr in linked]
+        prs += linked
+        if (conn.get('totalCount') or 0) > len(linked):
+            cut_linked.append(n['number'])
+    cut_closing = sorted({pr['number'] for pr in prs
+                          if ((pr.get('closingIssuesReferences') or {}).get('totalCount') or 0) >
+                          len((pr.get('closingIssuesReferences') or {}).get('nodes') or [])})
+    if cut_linked:
+        more.append(f'Issue {_nums(cut_linked)} 的原生关联 PR 超过 {LINKED_LIMIT} 个，只看了前 {LINKED_LIMIT} 个')
+    if cut_refs:
+        more.append(f'Issue {_nums(cut_refs)} 的 PR 交叉引用超过 {REF_LIMIT} 条，更早的「Part of」PR 可能没对上')
+    if cut_closing:
+        more.append(f'PR {_nums(cut_closing)} 关闭的 Issue 超过 {LINKED_LIMIT} 个，超出部分只靠 Issue 侧关联对上')
+    return {'open': rp['issues']['nodes'], 'closed': closed, 'prs': prs, 'more': more}
 
 
-def fetch_herdr():
-    """[{session, pane}]；socket 不存在的 session 跳过（不创建）。每个 session 的错误单独记。"""
-    agents, errors = [], []
+def _nums(ns):
+    ns = sorted(set(ns))
+    return '、'.join(f'#{n}' for n in ns[:8]) + (f' 等 {len(ns)} 个' if len(ns) > 8 else '')
+
+
+def herdr_sessions():
+    """有 socket 的 session（不创建）。"""
     base = qstore.socket_root()
-    sessions = sorted(p.name for p in base.iterdir() if (p / 'herdr.sock').exists()) if base.is_dir() else []
-    for s in sessions:
-        r = qstore.pane_list(s)
-        if r['ok']:
-            agents += [{'session': s, 'pane': p} for p in r['panes'] if isinstance(p, dict)]
-        elif r['code'] not in ('server_not_running', 'no_socket'):  # 残留 socket：没有在跑的 session，不算错
-            errors.append(f'{s}：{r["code"]} {r["message"]}'.strip())
-    if errors and not agents:
-        raise RuntimeError('herdr pane list 失败：' + '；'.join(errors))
-    return {'agents': agents, 'errors': errors}
+    return sorted(p.name for p in base.iterdir() if (p / 'herdr.sock').exists()) if base.is_dir() else []
+
+
+def fetch_session(s):
+    """一个 session 的 [{session, pane}]。缓存和失败都以 session 为边界：这里失败只影响这个 session。"""
+    r = qstore.pane_list(s)
+    if r['ok']:
+        panes = r['panes']
+        if not isinstance(panes, list):
+            raise RuntimeError(f'herdr {s} pane list 输出不是列表')
+        return [{'session': s, 'pane': p} for p in panes if isinstance(p, dict)]
+    if r['code'] in ('server_not_running', 'no_socket'):  # 残留 socket：这个 session 没在跑，不算错
+        return []
+    raise RuntimeError(f'herdr {s} pane list 失败：{r["code"]} {r["message"]}'.strip())
 
 
 # ---------- 内存缓存：每个来源单独保留上一次成功的数据 ----------
@@ -208,6 +238,8 @@ def agent_refs(agents, repos):
     out = {}
     for a in agents:
         p, s = a['pane'], a['session']
+        if not p.get('agent'):  # 普通 shell（worker 退出后、或人开的终端）不是执行任务的 agent
+            continue
         name = next((p.get(k) for k in ('name', 'agent_name', 'label') if isinstance(p.get(k), str) and p.get(k)), '')
         hits = []
         m = NAME_RE.match(name)
@@ -230,8 +262,9 @@ def agent_refs(agents, repos):
 
 
 def pr_refs(prs, repo):
-    """{(repo, 号): [pr]}：GitHub 关联（closingIssuesReferences）优先，再按正文 `Part of <repo>#<号>`。"""
-    out, seen = {}, set()
+    """({(repo, 号): [pr]}, {(repo, PR 号): pr})：PR 侧 closingIssuesReferences + 正文 `Part of <repo>#<号>`。
+    Issue 侧原生关联在 build 里优先直接挂。"""
+    out, seen, infos = {}, set(), {}
     for pr in prs:
         key = (_repo_of(pr, repo), pr.get('number'))
         if key in seen:
@@ -245,9 +278,10 @@ def pr_refs(prs, repo):
                 'draft': bool(pr.get('isDraft')), 'checks': ((pr.get('statusCheckRollup') or {}).get('state') or ''),
                 'updated': pr.get('updatedAt') or '', 'author': ((pr.get('author') or {}).get('login') or ''),
                 'repo': key[0], 'full': (pr.get('repository') or {}).get('nameWithOwner') or repo}
+        infos[key] = info
         for t in dict.fromkeys(targets):
             out.setdefault(t, []).append(info)
-    return out
+    return out, infos
 
 
 def question_refs(allq):
@@ -271,7 +305,14 @@ def pr_name(p, t):
     return f'PR #{p["number"]}' if p['repo'] == t['repo'].lower() else f'PR {p["full"]}#{p["number"]}'
 
 
-def stage_of(t, now):
+def check_desc(p):
+    if p['draft']:
+        return '是草稿'
+    return {'SUCCESS': 'checks 全绿', 'PENDING': 'checks 运行中', 'EXPECTED': 'checks 等待中', '': '尚无检查结果',
+            'FAILURE': 'checks 失败', 'ERROR': 'checks 出错'}.get(p['checks'], f'checks {p["checks"]}')
+
+
+def stage_of(t, now, unknown=()):
     """[(stage, 依据)]，按「最需要处理」排好；第一个是主 stage，其余作小标签。"""
     hits = []
     if t['state'] == 'CLOSED':
@@ -285,10 +326,9 @@ def stage_of(t, now):
         return hits
     open_prs = [p for p in t['prs'] if p['state'] == 'OPEN']
     merged = [p for p in t['prs'] if p['state'] == 'MERGED']
-    green = [p for p in open_prs if not p['draft'] and p['checks'] in ('SUCCESS', '')]
+    green = [p for p in open_prs if not p['draft'] and p['checks'] == 'SUCCESS']  # 只有明确 SUCCESS 才算全绿
     if green:
-        hits.append(('merge', '、'.join(pr_name(p, t) for p in green) +
-                     (' checks 全绿' if all(p['checks'] for p in green) else ' 没有 checks')))
+        hits.append(('merge', '、'.join(pr_name(p, t) for p in green) + ' checks 全绿'))
     elif merged and not open_prs:
         hits.append(('accept', '、'.join(pr_name(p, t) for p in merged) + ' 已合并，Issue 未关'))
     blocked = [a for a in t['agents'] if a['status'] == 'blocked']
@@ -296,6 +336,8 @@ def stage_of(t, now):
     if blocked or failed:
         hits.append(('stuck', '；'.join([f'{a["name"]} blocked' for a in blocked] +
                                         [f'{pr_name(p, t)} checks 失败' for p in failed])))
+    waiting = [p for p in open_prs if p not in green and p not in failed]  # 草稿 / 没有 checks / 还在跑
+    pr_note = '；'.join(f'{pr_name(p, t)} {check_desc(p)}' for p in waiting)
     hold = [l for l in t['labels'] if HOLD_LABEL_RE.match(l)]
     recent = [p for p in t['prs'] if _recent(p['updated'], now, ACTIVE_HOURS)]
     if t['agents']:
@@ -303,18 +345,21 @@ def stage_of(t, now):
         more = f' 等 {len(t["agents"])} 个' if len(t['agents']) > 1 else ''
         last = max([p['updated'] for p in t['prs']] + [t['updated'] or ''])
         hits.append(('doing', f'{a["name"]}（{a["status"]}，依据 {"名字" if a["by"] == "name" else "cwd"}）{more}'
-                     + (f' · {_ago(last, now)}动过' if last else '')))
+                     + (f' · {_ago(last, now)}动过' if last else '') + (f'；{pr_note}' if pr_note else '')))
     elif hold:
         hits.append(('hold', 'label ' + '、'.join(hold)))
-    elif recent or _recent(t['updated'], now, ACTIVE_HOURS) or [p for p in open_prs if p not in green + failed]:
+    elif recent or _recent(t['updated'], now, ACTIVE_HOURS) or waiting:
         p = max(recent, key=lambda x: x['updated']) if recent else None
         who = (pr_name(p, t) + (f' {p["author"]}' if p['author'] else '')) if p else 'Issue'
         when = _ago(p['updated'] if p else t['updated'], now)
-        hits.append(('doing', f'{who} · {when}动过' if when else who))
+        why = f'{who} · {when}动过' if when else who
+        hits.append(('doing', f'{pr_note}；{why}' if waiting else why))
     if hold and t['agents']:
         hits.append(('hold', 'label ' + '、'.join(hold)))
     if not t['agents'] and not open_prs and not merged and not hold and not any(h[0] == 'doing' for h in hits):
-        hits.append(('todo', '没有 agent、没有 PR'))
+        # 有 session 从没查成功过：不能断言「没有 agent」
+        hits.append(('todo', f'没有 PR；agent 情况待核（herdr {"、".join(unknown)} 查询失败）' if unknown
+                     else '没有 agent、没有 PR'))
     return hits
 
 
@@ -328,9 +373,11 @@ def _task(ws, repo, n):
 
 
 def build(repos, results, herdr_res, allq, now=None):
-    """纯函数：配置 + 各来源结果 + 收件箱 → 视图数据。results: {repo: cache entry}。"""
+    """纯函数：配置 + 各来源结果 + 收件箱 → 视图数据。results: {repo: cache entry}；herdr_res: {session: cache entry}。
+    失败的 session 用它上次成功的 agent（标旧时间）；从没成功过的记为 unknown。"""
     now = now or datetime.now(qstore.TZ)
-    agents = agent_refs((herdr_res.get('data') or {}).get('agents') or [], repos)
+    agents = agent_refs([a for e in herdr_res.values() for a in (e.get('data') or [])], repos)
+    unknown = sorted(s for s, e in herdr_res.items() if e.get('error') and e.get('data') is None)
     linked_q, loose_q = question_refs(allq)
     tasks, sources = {}, []
     for ws, repo in repos:
@@ -341,7 +388,7 @@ def build(repos, results, herdr_res, allq, now=None):
         data = ent.get('data')
         if data is None:
             continue
-        prs = pr_refs(data['prs'], repo.lower())
+        prs, infos = pr_refs(data['prs'], repo.lower())
         for n in data['open'] + data['closed']:
             if not n or not n.get('number'):
                 continue
@@ -349,10 +396,12 @@ def build(repos, results, herdr_res, allq, now=None):
             key = (repo.lower(), t['number'])
             if key in tasks:
                 continue
-            t['prs'] = sorted(prs.get(key, []), key=lambda p: p['number'])
+            got = [infos[k] for k in n.get('_linked') or [] if k in infos]  # Issue 侧原生关联优先
+            got += [p for p in prs.get(key, []) if p not in got]
+            t['prs'] = sorted(got, key=lambda p: (p['repo'], p['number']))
             t['agents'] = agents.get((ws, t['number']), [])
             t['questions'] = linked_q.pop(key, [])
-            hits = stage_of(t, now)
+            hits = stage_of(t, now, unknown)
             main = hits[0][0]
             t['stage'] = {'key': main, 'label': STAGES[main][1], 'group': STAGES[main][0]}
             t['why'] = [h[1] for h in hits]
@@ -360,10 +409,9 @@ def build(repos, results, herdr_res, allq, now=None):
             tasks[key] = t
     for qs in linked_q.values():  # issue 字段对不上任何任务（repo 不在配置、或 Issue 不在列表里）
         loose_q += qs
-    sources.append({'name': 'herdr', 'ws': '', 'ok': not herdr_res.get('error'), 'error': herdr_res.get('error') or '',
-                    'at': _iso(herdr_res['at']) if herdr_res.get('at') else '',
-                    'more': [f'部分 session 查询失败：{e}' for e in (herdr_res.get('data') or {}).get('errors', [])],
-                    'has_data': herdr_res.get('data') is not None})
+    for s, e in sorted(herdr_res.items()):  # 一个 session 一个来源：失败的单独标出，并保留它上次的数据
+        sources.append({'name': f'herdr {s}', 'ws': '', 'ok': not e.get('error'), 'error': e.get('error') or '',
+                        'at': _iso(e['at']) if e.get('at') else '', 'more': [], 'has_data': e.get('data') is not None})
     return {'generated_at': _iso(now), 'sources': sources, 'groups': _group(tasks), 'unlinked': loose_q,
             'stale': any(s['error'] for s in sources), 'count': len(tasks)}
 
@@ -436,9 +484,9 @@ def view(refresh=False, now=None):
         return {'generated_at': _iso(now or datetime.now(qstore.TZ)), 'config_error': str(e), 'sources': [],
                 'groups': [], 'unlinked': question_refs(qstore.all_questions())[1], 'stale': True, 'count': 0}
     fetchers = [(repo, (lambda r=repo: fetch_repo(r))) for repo in dict.fromkeys(r for _, r in repos)]
-    fetchers.append(('__herdr__', fetch_herdr))
+    fetchers += [('herdr:' + s, (lambda x=s: fetch_session(x))) for s in herdr_sessions()]
     got = CACHE.get(fetchers, refresh=refresh, now=now)
-    herdr_res = got.pop('__herdr__')
+    herdr_res = {k[6:]: got.pop(k) for k in list(got) if k.startswith('herdr:')}
     return build(repos, got, herdr_res, qstore.all_questions(), now=now)
 
 

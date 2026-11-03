@@ -3,7 +3,8 @@
 State: JSON file at $FAKE_HERDR_STATE, re-read on every call so a test can change it between calls:
   {"panes": {"<session>": [<pane>, ...]},           # sessions not listed answer server_not_running
    "prompt": "ok" | "blocked" | "gone" | "timeout" | "garbage" | "error:<code>",
-   "sleep": <seconds for "timeout">}
+   "sleep": <seconds for "timeout">,
+   "pane_list_fail": {"<session>": "timeout" | "error:<code>"}}   # 只让这个 session 的 pane list 失败
 Every call is appended to $FAKE_HERDR_LOG as one JSON line (the argv).
 Like the real herdr: success JSON goes to stdout with rc=0; an error leaves stdout empty, writes the error JSON to
 stderr and exits 1 (observed on a real agent_blocked).
@@ -36,6 +37,11 @@ def main(argv):
     if session not in panes:
         fail('server_not_running', f'no herdr server for {session}')
     if rest[:2] == ['pane', 'list']:
+        bad = state.get('pane_list_fail', {}).get(session)
+        if bad == 'timeout':
+            time.sleep(float(state.get('sleep', 30)))
+        elif bad:
+            fail(bad[6:] if bad.startswith('error:') else bad, 'fake pane list error', 'cli:pane:list')
         out({'id': 'cli:pane:list', 'result': {'panes': panes[session], 'type': 'pane_list'}})
     if rest[:2] == ['agent', 'prompt']:
         target = rest[2]

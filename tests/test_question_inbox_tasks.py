@@ -287,6 +287,102 @@ class HttpTest(TasksBase):
         self.assertEqual(pl['EnvironmentVariables']['GH_BIN_PATH'], str(self.tmp / 'bin' / 'gh'))
 
 
+class ReviewFixTest(TasksBase):
+    """审查 I1–I4 的验收。"""
+
+    def two_sessions(self, demo_panes, other_panes, **extra):
+        (self.tmp / 'sock' / 'other').mkdir(parents=True, exist_ok=True)
+        (self.tmp / 'sock' / 'other' / 'herdr.sock').write_text('')
+        self.set_herdr(panes={'demo': demo_panes, 'other': other_panes}, **extra)
+
+    def ws_pane(self, pane_id, n, status='idle', agent='claude'):
+        p = dict(base.pane(pane_id, lead=pane_id, agent=agent or 'claude', status=status),
+                 cwd=str(self.tmp / 'ws' / 'demo' / 'issues' / str(n) / 'repo'))
+        if not agent:
+            p.pop('agent'), p.pop('agent_session')
+            p['agent_status'] = None
+        return p
+
+    def test_i1_partial_herdr_failure_keeps_failed_session(self):
+        self.two_sessions([self.ws_pane('w1:p7', 8, 'blocked')], [self.ws_pane('w2:p1', 12)])
+        first = tasks.view(refresh=True)
+        self.assertEqual(self.flat(first)[8]['stage']['key'], 'stuck')
+        at = {s['name']: s['at'] for s in first['sources']}
+        # 第二轮：demo 的 pane list 超时；other 正常且换了内容
+        self.two_sessions([self.ws_pane('w1:p7', 8, 'blocked')], [self.ws_pane('w2:p1', 9)],
+                          pane_list_fail={'demo': 'timeout'}, sleep=5)
+        v = tasks.view(refresh=True)
+        src = {s['name']: s for s in v['sources']}
+        self.assertEqual((src['herdr demo']['ok'], src['herdr demo']['has_data'], src['herdr demo']['at']),
+                         (False, True, at['herdr demo']))
+        self.assertIn('超时', src['herdr demo']['error'])
+        self.assertTrue(src['herdr other']['ok'])
+        self.assertTrue(v['stale'])
+        t = self.flat(v)
+        self.assertEqual(t[8]['stage']['key'], 'stuck')                      # 旧的 blocked agent 还在
+        self.assertEqual([a['pane'] for a in t[8]['agents']], ['w1:p7'])
+        self.assertEqual([a['pane'] for a in t[9]['agents']], ['w2:p1'])     # 成功的 session 用新数据
+        self.assertEqual(t[12]['agents'], [])
+        self.assertIn('无法刷新 herdr demo', tasks.render_text(v))
+
+    def test_i1_never_succeeded_session_is_unknown_not_no_agent(self):
+        self.two_sessions([], [], pane_list_fail={'demo': 'error:internal'})
+        v = tasks.view(refresh=True)
+        t = self.flat(v)
+        self.assertEqual(t[8]['stage']['key'], 'todo')
+        self.assertIn('agent 情况待核', t[8]['why'][0])
+        self.assertNotIn('没有 agent', t[8]['why'][0])
+        self.assertTrue(v['stale'])
+
+    def test_i2_only_explicit_success_is_green(self):
+        self.set_gh(response([
+            issue(1, refs=[pr(101, checks=None, body='Part of #1')]),
+            issue(2, refs=[pr(102, checks='PENDING', body='Part of #2')]),
+            issue(3, refs=[pr(103, checks='FAILURE', body='Part of #3')]),
+            issue(4, refs=[pr(104, checks='SUCCESS', body='Part of #4')]),
+            issue(5, refs=[pr(105, checks='SUCCESS', draft=True, body='Part of #5')]),
+            issue(6, refs=[pr(106, checks='ERROR', body='Part of #6')]),
+        ]))
+        t = self.flat(tasks.view(refresh=True))
+        self.assertEqual({n: t[n]['stage']['key'] for n in t},
+                         {1: 'doing', 2: 'doing', 3: 'stuck', 4: 'merge', 5: 'doing', 6: 'stuck'})
+        self.assertIn('尚无检查结果', t[1]['why'][0])
+        self.assertIn('checks 运行中', t[2]['why'][0])
+        self.assertIn('草稿', t[5]['why'][0])
+        self.assertNotIn('merge', [x['key'] for n in (1, 2, 5) for x in t[n]['tags']])
+
+    def test_i3_issue_side_native_link_beyond_pr_side_page(self):
+        p = pr(101, checks='SUCCESS', closing=range(1, 11))  # PR 侧只返回前 10 个，没有 #11；正文没有 Part of
+        p['closingIssuesReferences']['totalCount'] = 11
+        i11 = issue(11)
+        i11['closedByPullRequestsReferences'] = {'totalCount': 1, 'nodes': [p]}
+        i12 = issue(12)  # Issue 侧原生关联也被截断
+        i12['closedByPullRequestsReferences'] = {'totalCount': 12, 'nodes': [pr(120 + k, checks='FAILURE') for k in range(10)]}
+        i13 = issue(13, refs=[pr(113, body='Relates to owner/repo#13；也提到 #13')])
+        self.set_gh(response([i11, i12, i13]))
+        v = tasks.view(refresh=True)
+        t = self.flat(v)
+        self.assertEqual([x['number'] for x in t[11]['prs']], [101])
+        self.assertEqual(t[11]['stage']['key'], 'merge')
+        self.assertEqual(len(t[12]['prs']), 10)
+        self.assertEqual((t[13]['prs'], t[13]['stage']['key']), ([], 'todo'))  # 提及不算关联
+        more = ' '.join(v['sources'][0]['more'])
+        self.assertIn('Issue #12 的原生关联 PR 超过', more)
+        self.assertIn('PR #101 关闭的 Issue 超过', more)
+
+    def test_i3_timeline_truncation_is_reported(self):
+        i = issue(1, refs=[pr(101, body='Part of #1')])
+        i['timelineItems']['pageInfo'] = {'hasPreviousPage': True}
+        self.set_gh(response([i]))
+        self.assertIn('Issue #1 的 PR 交叉引用超过', ' '.join(tasks.view(refresh=True)['sources'][0]['more']))
+
+    def test_i4_shell_pane_is_not_an_agent(self):
+        self.set_herdr(panes={'demo': [self.ws_pane('w1:p8', 8, agent=None), self.ws_pane('w1:p9', 9, 'blocked')]})
+        t = self.flat(tasks.view(refresh=True))
+        self.assertEqual((t[8]['agents'], t[8]['stage']['key']), ([], 'todo'))
+        self.assertEqual(([a['pane'] for a in t[9]['agents']], t[9]['stage']['key']), (['w1:p9'], 'stuck'))
+
+
 # ---------- node：任务页渲染，切换后答题页的保护仍然有效 ----------
 
 TASKS_VIEW = {

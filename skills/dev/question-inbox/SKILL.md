@@ -130,22 +130,24 @@ $Q tasks [--ws W] [--json]     # 和网页同一份数据；lead 回答「在做
 
 - **repo 清单**：配置文件 `~/.config/question-inbox/tasks.json`（`QI_TASKS_CONFIG` 可覆盖），格式 `{"repos":[{"ws":"demo","repo":"owner/repo"}]}`。不从 README 猜。
 - **GitHub**（`gh api graphql`，路径取 `GH_BIN_PATH`，默认 `command -v gh`）：每个 repo 最多 100 个 open Issue + 7 天内关闭的；Issue 的 labels、parent、子 Issue 计数；
-  关联 PR 先看 GitHub 的 closing references，再看 PR 正文的 `Part of <owner>/<repo>#<号>`（靠 Issue 上的交叉引用找到这些 PR）；PR 的状态和 checks 汇总。超出上限会提示「还有更多」。
-- **herdr**：每个有 socket 的 session 跑 `pane list`（socket 不在就跳过，不创建 session）。agent 名是 `w-<号>…` / `rv-<号>-…`，
-  或 cwd 在 `~/workspaces/<ws>/(issues|stories)/<号>/` 下，就算这个任务有人在做；页面写明依据是名字还是 cwd。
+  关联 PR 先用 Issue 侧的原生关联（linked / closing references），再补 PR 侧的 closing references 和正文 `Part of <owner>/<repo>#<号>`
+  （靠 Issue 上的交叉引用找到这些 PR；单纯提到不算关联）；PR 的状态和 checks 汇总。任何一处截断（open Issue、关联 PR、交叉引用）都会提示「还有更多」。
+- **herdr**：每个有 socket 的 session 跑 `pane list`（socket 不在就跳过，不创建 session）。只看有 agent 的 pane（普通 shell 不算）：
+  agent 名是 `w-<号>…` / `rv-<号>-…`，或 cwd 在 `~/workspaces/<ws>/(issues|stories)/<号>/` 下，就算这个任务有人在做；页面写明依据是名字还是 cwd。
+  缓存和失败**以 session 为单位**：某个 session 查询失败时，它上次的 agent 照用并标出时间，其他 session 照常刷新；从没查成功过的 session 让「待开工」写成「agent 情况待核」。
 - **收件箱**：题头 `issue` 字段对上的未答题挂在任务上，点「去回答」跳到题；`issue=none` 或对不上的放「未关联的待答题」。
 
-查询失败时页面显示「无法刷新：原因」，保留上一次成功的数据并标出时间；从没成功过就写「没有可用数据（不代表没有任务）」。
+查询失败时（每个 repo、每个 herdr session 单独算）页面显示「无法刷新：原因」，保留那个来源上一次成功的数据并标出时间；从没成功过就写「没有可用数据（不代表没有任务）」。
 
 stage（读的时候现算，每个都带依据；同时命中几个时显示最需要处理的那个，其余作小标签）：
 
 | stage | 判据 |
 |---|---|
 | 等你回答 | 有挂在这个任务上的未答题 |
-| 等你合并 | 有 open、非草稿的 PR，checks 全绿（或没有 checks，会写明） |
+| 等你合并 | 有 open、非草稿的 PR，checks 汇总**明确是 SUCCESS**（没有 checks、还在跑、草稿都不算，归「在做」并写明） |
 | 等你验收 | 没有 open PR，但有已合并的 PR，Issue 还开着（例如合了还没上 prod 验收） |
 | 卡住 | 对应的 agent 是 blocked，或 open PR 有失败的 check |
-| 在做 | 有对应的 agent；或 72 小时内 Issue / PR 有更新，或 PR 还在跑 checks / 是草稿。写「谁 · 多久前动过」 |
+| 在做 | 有对应的 agent；或 72 小时内 Issue / PR 有更新；或有 open PR 还没有可合并的检查结果（草稿 / 尚无检查结果 / 运行中）。写「谁 · 多久前动过」 |
 | 停着 | Issue 带 `blocked` / `on-hold` 这类 label（有 agent 时只作小标签） |
 | 待开工 | Issue open，没有 agent、没有 PR、没有上面这些 |
 | 最近关闭 | 7 天内关闭，「已完成」和「不做」分开标 |
