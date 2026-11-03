@@ -26,6 +26,10 @@ worker 能写哪些文件、交付物怎么验、谁能授权什么，由调用�
 - 复用 `W·` tab 前确认是自己建的或明确交接给自己的；前缀相同不代表归属。
 - 一个 worker tab 最多 2×2 四个；超了开 `W·<话题>-2`。
 - **cwd 只能在建 pane / tab 时定**，`agent start` / `prompt` 都改不了 → 每次显式传绝对 `--cwd`，不继承。
+- **名字和 cwd 带任务号**，这样不用另记「谁在做哪个任务」，看 herdr 就能算出来：
+  `agent start` 的名字用 `w-<号>`（同一任务多个就 `w-<号>-<用途>`），审查 worker 用 `rv-<号>-<kind>`；
+  建 pane 时 `--cwd` 用 `issues/<号>/`（老 ws 是 `stories/<号>/`）；该目录不存在的任务（只读分析、复核）cwd 用 ws 根，名字仍带号。
+  不属于任何 Issue 的临时活（讨论、调研）用描述性名字，不带号。
 
 ```bash
 # 首个 worker：按 label 找自己的 worker tab（不记 tab ID，重启会变），没有就建
@@ -50,10 +54,6 @@ herdr pane move <pane> --tab <tab_id> --target-pane <pane> --split right --no-fo
 - worker 重启后可能丢 name，侧栏上会被误认成 lead → 立刻 `herdr agent rename <pane> <name>` 恢复。
 
 ## 2. 起 worker
-
-**名字和 cwd 带任务号**，这样不用另记「谁在做哪个任务」，看 herdr 就能算出来：
-实现 worker 叫 `w-<号>`（同一任务多个就 `w-<号>-<用途>`），审查 worker 叫 `rv-<号>-<kind>`；`--cwd` 放在 `issues/<号>/` 下（老 ws 是 `stories/<号>/`）。
-不属于任何 Issue 的临时活（讨论、调研）用描述性名字，不带号。
 
 ```bash
 herdr agent start <name> --kind <kind> --pane <pane> -- <该 CLI 的 yolo 参数> <模型参数>

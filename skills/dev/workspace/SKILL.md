@@ -72,11 +72,14 @@ lead、worker 只是「当前谁在做」，可以换；状态从 Issue + PR + c
 1. 查重：已有 Issue 的补充就补到那个 Issue，不另开。
 2. 判断做不做、归哪个 ws（按各 ws README 的 Issue repo）、要不要拆。拆只拆**能独立验收或独立授权**的结果，实现步骤留在任务书里。
 3. **当天落地**，二选一，都不只停在聊天里：
-   - 做：在对应 repo 开 Issue（不是本 ws 的就开在那个 ws 的 repo，正文写明归谁接）；
-   - 不做：同样开 Issue 写清一句理由，然后以 **not planned** 关闭——留痕，Owner 不同意就 reopen。低价值的不做不用先问 Owner。
+   - 做：在对应 repo 开 Issue（按 `.templates/issue.md`）。**不是本 ws 的**：开在那个 ws 的 repo 后，收话的 lead 要么自己派 worker 去做（worktree 开在那个 ws 下），
+     要么明确回 Owner「这单要 <ws> 的 lead 接，那边现在没人在场」——不许只开 Issue 就算交出去。
+     跨 repo 挂父子：先建子 Issue，再 `gh issue edit <父> -R <父 repo> --add-sub-issue <子 URL>`。
+   - 不做：同样开 Issue，只写一句理由和结论（不套模板），然后 `gh issue close --reason "not planned"`——留痕，Owner 不同意就 reopen。低价值的不做不用先问 Owner。
+     它是某个父 Issue 的子项时，在父 Issue 正文的清单里单列一行「不做：#<号> 理由」：GitHub 把 not planned 也算进子项完成数，父 Issue 的进度不能当成「都做完了」。
 4. 回复 Owner 一行：`<owner>/<repo>#<号> · 做 / 不做 · 下一步`。
 
-只有业务取舍、优先级冲突、扩大授权范围、不可逆或对外动作才进问题收件箱问 Owner；做不做、怎么拆本身不出题。
+以上「做不做、怎么拆」的判断本身不出题；其余要 Owner 决定的事照第 8 节走问题收件箱。
 
 开工前先看 README 第 8 项：没有接入检查记录、或仓库表里有 repo 不在记录里，先按第 11 节查一遍。
 
