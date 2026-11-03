@@ -3,7 +3,8 @@
 State: JSON file at $FAKE_GH_STATE, re-read on every call:
   {"repos": {"owner/repo": <full GraphQL response object> | "fail:<message>" | "timeout"}}
 Every call is appended to $FAKE_GH_LOG as one JSON line (the argv).
-Supports only: gh api graphql -f query=... -f owner=O -f name=N [-f k=v ...].
+Supports: gh api graphql -f query=... -f owner=O -f name=N [-f k=v ...];
+          gh issue view <url> --json state,stateReason  (state "issues": {"<url>": {"state": ..., "stateReason": ...}}).
 A failure mimics real gh: message on stderr, rc=1.
 """
 import json
@@ -15,6 +16,14 @@ import time
 def main(argv):
     with open(os.environ['FAKE_GH_LOG'], 'a', encoding='utf-8') as f:
         f.write(json.dumps(argv, ensure_ascii=False) + '\n')
+    if argv[:2] == ['issue', 'view']:  # gh issue view <url> --json state,stateReason（state.issues 里配）
+        with open(os.environ['FAKE_GH_STATE'], encoding='utf-8') as f:
+            info = json.load(f).get('issues', {}).get(argv[2])
+        if info is None:
+            print(f'GraphQL: Could not resolve to an issue ({argv[2]})', file=sys.stderr)
+            sys.exit(1)
+        print(json.dumps(info))
+        sys.exit(0)
     if argv[:2] != ['api', 'graphql']:
         print('fake gh: unsupported command', file=sys.stderr)
         sys.exit(1)

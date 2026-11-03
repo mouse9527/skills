@@ -64,6 +64,7 @@ CI 只能跑公开规则：`agentskills validate`、`scripts/validate.py`、`tes
 | assistant | [xiaohongshu](skills/assistant/xiaohongshu/SKILL.md) | 小红书 |
 | dev | [herdr-workers](skills/dev/herdr-workers/SKILL.md) | 用 herdr 把任务交给另一个 agent（worker）时的布局、启动、派发… |
 | dev | [question-inbox](skills/dev/question-inbox/SKILL.md) | 问题收件箱 |
+| dev | [router](skills/dev/router/SKILL.md) | Router（需求分派） |
 | dev | [workspace](skills/dev/workspace/SKILL.md) | 工作区（ws）的骨架、创建、日常使用与收尾规则。所有 ws 放在 ~/works… |
 
 <!-- skills-index:end -->
