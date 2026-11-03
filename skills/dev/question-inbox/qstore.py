@@ -673,7 +673,7 @@ def save_draft(qid, content_rev, slots):
 
 
 def submit(qid, content_rev, answer_rev, slots):
-    """返回新的 answer_rev。"""
+    """返回新的 answer_rev。更正内容和当前 Rev 逐字相同时不生成新 Rev、不投递，返回当前 answer_rev。"""
     with locked():
         allq = all_questions()
         meta, body = _writable_for_owner(qid, allq)
@@ -685,6 +685,12 @@ def submit(qid, content_rev, answer_rev, slots):
             raise QError(409, f'问题或回答已被更新（content_rev {meta["content_rev"]}，answer_rev '
                               f'{meta["answer_rev"]}），请刷新；你填的内容已保留为草稿')
         clean = _check_slots(lead, meta, slots, complete=True)
+        last = next((r for r in answer_revs(sp) if r['rev'] == geti(meta, 'answer_rev')), None)
+        if last is not None and last['slots'] == clean:  # 重复点击提交：不算更正
+            if '草稿回答' in sp:
+                sp.pop('草稿回答')
+                _save(meta, join_body(lead, sp), '提交内容与当前回答相同，丢弃草稿，未生成新 Rev')
+            return geti(meta, 'answer_rev')
         n = geti(meta, 'answer_rev') + 1
         t = now()
         old = sp.get('回答', '')
