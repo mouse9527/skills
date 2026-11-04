@@ -146,7 +146,7 @@ Owner 在页面「需求」栏提交一句话 → `needs/need-NNNN.json` → 服
 
 状态：`new` →（Router take）`routing` →（route）`assigned` →（lead claim）
 → 清楚：`link` → `filed`；不清楚：`discussing`（`等 Owner` / `等 lead`）→ Owner 确认最新理解卡 → `confirmed` → `link` → `filed`；
-不做：`dropped`（必须关联一个 not planned Issue）。另有 `held`（Router / lead 找不到路、卡住）。`filed` / `dropped` 后讨论线程封存、只读。
+不做：`dropped`（必须关联一个 not planned Issue）。另有 `held`（Router / lead 找不到路、卡住）。`filed` 后讨论线程**继续可用**（修订 1）；只有 `dropped` 封存、只读。
 
 | 命令 | 谁 | 用途 |
 |---|---|---|
@@ -155,8 +155,12 @@ Owner 在页面「需求」栏提交一句话 → `needs/need-NNNN.json` → 服
 | `$Q router dispatch <id>` / `$Q router lead <ws>` / `$Q router close-lead <ws>` | 只有 Router | 写任务书并交给 `lead-<ws>`；起 / 关 lead（只在 session router 里，只认 `router-leads.json` 里自己建的；暂停时不派、不新起；close-lead 要整个 workspace 里只有这个 lead 和它的 worker 才关） |
 | `$Q need claim <id> [--takeover]` | 那个 ws 的 lead：pane 的 cwd **恰好**是 lead 目录、agent 名 `lead-<ws>`（worker 在子目录里，不能 claim） | 登记为负责 lead；takeover 只在原负责 lead **确认**不在时可用（查询失败、超时、多个匹配都算查不清，拒绝） |
 | `$Q need card <id> --body <文件>` | 只有负责 lead | 发理解卡：`## 理解` / `## 范围` / `## 不做什么` / `## 验收草案` / `## 开放问题`（开放问题每条带推荐，可空）；每发一张版本 + 1 |
-| `$Q need link <id> --issue <URL>…` / `$Q need drop <id> --issue <URL> --why "…"` | 只有负责 lead | 建好 Issue 后登记（讨论过的必须已确认；第一次 link 时核对根 Issue 在本 ws 主 repo、正文第一个非空行是 `需求：need-NNNN`）/ 不做 |
-| `$Q need hold <id> --why "…"` | Router（routing）或负责 lead | 卡住，页面显示原因 |
+| `$Q need link <id> --issue <URL>…` / `$Q need drop <id> --issue <URL> --why "…"` | 只有负责 lead | 建好 Issue 后登记（讨论过的必须已确认；第一次 link 时核对根 Issue 在本 ws 主 repo、正文第一个非空行是 `需求：need-NNNN`；并自动贴一条「已确认的理解」评论，没有理解卡时贴「按原话立项（未单独讨论）」；水位回填到根 Issue 创建时间）/ 不做 |
+| `$Q need inbox <id> [--ack <评论 id>…]` | 只有负责 lead | 列出未读的 Issue 评论（正文现场从 GitHub 取，不改状态）；`--ack` 才标已读 |
+| `$Q need say <id> --text "…"` | 只有负责 lead | 在 7788 讨论线程里说一句（小进展，不进 GitHub、不投递） |
+| `$Q need comment <id> --body <文件>` | 只有负责 lead | 把**结论**写到根 Issue（团队可见）；不贴讨论原文 |
+| `$Q need hold <id> --why "…"` | Router（routing）或负责 lead（已立项不要 hold） | 卡住，页面显示原因 |
+| `$Q router takeover <id>` | 只有 Router | 已立项需求的负责 lead **确认不在**：安排同 ws 的新 lead 接手（claim --takeover + need inbox） |
 | `$Q router register` / `$Q router paused` / `$Q router status` | Router / 任何人 | 登记身份；暂停开关；登记、拉起次数、最近投递 |
 
 身份不符一律退出码 4，状态不允许退出码 3。上面这些 Router / 负责 lead 的命令，身份**只取执行者自己 pane 的** `$HERDR_SESSION` / `$HERDR_PANE_ID`：
@@ -167,9 +171,14 @@ Owner 在页面「需求」栏提交一句话 → `needs/need-NNNN.json` → 服
 Router 起 lead、写派工书（`<lead 目录>/dispatch/`）、claim 校验都按它。
 **`lead_cwd` 只能指向 Owner 自己的代码**：Router 起 lead 时会对这个目录自动选「信任」（herdr-workers §2：外部内容不自动信任）。
 
+- **修订 1：讨论默认留在 7788，结论才进 Issue。** Owner 在详情页发的消息默认只进讨论线程、投给负责 lead；
+  输入框旁的「同时发到 Issue（团队可见）」默认关，打开后才走 GitHub 评论路径（发送意图、comment id 记账、对账），
+  回执显示「已发到 GitHub → 已通知 lead → lead 已读」。时间线来源分「7788 讨论」/「Issue 评论 · 经 7788」/「Issue 评论」。
+- lead 判断什么时候把**结论**写进 Issue：范围 / 验收 / 取舍 / 优先级变化，或 Owner 明确说「记一下」时，用 `need comment`；
+  小进展用 `need say` 留在 7788。Issue 评论是协作输入，不是授权。
 - **Owner 在页面上**：对还没有负责 lead 的需求写的是「补充 / 纠正」（记成 note，Router 正在处理时投给 Router）；有负责 lead 之后写的是「回复」，
   进讨论线程并投给负责 lead；「确认理解卡 vN」只能确认**最新**一张（绑定版本，过期 409），确认后投给负责 lead 去建 Issue。
-  等 Owner 回复或确认的需求出现在「待我决定」最上面的「需求讨论」一栏。
+  等 Owner 回复或确认的需求出现在「待处理」最上面的「需求讨论」一栏。
 - 还没 lead claim 的需求（assigned）：Owner 的补充投给 Router；分派后 30 分钟（`QI_UNCLAIMED_AFTER` 秒）仍没人 claim，服务自动补投 Router 一次，页面也给「重新通知」。
 - 投递和回答投递同一套机制：按 agent_session 定位、写前记账、held / uncertain、退避、不重复发，同一批最多合并 5 条。
   投给负责 lead 时找不到它（pane 关了、换了会话）只暂缓，不改投别的 lead、也不拉起谁（由 Router 的看门狗处理）。
@@ -207,7 +216,8 @@ launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/local.question-in
 
 ## 6. 页面
 
-顶部三栏：**需求**（`#needs`：提交一句话；每条需求的原话、ws、负责 lead、讨论线程（理解卡按段显示，旧版折叠）、回复框和「确认理解卡 vN」、关联 Issue 与进度；Router 健康与全局暂停）、**待我决定**（`#`：「需求讨论」「审批」两栏在前，然后是问题）、**任务**（`#tasks`）。
+页面照线框：最左图标栏（待处理 / 需求），右侧是需求 / 待处理 / 工作区筛选和数量，底部「全部 Issue（只读视图）」。**需求**看板六列从左到右：待处理 / 卡住 / 待立项 / 审查中 / 进行中 / 完成（判断优先级仍是完成优先，显示顺序另排）；**待处理**只放要 Owner 动手的事，按需求合并；`#tasks` 是只读 Issue 视图。旧地址 `#needs` 跳到看板、`#needs:<id>` 跳到对应详情页。
+详情页时间线里的问题 / 审批卡**就地作答**（沿用版本绑定、409、提交中禁用、提交后只读、多问摘要、迟到回包保护），复杂题可点「在完整页打开」。
 需求页和答题页的写请求都过同样的 JSON、Host、Origin、token 四项校验；提交需求带客户端生成的 `request_id`，重复提交返回原记录。
 
 ## 6.1 任务视图（只读）

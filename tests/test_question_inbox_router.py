@@ -248,13 +248,15 @@ class NeedStoreTest(RouterBase):
         self.assertEqual(r.returncode, 0, r.stderr)
         rec = self.need(nid)
         self.assertEqual((rec['status'], rec['issues'], rec['delivery']), ('filed', [ISSUE + '30'], 'received'))
-        with self.assertRaises(qstore.QError) as e:
-            qstore.owner_reply(nid, '再改改', 'req-reply-002')  # 封存
-        self.assertEqual(e.exception.code, 409)
+        rec, new = qstore.owner_reply(nid, '再改改', 'req-reply-002')  # 修订 1：立项后线程继续用
+        self.assertTrue(new)
+        self.assertEqual((rec['status'], rec['delivery'], rec['delivery_kind']), ('filed', 'pending', 'reply'))
         self.assertEqual(self.as_lead('need', 'card', nid, '--body', self.card_file('v3')).returncode, 3)
         self.assertEqual(self.as_lead('need', 'link', nid, '--issue', ISSUE + '31').returncode, 0)  # 可以追加子 Issue
-        self.assertEqual([x['kind'] for x in self.need(nid)['thread']], ['card', 'reply', 'card', 'confirm'])
-        self.assertIn('已封存', self.as_lead('need', 'show', nid).stdout)
+        self.assertEqual([x['kind'] for x in self.need(nid)['thread'] if x['kind'] in ('card', 'reply', 'confirm')],
+                         ['card', 'reply', 'card', 'confirm', 'reply'])
+        self.assertNotIn('已封存', self.as_lead('need', 'show', nid).stdout)
+        self.assertIn('再改改', self.as_lead('need', 'show', nid).stdout)
 
     def test_clear_need_links_without_discussion(self):
         nid = self.assigned()
@@ -408,13 +410,12 @@ class NeedDeliveryTest(RouterBase):
         st, h, _ = self.http('GET', '/api/list')
         self.assertEqual([t['id'] for t in h['needs_talk']], [nid])
         self.assertEqual(h['open_count'], 1)
-        self.lead_panes(gone=('w1:p1',))  # 负责 lead 不在了：只暂缓，不改投别的 lead、也不拉起谁
+        self.lead_panes(gone=('w1:p1',))  # 修订 1 / §3：负责 lead 确认不在 → 叫醒 Router 安排接手，不改投别的 lead
         self.post(f'/api/need/{nid}/reply', {'text': '在吗', 'request_id': 'req-reply-0009'})
-        self.wait_for(lambda: self.need(nid)['delivery'] == 'held', msg='held')
-        self.assertIn('负责 lead', self.need(nid)['last_error'])
+        self.wait_for(lambda: self.need(nid)['delivery_kind'] == 'takeover', msg='takeover')
+        self.assertIn(self.need(nid)['delivery'], ('pending', 'sending', 'sent', 'uncertain'))
         time.sleep(0.8)
-        self.assertEqual([c for c in self.herdr_calls() if 'prompt' in c], [])
-        self.assertEqual([c for c in self.all_calls() if 'start' in c], [])
+        self.assertEqual([c for c in self.herdr_calls() if 'prompt' in c and 'demo' in c], [])  # 没有投给（不在的）lead
 
     def test_pause_stops_delivery_and_resume(self):
         self.start_server()
@@ -1471,43 +1472,102 @@ const N = (id, over) => Object.assign({id, text: '<script>evil()</script> 第一
 (async () => {
   const out = {};
   const answerAll = (path, status, body) => { for (const r of pending(path)) { r.done = true; r.resolve({status, json: async () => body}); } };
-  if (scenario === 'needs') {
+  if (scenario === 'board') {
+    ctx.location.hash = '#board';
+    run(src); await flush();
+    const c = (id, title, col, ws, over) => Object.assign({id, title, number: 30, ws: ws || 'demo', column: col, flags: [], next: '下一步',
+      who: 'lead-demo', updated: '2026-11-03T10:00:00+08:00', unread: 0, loop: false, subs: {done: 0, skipped: 0, left: 0, total: 0},
+      prs: [], comments: [], error: '', status: 'filed', live: col === 'doing'}, over || {});
+    const col = (key, label, cards) => ({key, label, count: cards.length, cards});
+    answerAll('/api/board', 200, {generated_at: 't', errors: [], ws: ['demo'], degrade: false, columns: [
+      col('wait', '待处理', [c('need-0007', '演示需求 <b>x</b>', 'wait', 'demo', {flags: [{kind: 'wait', text: '理解卡 v2 等你确认'}]})]),
+      col('stuck', '卡住', []), col('todo', '待立项', []), col('review', '审查中', []),
+      col('doing', '进行中', [c('need-0008', '第二个', 'doing')]), col('done', '完成', [])]});
+    answerAll('/api/needs', 200, {needs: [], router: Object.assign({}, H, ARG.router || {})});
+    await flush();
+    if (pending('/api/needs').length) { answerAll('/api/needs', 200, {needs: [], router: Object.assign({}, H, ARG.router || {})}); await flush(); }
+    out.rail = findAll(e => e.tagName === 'A', modes).map(a => [a.attrs.href, text(a)]);
+    out.text = text(main);
+    out.hrefs = findAll(e => e.tagName === 'A', main).map(a => a.attrs.href);
+    out.cardCls = byId('router_card') ? byId('router_card').className : '';
+    out.buttons = findAll(e => e.tagName === 'BUTTON', main).map(text);
+    // 提需求对话框
+    button('+ 提需求', main).dispatch('click');
+    const ta = byId('new_need_text'); ta.value = '加一个 CSV 导出'; ta.dispatch('input');
+    const go = byId('new_need_go'); go.dispatch('click'); go.dispatch('click'); await flush();
+    out.postsPending = posts().length;
+    out.goPending = {disabled: byId('new_need_go').disabled, text: text(byId('new_need_go'))};
+    answerAll('/api/need', ARG.fail ? 500 : 200, ARG.fail ? {error: '服务端出错'} : {ok: true, id: 'need-0008', created: true});
+    await flush();
+    out.afterMsg = ARG.fail ? text(byId('sheet')) : (run('boardMsg && boardMsg.text') || text(main));
+    out.afterValue = byId('new_need_text') ? byId('new_need_text').value : '';
+    if (ARG.fail) { byId('new_need_go').dispatch('click'); await flush(); }
+    // Router 暂停开关（放在看板底部的小卡片里）
+    if (byId('pause_btn')) { byId('pause_btn').dispatch('click'); await flush(); out.pauseBusy = text(byId('pause_btn')); }
+    out.posts = posts();
+  } else if (scenario === 'old-needs') {
     ctx.location.hash = '#needs';
     run(src); await flush();
-    out.modes = findAll(e => e.tagName === 'A', modes).map(a => [a.attrs.href, text(a)]);
-    out.view = app.attrs['data-view'];
-    answerAll('/api/needs', 200, {needs: [N('need-0007')], router: Object.assign({}, H, ARG.router || {})});
-    answerAll('/api/tasks', 200, {generated_at: 't', sources: [], unlinked: [], needs: {}, groups: [{key: 'doing', title: '在做', count: 1, ws: [{ws: 'demo', tasks: [
-      {kind: 'task', depth: 0, ws: 'demo', repo: 'owner/repo', number: 30, title: 'T', url: 'https://github.com/owner/repo/issues/30',
-       stage: {key: 'doing', label: '在做', group: 'doing'}, why: ['w'], tags: [], prs: [], agents: [], questions: [], sub: {total: 3, completed: 1}, need: 'need-0007'}]}]}]});
+    out.mode = run('mode'); out.needId = run('needId');
+    ctx.location.hash = '#needs:need-0007'; listeners.hashchange(); await flush();
+    out.mode2 = run('mode'); out.needId2 = run('needId');
+    answerAll('/api/need/need-0007', 200, {id: 'need-0007', title: 'T', text: 't', status: 'filed', ws: 'demo', lead: {},
+      card_rev: 0, confirmed_rev: 0, issues: [], github: '', column: 'doing', column_label: '进行中', flags: [], sealed: false,
+      timeline: [], unread: 0, errors: [], receipt: {}, loop: false, subs: [], subs_progress: {done: 0, skipped: 0, left: 0, total: 0},
+      prs: [], created: 't', updated: 't', to_issue: true, lead_state: 'present'});
     await flush();
-    const html0 = htmlSets.length;
+    out.detail = text(main);
+  } else if (scenario === 'need-detail') {
+    ctx.location.hash = '#need:need-0007';
+    run(src); await flush();
+    const ago = new Date(Date.now() - 3 * 60000).toISOString();
+    answer('/api/need/need-0007', 200, {id: 'need-0007', title: '详情', text: 't', status: 'filed', ws: 'demo', lead: {}, card_rev: 0,
+      confirmed_rev: 0, issues: [], github: '', column: 'doing', column_label: '进行中', flags: [], sealed: false, unread: 0, errors: [],
+      receipt: {note: '已通知 lead-demo'}, loop: false, subs: [], subs_progress: {done: 0, skipped: 0, left: 0, total: 0}, prs: [],
+      created: 't', updated: 't', to_issue: true, lead_state: 'present', timeline: [
+        {kind: 'thread', at: ago, by: 'owner', source: '7788 讨论', text: 'OWNER_BODY_MARK：只在 7788 里聊', receipt: {notified: true, read: false, note: ''}},
+        {kind: 'system', at: ago, text: '负责 lead 不在，等待接手', source: '系统'}]});
+    await flush();
     out.text = text(main);
-    out.htmlSets = htmlSets.length - html0;
-    out.scripts = findAll(e => ['SCRIPT', 'IMG'].includes(e.tagName)).length;
-    out.hrefs = findAll(e => e.tagName === 'A', main).map(a => a.attrs.href);
-    out.buttons = findAll(e => e.tagName === 'BUTTON', main).map(text);
-    out.cardCls = byId('router_card').className;
-    // 连点两次提交：只发一个 POST；成功后显示编号、清空输入
-    const ta = byId('nd__new'); ta.value = '加一个 CSV 导出'; ta.dispatch('input');
-    const go = byId('need_go'); go.dispatch('click'); go.dispatch('click'); await flush();
-    byId('need_go').dispatch('click'); await flush();
-    out.postsPending = posts().length;
-    out.goPending = {disabled: byId('need_go').disabled, text: text(byId('need_go'))};
-    answer('/api/need', ARG.fail ? 500 : 200, ARG.fail ? {error: '服务端出错'} : {ok: true, id: 'need-0008', created: true}); await flush();
-    out.afterMsg = text(byId('need_msg'));
-    out.afterValue = byId('nd__new').value;
-    if (ARG.fail) {  // 重试用同一个 request_id
-      byId('need_go').dispatch('click'); await flush();
+    out.noise = out.text.includes('开始投递') || out.text.includes('投递暂缓');
+    out.relative = out.text.includes('分钟前');
+  } else if (scenario === 'need-inline') {
+    const qd = (n, status) => ({id: 'demo-0001', kind: 'question', title: '就地答题', status, content_rev: 3, answer_rev: status === 'answered' ? 1 : 2,
+      editable: true, draft: {slots: {}}, option_notes: {}, revs: status === 'answered' ? [{rev: 1, at: 't', corrected_by: 0, slots: {Q1: {type: 'option', choice: 'B. 乙'}, Q2: {type: 'free', text: '自由回答'}}}] : [],
+      questions: [{q: 'Q1', text: '第一问', options: ['A. 甲', 'B. 乙'], suggestion: 'A —— 理由', withdrawn: false},
+                  {q: 'Q2', text: '第二问', options: ['A. 甲', 'B. 乙'], suggestion: '', withdrawn: false}]});
+    const need = (status) => ({id: 'need-0007', title: '就地答题需求', text: 't', status: 'filed', ws: 'demo', lead: {}, card_rev: 0,
+      confirmed_rev: 0, issues: [], github: '', column: 'doing', column_label: '进行中', flags: [], sealed: false, unread: 0, errors: [],
+      receipt: {}, loop: false, subs: [], subs_progress: {done: 0, skipped: 0, left: 0, total: 0}, prs: [], created: 't', updated: 't',
+      to_issue: true, lead_state: 'present', timeline: [{kind: 'question', at: 't', id: 'demo-0001', title: '就地答题', qkind: 'question',
+        qstatus: status, blocking: false, invalid: '', source: '7788 问题卡', detail: qd(2, status)}]});
+    ctx.location.hash = '#need:need-0007';
+    run(src); await flush();
+    answer('/api/need/need-0007', 200, need('open')); await flush();
+    const pickIn = (name, v) => { const r = find(e => e.tagName === 'INPUT' && e.attrs.name === name && e.attrs.value === v);
+      r.checked = true; r.dispatch('change'); };
+    pickIn('i_demo-0001_Q1', 'opt:1');
+    const t2 = byId('i_demo-0001_Q2'); t2.value = '自由回答'; t2.dispatch('input');
+    out.inlineText = text(main);
+    button('提交回答', main).dispatch('click'); await flush();
+    out.sheetOpen = 'data-open' in byId('sheet').attrs;
+    out.postsBefore = posts().length;
+    const ok = button('确认提交', byId('sheet')); ok.dispatch('click'); ok.dispatch('click'); await flush();
+    out.busy = text(byId('inline_demo-0001'));
+    out.postsWhilePending = posts().length;
+    if (ARG.fail) {
+      answerAll('/api/q/demo-0001/submit', 409, {error: '问题或回答已被更新'});
+      await flush();
+      out.msg = run('inlineState["demo-0001"].msg && inlineState["demo-0001"].msg.text');
+      out.kept = run('inlineDraft["demo-0001"].checked.Q1');
+      out.formStill = !!byId('i_demo-0001_Q1');
+    } else {
+      answerAll('/api/q/demo-0001/submit', 200, {ok: true, answer_rev: 3});
+      await flush();
+      answer('/api/need/need-0007', 200, need('answered')); await flush();
+      out.readOnly = text(main);
+      out.noForm = !byId('i_demo-0001_Q1');
     }
-    // 补充 / 纠正
-    const nt = byId('nd_need-0007'); nt.value = '改成 TSV'; nt.dispatch('input');
-    button('回复', byId('need_need-0007')).dispatch('click'); await flush();
-    out.confirmLabel = text(byId('confirm_need-0007'));
-    byId('confirm_need-0007').dispatch('click'); byId('confirm_need-0007').dispatch('click'); await flush();
-    // 暂停开关
-    byId('pause_btn').dispatch('click'); await flush();
-    out.pauseBusy = text(byId('pause_btn'));
     out.posts = posts();
   } else if (scenario === 'approval') {
     ctx.location.hash = '#demo-0001';
@@ -1537,6 +1597,7 @@ const N = (id, over) => Object.assign({id, text: '<script>evil()</script> 第一
       needs_talk: [{id: 'need-0007', text: '<b>需求</b>', ws: 'demo', card_rev: 2, updated: 't'}]});
     await flush();
     out.groups = findAll(e => e.tagName === 'SECTION', side).map(s => [text(s.children[0]), findAll(e => e.tagName === 'A', s).map(a => a.attrs.href)]);
+    out.mainLinks = findAll(e => e.tagName === 'A', main).map(a => a.attrs.href);
   } else if (scenario === 'tasks-filter') {
     ctx.location.hash = '#tasks:need-0007';
     run(src); await flush();
@@ -1558,7 +1619,7 @@ const N = (id, over) => Object.assign({id, text: '<script>evil()</script> 第一
   for (const r of requests) if (!r.done) { r.done = true; r.resolve({status: 200, json: async () => (r.path === '/api/list' ? EMPTY : {})}); }
   await flush();
   process.stdout.write(JSON.stringify(out));
-})().catch(e => { console.error(e.stack); process.exit(2); });
+})().catch(e => { console.error('REQDUMP', JSON.stringify(requests.map(r => [r.path, !!r.done]))); console.error(e.stack); process.exit(2); });
 """
 
 
@@ -1572,35 +1633,26 @@ class RouterPageTest(unittest.TestCase):
     def run_page(self, scenario, arg=None):
         return base.PageScriptTest.run_page(self, scenario, json.dumps(arg or {}))
 
-    def test_needs_page_text_only_single_submit_note_and_pause(self):
-        out = self.run_page('needs')
-        self.assertEqual([m[0] for m in out['modes']], ['#needs', '#', '#tasks'])  # 需求 / 待我决定 / 任务
-        self.assertEqual([m[1][:2] for m in out['modes']], ['需求', '待我', '任务'])
-        self.assertEqual(out['view'], 'needs')
-        self.assertIn('<script>evil()</script> 第一行', out['text'])  # 文字，不是元素
-        self.assertIn('<img src=x onerror=alert(1)>', out['text'])
-        self.assertEqual((out['htmlSets'], out['scripts']), (0, 0))
-        self.assertNotIn('javascript:alert(1)', out['hrefs'])
-        self.assertIn('https://github.com/owner/repo/issues/30', out['hrefs'])
-        self.assertIn('#tasks:need-0007', out['hrefs'])  # 需求 → 对应任务
-        for s in ('讨论中 · 等你', '负责 lead：demo · pane w1:p1', '理解卡 v1（旧版）', '理解 v2 <i>x</i>', '验收草案 v2',
-                  'Owner · t2：<b>回复</b>', '分配理由：<b>理由</b>', '子 Issue 1/3 已关', '在做', '在线', '被拉起2 次', '最近一次投递', '1 条补充待 Router 处理'):
-            self.assertIn(s, out['text'])
+    def test_board_rail_create_dialog_and_pause(self):
+        out = self.run_page('board')
+        self.assertEqual(out['rail'], [['#', '待处理1'], ['#board', '需求']])
+        self.assertIn('演示需求 <b>x</b>', out['text'])
+        self.assertIn('理解卡 v2 等你确认', out['text'])
+        self.assertIn('完成', out['text'])
+        self.assertIn('#need:need-0007', out['hrefs'])
+        self.assertIn('online', out['cardCls'] + ' online')
+        self.assertIn('全局暂停', out['buttons'])
         self.assertEqual(out['postsPending'], 1)
         self.assertEqual(out['goPending'], {'disabled': True, 'text': '提交中…'})
         self.assertIn('已提交 need-0008', out['afterMsg'])
-        self.assertEqual(out['afterValue'], '')
         paths = [p['path'] for p in out['posts']]
-        self.assertEqual(paths, ['/api/need', '/api/need/need-0007/reply', '/api/need/need-0007/confirm', '/api/router/pause'])
-        self.assertEqual(out['confirmLabel'], '确认理解卡 v2')
-        self.assertEqual(out['posts'][2]['body']['card_rev'], 2)  # 绑定最新一张
+        self.assertEqual(paths, ['/api/need', '/api/router/pause'])
         self.assertEqual(out['posts'][0]['body']['text'], '加一个 CSV 导出')
         self.assertTrue(out['posts'][0]['body']['request_id'])
-        self.assertEqual(out['posts'][1]['body']['text'], '改成 TSV')
-        self.assertEqual(out['posts'][3]['body'], {'paused': True})
+        self.assertEqual(out['posts'][1]['body'], {'paused': True})
 
     def test_failed_submit_keeps_text_and_retries_with_same_request_id(self):
-        out = self.run_page('needs', {'fail': True})
+        out = self.run_page('board', {'fail': True})
         self.assertIn('服务端出错', out['afterMsg'])
         self.assertEqual(out['afterValue'], '加一个 CSV 导出')
         creates = [p['body'] for p in out['posts'] if p['path'] == '/api/need']
@@ -1608,26 +1660,63 @@ class RouterPageTest(unittest.TestCase):
         self.assertEqual(creates[0]['request_id'], creates[1]['request_id'])
 
     def test_router_cannot_start_is_red(self):
-        out = self.run_page('needs', {'router': {'gave_up': True, 'present': False, 'last_error': '1 小时内已拉起 3 次'}})
+        out = self.run_page('board', {'router': {'gave_up': True, 'present': False, 'last_error': '1 小时内已拉起 3 次'}})
         self.assertIn('bad', out['cardCls'])
         self.assertIn('Router 起不来', out['text'])
         self.assertIn('重新尝试拉起', out['buttons'])
 
     def test_pause_button_says_waiting_while_posting(self):
-        out = self.run_page('needs')
-        self.assertIn('暂停中…等当前动作做完', out['pauseBusy'])  # DS R2 Nit 2
+        out = self.run_page('board')
+        self.assertIn('暂停中…等当前动作做完', out['pauseBusy'])
 
     def test_reregister_button_when_router_absent(self):
-        out = self.run_page('needs', {'router': {'present': False, 'why': '登记的 Router 会话不在了'}})
+        out = self.run_page('board', {'router': {'present': False, 'why': '登记的 Router 会话不在了'}})
         self.assertIn('让 Router 重新登记', out['buttons'])
         self.assertIn('登记的 Router 会话不在了', out['text'])
-        out = self.run_page('needs')
-        self.assertNotIn('让 Router 重新登记', out['buttons'])  # 在线时不显示
+        out = self.run_page('board')
+        self.assertNotIn('让 Router 重新登记', out['buttons'])
+
+    def test_detail_shows_owner_body_and_hides_delivery_noise(self):
+        out = self.run_page('need-detail')
+        self.assertIn('OWNER_BODY_MARK：只在 7788 里聊', out['text'])
+        self.assertIn('负责 lead 不在，等待接手', out['text'])
+        self.assertFalse(out['noise'])
+        self.assertTrue(out['relative'])
+
+    def test_inline_question_uses_summary_and_versions(self):
+        out = self.run_page('need-inline')
+        self.assertIn('第一问', out['inlineText'])
+        self.assertIn('第二问', out['inlineText'])
+        self.assertTrue(out['sheetOpen'])
+        self.assertEqual(out['postsBefore'], 0)
+        self.assertEqual(out['postsWhilePending'], 1)
+        self.assertIn('提交中', out['busy'])
+        post = out['posts'][0]
+        self.assertEqual(post['path'], '/api/q/demo-0001/submit')
+        self.assertEqual(post['body']['content_rev'], 3)
+        self.assertEqual(post['body']['answer_rev'], 2)
+        self.assertEqual(post['body']['slots']['Q1']['choice'], 'B. 乙')
+        self.assertEqual(post['body']['slots']['Q2'], {'type': 'free', 'text': '自由回答'})
+        self.assertTrue(out['noForm'])
+        self.assertIn('已提交 Rev 1', out['readOnly'])
+
+    def test_inline_question_409_keeps_input(self):
+        out = self.run_page('need-inline', {'fail': True})
+        self.assertIn('版本冲突', out['msg'])
+        self.assertEqual(out['kept'], 'opt:1')
+        self.assertTrue(out['formStill'])
+        self.assertEqual(len(out['posts']), 1)
+
+    def test_old_needs_addresses_redirect(self):
+        out = self.run_page('old-needs')
+        self.assertEqual((out['mode'], out['needId']), ('board', ''))
+        self.assertEqual((out['mode2'], out['needId2']), ('need', 'need-0007'))
+        self.assertIn('T', out['detail'])
 
     def test_approval_page(self):
         out = self.run_page('approval')
-        self.assertEqual(out['radios'], ['opt:0', 'opt:1', 'opt:2'])  # 只有三个固定选项，没有「按建议」和「其他回答」
-        self.assertEqual(out['checked'], 0)  # 不预选
+        self.assertEqual(out['radios'], ['opt:0', 'opt:1', 'opt:2'])
+        self.assertEqual(out['checked'], 0)
         self.assertNotIn('其余按建议', out['buttons'])
         self.assertNotIn('其余按建议', out['text'])
         self.assertIn('审批', out['text'])
@@ -1637,10 +1726,9 @@ class RouterPageTest(unittest.TestCase):
         self.assertIn('C. 需要先改', out['msgCEmpty'])
         self.assertEqual(len(out['posts']), 1)
         self.assertEqual(out['posts'][0]['body']['slots'], {'Q1': {'type': 'option', 'choice': 'C. 需要先改', 'text': '先补测试'}})
-        self.assertEqual(out['groups'][0], ['需求讨论1 条', ['#needs:need-0007']])  # 需求讨论最前
-        self.assertEqual(out['groups'][1][0], '审批1 题')  # 审批一栏排在问题前面
-        self.assertEqual(out['groups'][1][1], ['#demo-0002'])
-        self.assertEqual([g[1] for g in out['groups'][2:]], [['#demo-0001'], ['#demo-0003']])
+        self.assertIn('#need:need-0007', out['mainLinks'])
+        for href in ('#demo-0001', '#demo-0002', '#demo-0003'):
+            self.assertIn(href, out['mainLinks'])
 
     def test_tasks_filter_by_need(self):
         out = self.run_page('tasks-filter')
