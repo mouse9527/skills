@@ -71,12 +71,15 @@ Q="python3 $HOME/.claude/skills/question-inbox/q.py"   # 和 skill question-inbo
 ## 5. 看门狗
 
 - lead 是 blocked：`agent read` 看它在等什么；属于 Owner 决定的事，提醒它走 `q ask`（审批走 `q ask --kind approval`），不替它答。
-- lead 不在了、但它负责的需求**还没 filed / dropped**：`$Q router lead <ws>` 重新起，
-  再 `herdr --session router agent prompt lead-<ws> "读 <lead 目录>/dispatch/<id>.md 并照做。"`；新 lead 用 `need claim --takeover` 接手
-  （只有原负责 lead **确认**不在时才行；查不清会被拒，稍后再试）。
+- lead 不在了、但它负责的需求**还没 filed / dropped**（assigned 已 claim / discussing / confirmed）且有待投递的消息：
+  服务把消息记成暂缓、看板标「卡住 · 没人管」，负责 lead **确认不在**时**自动**给你发 `[question-inbox] … 负责 lead 确认不在`
+  （同一需求 30 分钟内只发一次；全局暂停时不发、只记录；查不清时不发）。收到后同样执行 `$Q router takeover <id>`
+  （页面上的「请 Router 安排接手」只是手动重试，效果相同）
+  （新 lead `need claim --takeover` 后读 `need inbox`，再按 workspace §3 继续讨论 / 立项）。
+  只是 assigned、还没人 claim 的，照旧 `$Q router dispatch <id>`。
 - lead 不在了、需求**已经 filed**、但还有没投出去的消息或 open 的派工 Issue：收到 `[question-inbox] … 负责 lead 确认不在` 时执行
   `$Q router takeover <id>`：它只会在原 lead **确认不在**时才动作，确保 `lead-<ws>` 在，写 `dispatch/<id>-takeover.md`，
-  prompt 新 lead `need claim <id> --takeover` → `need inbox <id>`（读漏掉的 Issue 评论，读完 `--ack`）→ 继续推进。
+  prompt 新 lead `need claim <id> --takeover` → `need inbox <id>`（读漏掉的 7788 消息和 Issue 评论，读完照口令 `--ack`）→ 继续推进。
   查不清 / 原 lead 还在就拒绝，不要绕过。已立项需求不会退回 held，旧审批也不自动迁移：没定的事由新 lead 重新发题。
 - 每个 ws 每小时最多重启 2 次，超过就出一题给 Owner。
 

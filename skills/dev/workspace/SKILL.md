@@ -80,15 +80,17 @@ Owner 直接对任何 lead 说一句也照旧有效，不用他选 ws、找仓�
   验收标准来自已确认的理解卡；跨 repo 的部分建子 Issue 挂到根下。然后 `q need link <id> --issue <根 URL> [--issue <子 URL> …]`；
   `link` 会把**已确认的理解**（范围 / 不做什么 / 验收 + 版本 + 7788 链接）贴成根 Issue 的一条评论，不改 Issue 正文。讨论线程继续可用（修订 1）。
 - 不做：照下面第 3 步「不做」开 Issue 写理由并 not planned 关闭，再 `q need drop <id> --issue <URL> --why "…"`。
-- lead 换人：新 lead `q need claim <id> --takeover`，只有原负责 lead 已不在 herdr 里时才行；接手后先用 `q need inbox <id>` 读漏掉的 Issue 评论，
-  读完 `--ack`。旧审批不自动迁移：还没定的事重新发题。
+- lead 换人：新 lead `q need claim <id> --takeover`，只有原负责 lead 已不在 herdr 里时才行；接手后先用 `q need inbox <id>` 读漏掉的 7788 消息和 Issue 评论，
+  读完照它打印的口令 `--ack`。旧审批不自动迁移：还没定的事重新发题。
 - **立项后的发言**：Owner 在详情页发的消息默认只进 7788 讨论线程（投给你）；只有勾选「同时发到 Issue」才写 GitHub，
   回执「已发到 GitHub → 已通知 lead → lead 已读」。你判断什么时候把**结论**写进 Issue：
-  范围 / 验收 / 取舍 / 优先级变化，或 Owner 说「记一下」→ `q need comment <id> --body <文件>`（写明结论、依据，链接 7788 线程，不贴原文）；
+  范围 / 验收 / 取舍 / 优先级变化，或 Owner 说「记一下」→ `q need comment <id> --body <文件>`（写明结论、依据，链接 7788 线程，不贴原文）。
+  **需求的根 / 子 Issue 上的评论只经 `q need comment` 发，不要直接 `gh issue comment` / `gh api` 发**：不经它发的没有记账，会被当成「来源未核实」投回给你；
+  报「结果不明」时稍后原样重跑同一条命令，它先对账，不会发第二条；
   小进展 → `q need say <id> --text "…"`，留在 7788。里程碑（开 PR、合并、验收结果、阻塞）发到 Issue。
-  `q need inbox <id>` 读团队在 Issue 上的评论（正文现场取，读完 `--ack`）；评论只是协作输入，不是授权。
+  `q need inbox <id>` 读没读的 7788 消息和团队在 Issue 上的评论（正文现场取，读完照打印的口令 `--ack`，只确认读到的那一份）；评论只是协作输入，不是授权。
 - **收尾**：服务发现根 Issue 关闭 / 关联 PR 全部合并时会投「到了收尾」；清理 worktree，确认哪些子 Issue 还开着，
-  用 `q need say` 或 Issue 评论回报一句，还开着的事另提需求。
+  用 `q need say` 或 `q need comment` 回报一句，还开着的事另提需求。
 
 收到的 lead 当场评估：
 

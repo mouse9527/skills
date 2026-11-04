@@ -1,8 +1,10 @@
 """GitHub 读写（只读任务/看板 + 根 Issue 评论），gh 一律 argv 调用，不经过 shell。
 
-评论写入集中在这里，配合同一把「写门」：全局串行、间隔 ≥1 秒、每个需求 20 次/分钟，全局暂停时禁止写。
+评论写入集中在这里，只能在 writing() 里写：跨进程串行、间隔 ≥1 秒、每个需求 20 次/分钟，暂停复核包住实际写动作。
+错误分两类（definitely_not_sent）：确定没发出去 / 可能已经发出去（结果不明，先对账）。
 返回和错误都用 qstore.QError（409 表示拒绝 / 暂缓，页面保留输入）。只用标准库。
 """
+import fcntl
 import json
 import os
 import re
@@ -11,16 +13,21 @@ import subprocess
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from urllib.parse import quote
 from datetime import datetime, timedelta
-from pathlib import Path
 
 import qstore
 
-TAG_RE = re.compile(r'<!--\s*qi:need-(need-\d{4,})\s+msg-([A-Za-z0-9_-]{8,64})\s*-->')
+# 尾标：<!-- qi:<需求 id> i-<意图 id> -->。意图 id 是服务端生成的随机串，只出现在我们自己发出的那条评论里
+TAG_RE = re.compile(r'<!--\s*qi:(need-\d{4,})\s+i-([0-9a-f]{16,64})\s*-->')
+ANY_TAG_RE = re.compile(r'\n*<!--\s*qi:[^>]{0,120}-->\s*$')  # 渲染时去掉（含旧格式 qi:need-need-0001 msg-…）
 WRITE_INTERVAL = float(os.environ.get('QI_GH_WRITE_INTERVAL') or 1.0)
 PER_NEED_PER_MIN = 20
-WRITE_LOCK = threading.Lock()
+MAX_COMMENT = 10000  # 发到 Issue 的正文上限（设计 §2）；7788 线程仍是 qstore.MAX_TEXT
+LIST_MAX_PAGES = 50  # 一轮按 repo 最多读这么多页；没读完就只把水位推进到读到的最后一条
+ISSUE_MAX_PAGES = 200
+TREE_MAX_NODES = 300
 
 
 def gh_bin():
@@ -110,13 +117,19 @@ def remaining():
 
 # ---------- 评论 ----------
 
-def list_comments(repo, since=None, per_page=100, max_pages=50, include_headers=True):
-    """按 updated_at 升序返回某个 repo 的 Issue 评论（含 PR 评论，页面按 Issue 号过滤）。翻完所有页。"""
+def _check_repo(repo):
     if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repo or ''):
         raise GHError(400, f'repo 不合法：{repo!r}', 'bad_repo')
+
+
+def list_comments(repo, since=None, per_page=100, max_pages=None, include_headers=True):
+    """某个 repo 的 Issue 评论（含 PR 评论，调用方按 Issue 号过滤），按 updated_at 升序。
+    返回 (评论列表, 是否读完)。没读完（到了页数上限）时调用方只能把水位推进到读到的最后一条，不能当成扫完。"""
+    _check_repo(repo)
+    max_pages = max_pages or LIST_MAX_PAGES
     page, out = 1, []
     while page <= max_pages:
-        q = f'repos/{repo}/issues/comments?per_page={per_page}&page={page}'
+        q = f'repos/{repo}/issues/comments?sort=updated&direction=asc&per_page={per_page}&page={page}'
         if since:
             q += f'&since={quote(since)}'
         argv = [gh_bin(), 'api', *( ['--include'] if include_headers else []), q]
@@ -125,15 +138,15 @@ def list_comments(repo, since=None, per_page=100, max_pages=50, include_headers=
             raise GHError(409, f'{repo} 评论返回的不是列表', 'json')
         out += [c for c in data if isinstance(c, dict) and isinstance(c.get('id'), int)]
         if len(data) < per_page:
-            break
+            return out, True
         page += 1
-    return out
+    return out, False
 
 
-def issue_comments(repo, number, per_page=100, max_pages=20):
-    """某个 Issue（或 PR）的全部评论，正文现场读，不落盘。"""
-    if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repo or ''):
-        raise GHError(400, f'repo 不合法：{repo!r}', 'bad_repo')
+def issue_comments(repo, number, per_page=100, max_pages=None):
+    """某个 Issue（或 PR）的全部评论，正文现场读，不落盘。读不完（超过页数上限）抛 GHError(truncated)，不返回半截。"""
+    _check_repo(repo)
+    max_pages = max_pages or ISSUE_MAX_PAGES
     page, out = 1, []
     while page <= max_pages:
         argv = [gh_bin(), 'api', f'repos/{repo}/issues/{int(number)}/comments?per_page={per_page}&page={page}']
@@ -142,19 +155,42 @@ def issue_comments(repo, number, per_page=100, max_pages=20):
             raise GHError(409, '评论返回的不是列表', 'json')
         out += [c for c in data if isinstance(c, dict) and isinstance(c.get('id'), int)]
         if len(data) < per_page:
-            break
+            return out
         page += 1
-    return out
+    raise GHError(409, f'{repo}#{number} 的评论超过 {max_pages * per_page} 条，没有读完', 'truncated')
 
 
-def create_comment(repo, number, body, tag=''):
-    """在 Issue（或 PR）上发一条评论；正文走临时文件 + -F body=@，argv 调用。
-    tag 是尾部隐藏关联标记，只用于服务端对账，不作为身份依据。"""
-    if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repo or ''):
-        raise GHError(400, f'repo 不合法：{repo!r}', 'bad_repo')
-    text = body.rstrip('\n')
-    if tag:
-        text += f'\n\n{tag}'
+def get_comment(repo, comment_id):
+    """按 id 读一条评论（不受分页影响）；不存在抛 GHError(404)。"""
+    _check_repo(repo)
+    res = _run([gh_bin(), 'api', f'repos/{repo}/issues/comments/{int(comment_id)}'])
+    data = _json(res, f'读取评论 {comment_id}')
+    if not isinstance(data, dict) or not isinstance(data.get('id'), int):
+        raise GHError(404, f'{repo} 上找不到评论 {comment_id}', 'not_found', 404)
+    return data
+
+
+def norm_body(text):
+    return (text or '').replace('\r\n', '\n').rstrip()
+
+
+def tag(nid, tag_id):
+    return f'<!-- qi:{nid} i-{tag_id} -->'
+
+
+def posted_text(body, tag_text):
+    return body.rstrip('\n') + (f'\n\n{tag_text}' if tag_text else '')
+
+
+def strip_tag(text):
+    return ANY_TAG_RE.sub('', text or '')
+
+
+def create_comment(repo, number, body, tag_text=''):
+    """在 Issue（或 PR）上发一条评论；正文走临时文件 + -F body=@，argv 调用。只在 writing() 里调用。
+    tag_text 是尾部隐藏关联标记，只用于对账，单独不作为身份依据。"""
+    _check_repo(repo)
+    text = posted_text(body, tag_text)
     fd, path = tempfile.mkstemp(prefix='qi-comment-', suffix='.md')
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
@@ -168,18 +204,49 @@ def create_comment(repo, number, body, tag=''):
             pass
     if not isinstance(data, dict) or not isinstance(data.get('id'), int):
         raise GHError(409, '发评论成功但没拿到评论 id，结果不明', 'uncertain')
+    login = ((data.get('user') or {}).get('login') or '').lower()
+    if login:
+        _note_poster(login)
     return data
 
 
-def find_tagged(repo, number, tag):
-    """对账：在 Issue 评论里找尾标，找到返回评论对象，找不到 None。"""
-    for c in issue_comments(repo, number):
-        if tag and tag in (c.get('body') or ''):
-            return c
-    return None
+def definitely_not_sent(e):
+    """True：这次写**确定没发出去**（写门拒绝、gh 起不来、参数不合法、GitHub 明确的 4xx 拒绝）。
+    False：可能已经发出去（超时、5xx、回包丢失 / 解析不了、没有状态码的失败）→ 结果不明，先对账。"""
+    if e.kind in ('paused', 'rate_need', 'exec', 'bad_repo', 'too_long'):
+        return True
+    return 400 <= (e.status or 0) < 500 and e.status != 408
 
 
-# ---------- 写门（qstore 里的需求记录 + state 目录里的全局时间） ----------
+def trusted_authors():
+    """对账时认可的发布账号：配置的 Owner 登录名 + 我们发评论时 GitHub 回包里的账号。"""
+    out = {a for a in (qstore.owner_login(), _read_write_state().get('poster') or '') if a}
+    return {a.lower() for a in out}
+
+
+def matches_intent(comment, nid, intent):
+    """一条评论是不是某个发送意图发出去的那条：完整尾标（含随机意图 id）+ 发布正文哈希 + 可信作者，三项都对上才算。"""
+    body = comment.get('body') or ''
+    tid = intent.get('tag_id') or ''
+    if not tid or tag(nid, tid) not in body:
+        return False
+    if intent.get('posted_hash') and qstore._hash(norm_body(body)) != intent['posted_hash']:
+        return False
+    author = ((comment.get('user') or {}).get('login') or '').lower()
+    trusted = trusted_authors()
+    return not trusted or author in trusted
+
+
+def find_intent(repo, number, nid, intent):
+    """对账：到目标 Issue 上找这个意图发出去的评论。返回 (评论或 None, 是否完整读过)。"""
+    try:
+        items = issue_comments(repo, number)
+    except GHError:
+        return None, False
+    return next((c for c in items if matches_intent(c, nid, intent)), None), True
+
+
+# ---------- 写门：跨进程串行（state/gh-write.lock）、间隔 ≥1 秒、每个需求 20 次/分钟、暂停复核包住实际写动作 ----------
 
 def _write_state():
     return qstore.state_dir() / 'gh-write.json'
@@ -196,77 +263,115 @@ def _read_write_state():
 def _save_write_state(data):
     d = qstore.state_dir()
     d.mkdir(parents=True, exist_ok=True)
-    tmp = d / f'.gh-write-{os.getpid()}.tmp'
+    tmp = d / f'.gh-write-{os.getpid()}-{threading.get_ident()}.tmp'
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1) + '\n', encoding='utf-8')
     os.replace(tmp, _write_state())
 
 
-def write_gate(nid):
-    """发评论前的门：暂停、串行、全局间隔 ≥1 秒、每个需求 20 次/分钟。不通过抛 GHError(409)。
-    通过后先记账（占掉这一格），发送失败也不会退格，避免重试风暴。"""
-    if qstore.paused():
-        raise GHError(409, '全局暂停中：只读，不发评论', 'paused')
-    with WRITE_LOCK:
-        st = _read_write_state()
-        now = datetime.now(qstore.TZ)
-        last = qstore.parse_time(st.get('last_at'))
-        if last:
-            wait = WRITE_INTERVAL - (now - last).total_seconds()
-            if wait > 0:
-                time.sleep(min(wait, WRITE_INTERVAL))
-                now = datetime.now(qstore.TZ)
-        per = st.get('needs') if isinstance(st.get('needs'), dict) else {}
-        recent = [t for t in per.get(nid) or []
-                  if (qstore.parse_time(t) or now) > now - timedelta(minutes=1)]
-        if len(recent) >= PER_NEED_PER_MIN:
-            raise GHError(429, f'{nid} 一分钟内已经发了 {len(recent)} 条评论，暂停一下再发', 'rate_need')
-        per[nid] = (recent + [now.isoformat(timespec='seconds')])[-PER_NEED_PER_MIN:]
-        st.update({'last_at': now.isoformat(timespec='seconds'), 'needs': per})
+def _note_poster(login):
+    """调用方已持写锁。"""
+    st = _read_write_state()
+    if st.get('poster') != login:
+        st['poster'] = login
         _save_write_state(st)
 
 
-# ---------- 看板：定向读一个需求的根 Issue 树 ----------
+@contextmanager
+def _write_lock():
+    d = qstore.state_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    with open(d / 'gh-write.lock', 'a') as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
 
-TREE_QUERY = '''query($owner:String!,$name:String!,$number:Int!){
- repository(owner:$owner,name:$name){
-  issue(number:$number){
-   number title url state stateReason closedAt createdAt updatedAt body
-   labels(first:30){nodes{name}}
-   subIssues(first:50){nodes{number title url state stateReason closedAt updatedAt body
-     labels(first:30){nodes{name}}}}
-   timelineItems(itemTypes:[CROSS_REFERENCED_EVENT],last:50){nodes{
-     ...on CrossReferencedEvent{source{...on PullRequest{number title url state isDraft mergedAt updatedAt
-       reviewDecision statusCheckRollup{state} additions deletions repository{nameWithOwner}}}}}}
-   closedByPullRequestsReferences(first:20,includeClosedPrs:true){nodes{number title url state isDraft mergedAt
-     updatedAt reviewDecision statusCheckRollup{state} repository{nameWithOwner}}}
-  }
- }
-}'''
+
+@contextmanager
+def writing(nid):
+    """发评论的门，用法：`with ghapi.writing(nid): ghapi.create_comment(...)`。
+    1) 跨进程独占锁（服务和 CLI 共用 state/gh-write.lock），整个写动作串行；
+    2) 距上一次写不到间隔就等；3) 每个需求 1 分钟最多 PER_NEED_PER_MIN 次（先占格，失败不退格，避免重试风暴）；
+    4) 持 control.lock 共享锁**现查暂停**再写：set_paused 持独占锁，所以暂停提交之后不会再有新的写，正在写的那一次做完它才生效。
+    不通过抛 GHError(409)，这时**确定没发**。"""
+    if qstore.paused():
+        raise GHError(409, '全局暂停中：只读，不发评论', 'paused')
+    with _write_lock():
+        st = _read_write_state()
+        last = qstore.parse_time(st.get('last_at'))
+        if last:
+            wait = WRITE_INTERVAL - (datetime.now(qstore.TZ) - last).total_seconds()
+            if wait > 0:
+                time.sleep(min(wait, WRITE_INTERVAL))
+        now = datetime.now(qstore.TZ)
+        per = st.get('needs') if isinstance(st.get('needs'), dict) else {}
+        recent = [t for t in per.get(nid) or [] if (qstore.parse_time(t) or now) > now - timedelta(minutes=1)]
+        if len(recent) >= PER_NEED_PER_MIN:
+            raise GHError(429, f'{nid} 一分钟内已经发了 {len(recent)} 条评论，暂停一下再发', 'rate_need')
+        with qstore._control_lock(fcntl.LOCK_SH):
+            if qstore.paused():
+                raise GHError(409, '全局暂停中：只读，不发评论', 'paused')
+            per[nid] = (recent + [now.isoformat(timespec='microseconds')])[-PER_NEED_PER_MIN:]
+            st.update({'last_at': now.isoformat(timespec='microseconds'), 'needs': per})
+            _save_write_state(st)
+            yield
+
+
+def write_gate(nid):
+    """只过门、不写（测试和旧调用用）；真正写评论要用 writing()。"""
+    with writing(nid):
+        pass
+
+
+# ---------- 看板：从根 Issue 出发定向读整棵树 ----------
+
+NODE_FIELDS = ('number title url state stateReason closedAt createdAt updatedAt body repository{nameWithOwner} '
+               'labels(first:30){nodes{name}}')
+PR_FIELDS = ('number title url state isDraft mergedAt updatedAt reviewDecision statusCheckRollup{state} '
+             'additions deletions repository{nameWithOwner}')
+TREE_QUERY = ('query($owner:String!,$name:String!,$number:Int!,$after:String){\n'
+              ' repository(owner:$owner,name:$name){\n'
+              '  issue(number:$number){\n'
+              f'   {NODE_FIELDS}\n'
+              '   subIssues(first:100,after:$after){pageInfo{hasNextPage endCursor} nodes{number repository{nameWithOwner}}}\n'
+              '   timelineItems(itemTypes:[CROSS_REFERENCED_EVENT],first:100){pageInfo{hasNextPage}\n'
+              f'     nodes{{...on CrossReferencedEvent{{source{{...on PullRequest{{{PR_FIELDS}}}}}}}}}}}\n'
+              f'   closedByPullRequestsReferences(first:50,includeClosedPrs:true){{pageInfo{{hasNextPage}} nodes{{{PR_FIELDS}}}}}\n'
+              '  }\n }\n}')
+
+
+def _issue_node(repo, number, after=''):
+    owner, name = repo.split('/', 1)
+    argv = [gh_bin(), 'api', 'graphql', '-f', f'query={TREE_QUERY}', '-f', f'owner={owner}', '-f', f'name={name}',
+            '-F', f'number={int(number)}']
+    if after:
+        argv += ['-f', f'after={after}']
+    data = _json(_run(argv), f'读取 {repo}#{number}')
+    node = (((data.get('data') or {}).get('repository') or {}).get('issue')) if isinstance(data, dict) else None
+    if not node:
+        raise GHError(409, f'gh 找不到 {repo}#{number}', 'not_found')
+    return node
 
 
 def issue_tree(url):
-    """定向读根 Issue（不依赖「最近 100 个 open」）：根 + 子 Issue + 交叉引用 PR + 原生关联 PR。
-    返回 {'root': {...}, 'subs': [...], 'prs': [...]}；查不到抛 GHError(409)。"""
+    """定向读根 Issue（不依赖「最近 100 个 open」）：根 + **所有层级**的子 Issue（翻页）+ 每个 Issue 的交叉引用 PR 和原生关联 PR。
+    子 Issue 保留自己的仓库。返回 {'root', 'subs': [...带 depth / parent], 'prs': [...带 issue], 'truncated': [说明]}；
+    根查不到抛 GHError(409)；子 Issue 查不到不中断，记进 truncated。"""
     m = qstore.ISSUE_URL_RE.match(url or '')
     if not m:
         raise GHError(400, f'Issue 必须是完整 URL：{url!r}', 'bad_url')
-    owner, name, number = m.group(1), m.group(2), int(m.group(3))
-    argv = [gh_bin(), 'api', 'graphql', '-f', f'query={TREE_QUERY}', '-f', f'owner={owner}', '-f', f'name={name}',
-            '-F', f'number={number}']
-    data = _json(_run(argv), f'读取 {owner}/{name}#{number}')
-    repo = (data.get('data') or {}).get('repository') if isinstance(data, dict) else None
-    node = (repo or {}).get('issue')
-    if not node:
-        raise GHError(409, f'gh 找不到 {url}', 'not_found')
-    prs, seen = [], set()
+    root_repo, number = f'{m.group(1)}/{m.group(2)}', int(m.group(3))
+    prs, seen_pr, subs, truncated = [], set(), [], []
 
-    def add_pr(pr):
+    def add_pr(pr, at):
         if not isinstance(pr, dict) or not isinstance(pr.get('number'), int):
             return
-        key = (((pr.get('repository') or {}).get('nameWithOwner') or f'{owner}/{name}').lower(), pr['number'])
-        if key in seen:
+        full = (pr.get('repository') or {}).get('nameWithOwner') or at[0]
+        key = (full.lower(), pr['number'])
+        if key in seen_pr:
             return
-        seen.add(key)
+        seen_pr.add(key)
         prs.append({'number': pr['number'], 'title': pr.get('title') or '',
                     'url': pr.get('url') if str(pr.get('url') or '').startswith('https://github.com/') else '',
                     'state': pr.get('state') or '', 'draft': bool(pr.get('isDraft')),
@@ -275,17 +380,57 @@ def issue_tree(url):
                     'review': pr.get('reviewDecision') or '',
                     'checks': ((pr.get('statusCheckRollup') or {}).get('state') or ''),
                     'additions': pr.get('additions') or 0, 'deletions': pr.get('deletions') or 0,
-                    'repo': key[0], 'full': (pr.get('repository') or {}).get('nameWithOwner') or f'{owner}/{name}'})
+                    'repo': key[0], 'full': full, 'issue': f'{at[0]}#{at[1]}'})
 
-    for ev in ((node.get('timelineItems') or {}).get('nodes') or []):
-        add_pr((ev or {}).get('source'))
-    for pr in ((node.get('closedByPullRequestsReferences') or {}).get('nodes') or []):
-        add_pr(pr)
-    subs = [n for n in ((node.get('subIssues') or {}).get('nodes') or []) if n and n.get('number')]
-    return {'root': _issue(node, f'{owner}/{name}'), 'subs': [_issue(n, f'{owner}/{name}') for n in subs], 'prs': prs}
+    def read(repo, num):
+        node = _issue_node(repo, num)
+        kids = list(((node.get('subIssues') or {}).get('nodes') or []))
+        page = (node.get('subIssues') or {}).get('pageInfo') or {}
+        while page.get('hasNextPage') and page.get('endCursor'):
+            more = _issue_node(repo, num, page['endCursor']).get('subIssues') or {}
+            kids += more.get('nodes') or []
+            page = more.get('pageInfo') or {}
+        tl = node.get('timelineItems') or {}
+        for ev in tl.get('nodes') or []:
+            add_pr((ev or {}).get('source'), (repo, num))
+        cb = node.get('closedByPullRequestsReferences') or {}
+        for pr in cb.get('nodes') or []:
+            add_pr(pr, (repo, num))
+        if (tl.get('pageInfo') or {}).get('hasNextPage') or (cb.get('pageInfo') or {}).get('hasNextPage'):
+            truncated.append(f'{repo}#{num} 关联的 PR 超过 100 个，只读了前 100 个')
+        return node, kids
+
+    node, kids = read(root_repo, number)
+    root = _issue(node, root_repo)
+    queue = [(k, root_repo, number, 1) for k in kids]
+    seen = {(root['repo'], root['number'])}
+    while queue:
+        k, prepo, pnum, depth = queue.pop(0)
+        repo = ((k or {}).get('repository') or {}).get('nameWithOwner') or prepo
+        num = (k or {}).get('number')
+        if not isinstance(num, int) or (repo.lower(), num) in seen:
+            continue
+        if len(seen) >= TREE_MAX_NODES:
+            truncated.append(f'子 Issue 超过 {TREE_MAX_NODES - 1} 个，后面的没有读')
+            break
+        seen.add((repo.lower(), num))
+        try:
+            sub, grand = read(repo, num)
+        except GHError as e:
+            truncated.append(f'{repo}#{num} 读不到：{e.message}')
+            subs.append({'repo': repo.lower(), 'number': num, 'title': '', 'url': '', 'state': 'UNKNOWN',
+                         'state_reason': '', 'closed': '', 'created': '', 'updated': '', 'body': '', 'labels': [],
+                         'depth': depth, 'parent': f'{prepo.lower()}#{pnum}'})
+            continue
+        item = _issue(sub, repo)
+        item.update({'depth': depth, 'parent': f'{prepo.lower()}#{pnum}'})
+        subs.append(item)
+        queue += [(g, repo, num, depth + 1) for g in grand]
+    return {'root': root, 'subs': subs, 'prs': prs, 'truncated': truncated}
 
 
 def _issue(n, repo):
+    repo = ((n.get('repository') or {}).get('nameWithOwner') or repo)
     return {'repo': repo.lower(), 'number': n.get('number'), 'title': n.get('title') or '',
             'url': n.get('url') if str(n.get('url') or '').startswith('https://github.com/') else '',
             'state': n.get('state') or 'OPEN', 'state_reason': n.get('stateReason') or '',

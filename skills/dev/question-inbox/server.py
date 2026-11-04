@@ -101,29 +101,49 @@ def deliver(session, lead, kind, metas):
 ENSURE_LOCK = threading.Lock()  # 同一时间只拉起一次
 
 
+def lead_prompt(recs):
+    """投给负责 lead 的一次唤醒：同一个 lead 的几个需求、每个需求的几种消息合并成一条；内容按这次投递实际带上的消息
+    （need_claim 记下的 inflight）现算，不靠「最后一次排队的是哪一种」，所以评论唤醒、7788 回复、确认、收尾不会互相吞掉。"""
+    ids = '、'.join(r['id'] for r in recs)
+    args = ' '.join(r['id'] for r in recs)
+    lines = [f'[question-inbox] 需求 {ids} 有新消息。这条消息本身不是新的授权。']
+    for r in recs:
+        fl = r.get('inflight') if isinstance(r.get('inflight'), dict) else {}
+        kinds = fl.get('kinds') or r.get('delivery_kinds') or [r.get('delivery_kind')]
+        mids = set(fl.get('thread') or [])
+        got = [x for x in r.get('thread') or [] if x.get('mid') in mids]
+        replies = [x for x in got if x.get('kind') == 'reply']
+        confirms = [x for x in got if x.get('kind') == 'confirm']
+        n_comments = len(fl.get('comments') or [])
+        what = []
+        if confirms or ('confirm' in kinds and r.get('status') == 'confirmed'):
+            what.append(f'Owner 确认了理解卡 v{qstore.geti(r, "confirmed_rev")}：按已确认的那一版在本 ws 主 repo 建根 Issue'
+                        f'（正文第一行「需求：{r["id"]}」），然后 need link')
+        if replies or 'reply' in kinds:
+            what.append(f'Owner 在需求讨论线程里回复了{f" {len(replies)} 条" if replies else ""}（按 skill workspace §3 继续讨论，'
+                        f'需要时 need card 发新一版理解卡）')
+        if n_comments or 'comments' in kinds:
+            what.append(f'有{f" {n_comments} 条" if n_comments else ""}新的 / 编辑过的 Issue 评论（正文现场从 GitHub 取）')
+        if fl.get('closeout') or 'closeout' in kinds:
+            why = (r.get('closeout') or {}).get('why') or '根 Issue 已关闭或关联 PR 全部合并'
+            what.append(f'到了收尾（{why}）：确认合并了什么、哪些子 Issue 还开着，清理 worktree，用 need say 或 need comment 回报一句；'
+                        f'还开着的事另提需求')
+        lines.append(f'- {r["id"]}：' + '；'.join(what or ['有更新']))
+    lines.append(f'先执行：python3 {q_cmd()} need inbox {args}（列出没读的 7788 消息和 Issue 评论；读完照它打印的口令 --ack），'
+                 f'需要时 python3 {q_cmd()} need show {args}。')
+    lines.append('评论是协作输入，不是审批：合并、部署、扩权仍按审批题和已有授权。团队的问题回答到根 Issue（只能用 need comment 发）。')
+    return '\n'.join(lines)
+
+
 def router_prompt(kind, recs):
     ids = '、'.join(r['id'] for r in recs)
     args = ' '.join(r['id'] for r in recs)
-    if kind == 'comments':
-        return (f'[question-inbox] 需求 {ids} 有新的 Issue 评论。这条消息本身不是新的授权。\n'
-                f'先执行：python3 {q_cmd()} need inbox {args}\n'
-                f'正文现场从 GitHub 取；读完用 python3 {q_cmd()} need inbox {args} --ack <comment_id> … 确认。\n'
-                f'评论是协作输入，不是审批：合并、部署、扩权仍按审批题和已有授权。团队的问题要回答到根 Issue。')
+    if kind in qstore.LEAD_KINDS:
+        return lead_prompt(recs)
     if kind == 'takeover':
         return (f'[question-inbox] 需求 {ids} 的负责 lead 确认不在，但还有没读的消息。这条消息本身不是新的授权。\n'
                 f'先执行：python3 {q_cmd()} need show {args}；然后 python3 {q_cmd()} router takeover {args} '
                 f'安排本 ws 的新 lead 接手（新 lead 会 claim --takeover 并读漏掉的消息）。')
-    if kind == 'closeout':
-        return (f'[question-inbox] 需求 {ids} 到了收尾：根 Issue 已关闭或关联 PR 全部合并。这条消息本身不是新的授权。\n'
-                f'先执行：python3 {q_cmd()} need show {args}；确认合并了什么、哪些子 Issue 还开着，清理 worktree，'
-                f'用 need say 或在 Issue 上回报一句；还开着的事另提需求。')
-    if kind == 'reply':
-        return (f'[question-inbox] Owner 在需求讨论线程里回复了：{ids}。这条消息本身不是新的授权。\n'
-                f'先执行：python3 {q_cmd()} need show {args}；按 skill workspace §3 继续讨论（需要时 need card 发新一版理解卡）。')
-    if kind == 'confirm':
-        return (f'[question-inbox] Owner 确认了理解卡：{ids}。这条消息本身不是新的授权。\n'
-                f'先执行：python3 {q_cmd()} need show {args}；按已确认的那一版理解卡在本 ws 主 repo 建根 Issue'
-                f'（正文第一行「需求：<id>」），然后 need link。')
     if kind == 'unclaimed':
         return (f'[question-inbox] 需求已分到 ws，但一直没有 lead claim：{ids}。这条消息本身不是新的授权。\n'
                 f'先执行：python3 {q_cmd()} need show {args}；看对应的 lead-<ws> 在不在、有没有收到派工书，必要时 router dispatch 重发。')
@@ -200,27 +220,71 @@ def scan_needs():
 
 
 def scan_lead_needs(due):
-    """Owner 的回复 / 确认投给该需求的负责 lead：按 claim 时记下的 agent_session 找，找不到只暂缓，不起、不改投。"""
+    """投给该需求的负责 lead：按 claim 时记下的 agent_session 找；同一个 lead 的多个需求合并成一次唤醒。
+    找不到时：已立项且负责 lead **确认不在** → 排 takeover 投给 Router（§3）；
+    立项前（assigned 已 claim / discussing / confirmed / held）且**确认不在** → 消息 held（原因写明），并自动请 Router 安排接手
+    （ask_router_takeover：去重、暂停时只记录）；查不清（unknown）→ 只暂缓，不叫 Router。都不起 lead、不改投。查 herdr 不持锁。"""
     groups = {}
     for r in sorted(due, key=lambda r: r['id']):
         lead = r.get('lead') or {}
-        groups.setdefault((lead.get('herdr_session'), lead.get('lead_session'), r.get('delivery_kind')), []).append(r)
-    for (session, lead, kind), recs in groups.items():
+        groups.setdefault((lead.get('herdr_session'), lead.get('lead_session')), []).append(r)
+    for (session, lead), recs in groups.items():
         refs = [(r['id'], qstore.geti(r, 'delivery_seq')) for r in recs]
         pane, why = qstore.find_lead(session, lead) if session and lead else (None, '还没有负责 lead')
         if not pane:
-            st, _, _ = qstore.presence(session, lead)
-            if st == 'absent':
-                for r in recs:
-                    try:
-                        qstore.queue_takeover(r['id'])
-                    except qstore.QError:
-                        pass
-            else:
-                qstore.need_mark_held(refs, f'负责 lead {why}')
+            st, _, _ = qstore.presence(session, lead) if session and lead else ('absent', None, '')
+            filed = [r for r in recs if r.get('status') == 'filed'] if st == 'absent' else []
+            for r in filed:
+                try:
+                    qstore.queue_takeover(r['id'])
+                except qstore.QError:
+                    pass
+            for ref, r in zip(refs, recs):
+                if r in filed:
+                    continue
+                if st != 'absent':
+                    qstore.need_mark_held([ref], f'负责 lead {why}')
+                    continue
+                asked = ask_router_takeover(r) if r.get('lead') and r.get('status') in qstore.LEAD_STATES else 'n/a'
+                note = {'sent': '已请 Router 安排接手', 'dup': '已请 Router 安排接手', 'uncertain': '已请 Router 安排接手（不确定是否送达）',
+                        'paused': '全局暂停中，没有叫 Router，恢复后再叫', 'router_absent': 'Router 暂时不在，稍后再叫'}.get(asked, '')
+                qstore.need_mark_held([ref], f'负责 lead {why}（确认不在' + (f'：{note}' if note else '') + '）')
             continue
         for i in range(0, len(recs), qstore.NEED_BATCH):
-            deliver_router(session, pane, '', kind, recs[i:i + qstore.NEED_BATCH])
+            deliver_router(session, pane, '', 'lead', recs[i:i + qstore.NEED_BATCH])  # 提示词由 lead_prompt 按消息现算
+
+
+def ask_router_takeover(rec, force=False):
+    """立项前负责 lead 确认不在：直接 prompt Router 一次「router takeover <id>」，不占投递槽（消息照样 held）。
+    去重：已叫过且在 QI_TAKEOVER_REASK 窗口内不再叫（force=True 是页面上的手动重试）；全局暂停时不叫、只记录；
+    Router 不在时不叫，需要时拉起它，下一轮再叫。返回 sent / uncertain / dup / paused / router_absent。"""
+    if not force and not qstore.takeover_ask_due(rec):
+        return 'dup'
+    nid = rec['id']
+    if qstore.paused():
+        qstore.note_takeover_ask(nid, 'paused')
+        return 'paused'
+    s = qstore.router_session()
+    if not qstore.socket_exists(s):
+        qstore.note_takeover_ask(nid, 'router_absent', f'herdr session {s} 不在')
+        return 'router_absent'
+    pane, why, start = router_presence(qstore.router_info())
+    if not pane:
+        qstore.note_takeover_ask(nid, 'router_absent', why + ('；' + kick_ensure() if start else ''))
+        return 'router_absent'
+    r = qstore.gated(s, 'agent', 'prompt', pane['pane_id'], router_prompt('takeover', [rec]))
+    if r.get('kind') == 'paused':
+        qstore.note_takeover_ask(nid, 'paused')
+        return 'paused'
+    if r['ok']:
+        result = 'sent'
+    elif r['kind'] in ('no_socket', 'exec_error') or r['code'] in qstore.NOT_SENT_CODES:
+        result = 'router_absent'
+    else:
+        result = 'uncertain'
+    qstore.note_takeover_ask(nid, result, '' if r['ok'] else f'{r["code"]} {r["message"]}'.strip())
+    log.info('need %s takeover ask %s', nid, result)
+    return result
 
 
 def deliver_router(session, pane, lead, kind, recs):
@@ -230,7 +294,10 @@ def deliver_router(session, pane, lead, kind, recs):
     if not claimed:
         return
     ids = {c[0] for c in claimed}
-    text = router_prompt(kind, [x for x in recs if x['id'] in ids])
+    if lead:
+        text = router_prompt(kind, [x for x in recs if x['id'] in ids])
+    else:  # 投给负责 lead：按 claim 时记下的这次实际带上的消息写提示词
+        text = lead_prompt([qstore.read_need(c[0]) for c in sorted(claimed)])
     r = (qstore.gated if lead else qstore.herdr)(session, 'agent', 'prompt', pane['pane_id'], text)
     if r.get('kind') == 'paused':
         qstore.need_unclaim(claimed, '全局暂停，没有发出')
@@ -345,16 +412,16 @@ def need_detail(nid):
                 'id': c.get('id'), 'author': ((c.get('user') or {}).get('login') or ''), 'source': src,
                 'self': by, 'state': row.get('state') or ('own' if by != 'team' else 'pending'),
                 'edited': bool(c.get('created_at') and c.get('updated_at') and c.get('created_at') != c.get('updated_at')),
-                'body_html': md(c.get('body') or ''), 'url': c.get('html_url') or url,
-                'receipt': {'notified': row.get('state') in ('notified', 'read', 'own'),
-                            'read': row.get('state') in ('read', 'own'), 'note': ''}})
+                'body_html': md(ghapi.strip_tag(c.get('body') or '')), 'url': c.get('html_url') or url,
+                'receipt': {'notified': row.get('state') in ('notified', 'read'),
+                            'read': row.get('state') == 'read', 'note': ''}})
     for x in rec.get('thread') or []:
         kind = x.get('kind')
         if kind == 'confirm':
             timeline.append({'kind': 'system', 'at': x.get('at') or '', 'text': f'Owner 确认理解卡 v{qstore.geti(x, "rev")}',
                              'source': '7788 讨论'})
             continue
-        item = {'kind': 'thread', 'at': x.get('at') or '', 'by': x.get('by') or '', 'source': '7788 讨论',
+        item = {'kind': 'thread', 'at': x.get('at') or '', 'by': x.get('by') or '', 'source': '7788 讨论', 'mid': x.get('mid') or '',
                 'text': x.get('text') or '', 'rev': qstore.geti(x, 'rev'), 'kind2': kind,
                 'receipt': {'notified': bool(x.get('notified_at')), 'read': bool(x.get('read_at')), 'note': ''}}
         if kind == 'card':
@@ -383,10 +450,16 @@ def need_detail(nid):
     notes = []
     if rec.get('loop_suspect'):
         notes.append('疑似循环：已停止自动投递')
-    if rec.get('delivery_kind') == 'takeover' and rec.get('delivery') in ('pending', 'sending', 'held', 'uncertain'):
-        notes.append('负责 lead 不在，等待接手')
+    if rec.get('delivery_kind') == 'takeover' and rec.get('delivery') in ('pending', 'sending', 'held', 'uncertain', 'sent'):
+        notes.append('负责 lead 不在，等待接手（已请 Router 安排）')
+    elif rec.get('delivery_to') == 'lead' and rec.get('delivery') == 'held' and '负责 lead' in (rec.get('last_error') or ''):
+        notes.append('消息暂缓：' + rec['last_error'])
     if rec.get('closed_notified'):
         notes.append('根 Issue 已关闭或 PR 全部合并，已发收尾通知')
+    elif isinstance(rec.get('closeout'), dict):
+        notes.append(f'收尾通知排队中（{rec["closeout"].get("why")}）')
+    for t in (tree or {}).get('truncated') or []:
+        errors.append('需求树没读全：' + t)
     if rec.get('last_error') and any(k in rec['last_error'] for k in ('起不来', 'GitHub 查询失败', '查询失败')):
         notes.append(rec['last_error'])
     for note in dict.fromkeys(notes):
@@ -406,7 +479,11 @@ def need_detail(nid):
     return {'id': rec['id'], 'text': rec.get('text') or '', 'title': root.get('title') or (rec.get('text') or '').split('\n')[0],
             'body_html': md(root.get('body') or ''), 'lead_state': st,
             'number': root.get('number') or '',
-            'status': rec.get('status'), 'ws': rec.get('ws') or '', 'lead': rec.get('lead') or {},
+            'status': rec.get('status'), 'discuss': rec.get('discuss') or '', 'ws': rec.get('ws') or '',
+            'lead': rec.get('lead') or {},
+            'can_takeover': bool(rec.get('lead') and st == 'absent' and rec.get('status') in qstore.LEAD_STATES
+                                 and rec.get('status') != 'filed'),  # 手动重试入口；平时服务会自动叫
+            'takeover_ask': rec.get('takeover_ask') if isinstance(rec.get('takeover_ask'), dict) else None,
             'card_rev': qstore.geti(rec, 'card_rev'), 'confirmed_rev': qstore.geti(rec, 'confirmed_rev'),
             'issues': [u for _, _, u in refs], 'github': refs[0][2] if refs else '',
             'column': col, 'column_label': label, 'flags': flags, 'sealed': rec.get('status') in qstore.SEALED,
@@ -757,7 +834,7 @@ class Handler(BaseHTTPRequestHandler):
             log.warning('rejected write %s: %s', self.path, bad)
             return self.send(403, {'error': bad})
         m = re.fullmatch(r'/api/q/([A-Za-z0-9_.-]+)/(save|submit|renotify|close)', self.path)
-        other = re.fullmatch(r'/api/(need)|/api/need/(need-\d{4,})/(reply|confirm|renotify|message|comment)'
+        other = re.fullmatch(r'/api/(need)|/api/need/(need-\d{4,})/(reply|confirm|renotify|message|comment|unloop|takeover)'
                              r'|/api/router/(pause|retry|reregister)', self.path)
         if not m and not other:
             return self.send(404, {'error': 'not found'})
@@ -823,6 +900,17 @@ class Handler(BaseHTTPRequestHandler):
             elif action == 'renotify':
                 qstore.need_renotify(nid)
                 res = {'ok': True, 'note': '已重新排队；这条可能已经在 Router 的队列里'}
+            elif action == 'unloop':
+                qstore.unloop(nid)
+                res = {'ok': True, 'note': '已解除疑似循环，held 的评论恢复投递'}
+            elif action == 'takeover':  # 立项前负责 lead 确认不在：手动重试「请 Router 安排接手」（平时服务会自动叫；查 herdr 不持锁）
+                cur = qstore.read_need(nid)
+                lead = cur.get('lead') or {}
+                st = qstore.presence(lead.get('herdr_session'), lead.get('lead_session'))[0] if lead else 'absent'
+                got = ask_router_takeover(qstore.request_takeover(nid, st), force=True)
+                if got in ('paused', 'router_absent'):
+                    return self.send(409, {'error': '全局暂停中：没有叫 Router' if got == 'paused' else 'Router 暂时不在，已记录，稍后会再叫'})
+                res = {'ok': True, 'note': '已请 Router 安排接手；接手的 lead 会读到没读的消息'}
             elif ctl == 'pause':
                 if not isinstance(req.get('paused'), bool):
                     return self.send(400, {'error': 'paused 必须是 true / false'})
@@ -1141,8 +1229,8 @@ body{background:var(--canvas);color:var(--fg);font:14px/1.55 -apple-system,Blink
 .chip.info{background:var(--accent-soft);color:var(--accent)}
 .crumb{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--mute);flex-wrap:wrap}
 .crumb .sep{color:var(--faint)}.crumb a{color:inherit}
-.chipw{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);border-radius:999px;padding:2px 10px;font-size:12px}
-.chipw.live{color:var(--ok-text);border-color:var(--ok-text)}
+.chipw{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--mute);cursor:default;user-select:none}
+.chipw.live{color:var(--ok-text)}
 .detailwrap{display:grid;grid-template-columns:minmax(0,1fr) 280px;gap:26px;align-items:start;max-width:1180px}
 .detailwrap>header,.detailwrap>.body,.detailwrap>.subs,.detailwrap>.subhd,.detailwrap>.sech,.detailwrap>.tl,.detailwrap>.composer,.detailwrap>.msgbar{grid-column:1}
 .detailwrap>aside.props{grid-column:2;grid-row:1 / span 20;border-left:1px solid var(--line);padding-left:20px;position:sticky;top:12px}
@@ -1331,11 +1419,9 @@ function renderInbox() {
   const main = document.getElementById('main');
   const wait = (boardData && boardData.columns) ? (boardData.columns.find(c => c.key === 'wait') || {cards: []}).cards.filter(c => !archived(c)) : [];
   const waitIds = new Set(wait.map(c => c.id));
-  const waitIssues = new Set(wait.flatMap(c => c.issue_numbers || []));
-  const todo = ((listData && listData.groups ? listData.groups.todo : []) || []).filter(q => {
-    const m = /#(\d+)$/.exec(q.issue || '');
-    return !m || !waitIssues.has(+m[1]);
-  });
+  // 只按完整的「repo#号」合并：另一个 repo 同号的题不能被当成已合并而消失
+  const waitIssues = new Set(wait.flatMap(c => (c.issue_keys || []).map(k => String(k).toLowerCase())));
+  const todo = ((listData && listData.groups ? listData.groups.todo : []) || []).filter(q => !waitIssues.has(String(q.issue || '').toLowerCase()));
   const talk = ((listData && listData.needs_talk) || []).filter(t => !waitIds.has(t.id));
   const wrap = el('div', {class: 'wrap boardwrap'});
   wrap.append(el('header', {class: 'boardhead'}, el('h1', {}, '待处理'),
@@ -1859,7 +1945,6 @@ const TASKS = 'tasks', NEEDS = 'needs';
 let mode = 'inbox', tasksData = null, tasksErr = '', tasksSeq = 0, tasksLoading = false, tasksAt = 0, taskFilter = '';
 let listData = null;
 let needId = '', boardNewOpen = false, boardNewText = '', boardNewBusy = false, boardNewReq = '', needReqText2 = '';
-let needTextDraft = '';
 let boardNewErr = '';
 const STAGE_CLS = {answer: 'hot', merge: 'hot', accept: 'hot', stuck: 'bad', doing: 'info', todo: 'mute', hold: 'mute', done: 'ok', dropped: 'mute'};
 
@@ -1884,6 +1969,7 @@ function avatar(ws, big) {
   const initial = (ws || '?').slice(0, 1).toUpperCase();
   return el('span', {class: 'av' + (big ? ' lg' : ''), style: 'background:' + wsColor(ws)}, initial);
 }
+function meAvatar(big) { return el('span', {class: 'av a-me' + (big ? ' lg' : ''), title: 'Owner（你）'}, '我'); }
 function allCards() {
   return (boardData && boardData.columns) ? boardData.columns.flatMap(c => c.cards) : [];
 }
@@ -1933,8 +2019,7 @@ function ghLink(url, text) {
 
 const BOARD = 'board', NEEDP = 'need';
 let boardData = null, boardErr = '', boardSeq = 0, boardAt = 0, boardWs = '', boardMsg = null, routerHealth = null;
-let needData = null, needErr = '', needSeq = 0, needSendBusy = false, needMsg2 = null, needAt = 0;
-let needReqId = '', needReqText = '';
+let needData = null, needErr = '', needSeq = 0, needMsg2 = null, needAt = 0;
 
 function archived(c) { return store('qi.arch.' + c.id) === String(c.updated || ''); }
 
@@ -1968,10 +2053,10 @@ function timelineView(n) {
       continue;
     }
     if (x.kind === 'comment') {
-      const who = x.author || '?';
-      box.append(el('div', {class: 'msg'}, el('span', {class: 'av a-team'}, who.slice(0, 1).toUpperCase()),
+      const who = x.author || '?', mine = x.self === 'owner';
+      box.append(el('div', {class: 'msg'}, mine ? meAvatar(true) : el('span', {class: 'av a-team'}, who.slice(0, 1).toUpperCase()),
         el('div', {class: 'bubble ' + (x.self ? 'soft' : '')},
-          el('div', {class: 'mh'}, el('b', {}, who), sourceTag(x.source),
+          el('div', {class: 'mh'}, el('b', {}, mine ? '你' : who), sourceTag(x.source),
             el('span', {title: x.at || ''}, when(x.at)), x.edited ? el('span', {class: 'src'}, '编辑过') : null),
           html(x.body_html || ''),
           x.self && x.source && x.source.indexOf('经 7788') >= 0 ? el('div', {class: 'receipt'}, receiptLine(x.receipt, true)) : null)));
@@ -1992,7 +2077,7 @@ function timelineView(n) {
       continue;
     }
     const owner = x.by === 'owner';
-    box.append(el('div', {class: 'msg'}, owner ? avatar('', true) : avatar(n.ws, true),
+    box.append(el('div', {class: 'msg'}, owner ? meAvatar(true) : avatar(n.ws, true),
       el('div', {class: 'bubble soft'},
         el('div', {class: 'mh'}, el('b', {}, owner ? '你' : 'lead-' + (n.ws || '')),
           sourceTag('7788 讨论'), el('span', {title: x.at || ''}, when(x.at))),
@@ -2011,14 +2096,35 @@ function inlineGet(id) {
   if (!inlineState[id]) inlineState[id] = {busy: false, gen: 0, msg: null};
   return inlineState[id];
 }
-function inlineDraftOf(id) {
-  if (!inlineDraft[id]) inlineDraft[id] = {checked: {}, texts: {}};
-  return inlineDraft[id];
+// 草稿绑定它开始时的版本（content_rev/answer_rev）；选项按文字记，不靠序号
+function inlineRev(d) { return `${d.content_rev}/${d.answer_rev}`; }
+function inlineDraftOf(d) {
+  if (!inlineDraft[d.id]) inlineDraft[d.id] = {rev: inlineRev(d), checked: {}, choices: {}, texts: {}, gen: 0};
+  return inlineDraft[d.id];
+}
+function inlineHasInput(st) {
+  return !!st && (Object.values(st.checked).some(Boolean) || Object.values(st.texts).some(t => (t || '').trim()));
+}
+// 题目被勘误 / 替换 / 回答在别处更新：旧草稿不套到新版本上。丢弃，并把旧输入原样摆出来让 Owner 对照重填
+function inlineCheckStale(d) {
+  const st = inlineDraft[d.id], s = inlineGet(d.id);
+  if (!st || st.rev === inlineRev(d) || s.busy) return;
+  if (inlineHasInput(st)) {
+    const old = Object.keys(Object.assign({}, st.checked, st.texts)).sort().map(q =>
+      `${q}：${st.choices[q] || ({suggested: '按建议', need_context: '需要更多上下文', defer: '暂不决定'}[st.checked[q]] || '')}${(st.texts[q] || '').trim() ? ' · ' + st.texts[q].trim() : ''}`);
+    s.msg = {cls: 'warn', text: `这题已更新（版本 ${st.rev} → ${inlineRev(d)}），你在旧版本上的输入没有套用到新版本，请看完更新后重新作答。旧输入：` + old.join('；')};
+  }
+  delete inlineDraft[d.id];
+  if (inlineSheet && inlineSheet.id === d.id) inlineSheet = null;
 }
 function inlineSlot(d, q) {
-  const st = inlineDraftOf(d.id), v = st.checked[q.q] || '', text = st.texts[q.q] || '';
+  const st = inlineDraft[d.id] || {checked: {}, choices: {}, texts: {}};
+  const v = st.checked[q.q] || '', text = st.texts[q.q] || '';
   if (!v) return text.trim() && d.kind !== 'approval' ? {type: 'free', text} : null;
-  if (v.indexOf('opt:') === 0) return {type: 'option', choice: q.options[+v.slice(4)], text};
+  if (v.indexOf('opt:') === 0) {
+    const c = st.choices[q.q];
+    return c && (q.options || []).includes(c) ? {type: 'option', choice: c, text} : null;
+  }
   return {type: v, text};
 }
 function inlineSlots(d) {
@@ -2034,16 +2140,28 @@ function inlineDecision(d, q, s) {
   if (s.type === 'withdrawn') return '已撤回';
   return {need_context: '需要更多上下文', defer: '暂不决定'}[s.type] || s.type;
 }
+// 作答前必须看到的上下文：审批的动作 / 对象 / 后果、勘误（默认展开）；背景、证据可折叠
+function inlineContext(d) {
+  const out = [];
+  if (d.invalid) out.push(el('div', {class: 'msgbar bad'}, '已失效：' + d.invalid));
+  for (const [k, h] of d.approval_html || []) out.push(el('div', {class: 'appr prose'}, el('strong', {}, k), html(h)));
+  if (d.errata_html) out.push(el('div', {class: 'errata prose'}, el('strong', {}, '勘误（lead 改过问题，作答前请看）'), html(d.errata_html)));
+  if (d.background_html) out.push(fold('ibg_' + d.id, 'sec prose', '背景', d.kind === 'approval', html(d.background_html)));
+  if (d.evidence_html) out.push(fold('iev_' + d.id, 'sec prose', '证据', false, html(d.evidence_html)));
+  return out;
+}
 function inlineCard(x) {
   const d = x.detail;
   if (!d) {
     return el('div', {class: 'bubble ask tlq'},
       el('div', {class: 'mh'}, icon('st-wait', 14), el('b', {}, x.title || x.id), el('span', {class: 'src'}, x.invalid || '读取失败')));
   }
+  inlineCheckStale(d);
   const st = inlineGet(d.id);
   const editing = !!inlineEdit[d.id];
   const live = (d.questions || []).filter(q => !q.withdrawn);
   const answered = d.status === 'answered' || d.status === 'resolved';
+  const msg = st.msg ? el('div', {class: 'msgbar ' + st.msg.cls}, st.msg.text) : null;
   if (answered && !editing) {
     const latest = (d.revs || []).find(r => r.rev === d.answer_rev) || {slots: {}};
     return el('div', {class: 'bubble ask tlq'},
@@ -2051,37 +2169,41 @@ function inlineCard(x) {
         el('span', {class: 'src'}, d.kind === 'approval' ? '审批' : '问题'), el('span', {class: 'src'}, `已提交 Rev ${d.answer_rev}`),
         el('span', {title: d.updated || ''}, when(d.updated))),
       el('div', {class: 'mtext'}, live.map(q => `${q.q}：${inlineDecision(d, q, latest.slots[q.q])}`).join('\n')),
+      msg,
       el('div', {class: 'opts'},
-        el('button', {onclick: () => { inlineEdit[d.id] = true; renderNeed(); }}, '更正回答'),
+        d.editable ? el('button', {onclick: () => { inlineEdit[d.id] = true; renderNeed(); }}, '更正回答') : null,
         el('a', {class: 'ghost', href: '#' + d.id}, '在完整页打开 ↗')));
   }
   if (d.status !== 'open' && !editing) {
     return el('div', {class: 'bubble ask tlq'},
-      el('div', {class: 'mh'}, el('b', {}, d.title || d.id), el('span', {class: 'src'}, d.invalid || d.status)));
+      el('div', {class: 'mh'}, el('b', {}, d.title || d.id), el('span', {class: 'src'}, d.invalid || d.status)), msg);
   }
   const box = el('div', {class: 'bubble ask tlq' + (st.busy ? ' busy' : '')},
     el('div', {class: 'mh'}, icon(d.kind === 'approval' ? 'st-wait' : 'st-prog', 14), el('b', {}, d.title || d.id),
       el('span', {class: 'src'}, d.kind === 'approval' ? '审批 · 等你' : '问题 · 等你'),
-      el('span', {title: d.updated || ''}, when(d.updated))));
-  const draft = inlineDraftOf(d.id);
+      el('span', {title: d.updated || ''}, when(d.updated))),
+    inlineContext(d));
+  if (answered) box.append(el('div', {class: 'msgbar info'}, `正在更正：当前 Rev ${d.answer_rev}，提交后生成 Rev ${d.answer_rev + 1}，旧版作废。`));
+  const cur = inlineDraft[d.id] || {checked: {}, texts: {}};
+  const input = (q, f) => { const dr = inlineDraftOf(d); f(dr); dr.gen++; };
   for (const q of live) {
-    const sel = draft.checked[q.q] || '';
+    const sel = cur.checked[q.q] || '';
     const qbox = el('div', {class: 'iq'}, el('div', {class: 'qtext'}, el('span', {class: 'qn'}, q.q), q.text));
     if (d.kind === 'approval') {
       const row = el('div', {class: 'opts'});
       q.options.forEach((o, i) => row.append(el('button', {class: 'opt' + (sel === 'opt:' + i ? ' go' : ''), disabled: st.busy,
-        onclick: () => { if (st.busy) return; draft.checked[q.q] = 'opt:' + i; renderNeed(); }}, o)));
+        onclick: () => { if (st.busy) return; input(q, dr => { dr.checked[q.q] = 'opt:' + i; dr.choices[q.q] = o; }); renderNeed(); }}, o)));
       qbox.append(row);
-      const ta = el('textarea', {id: 'i_' + d.id + '_' + q.q, rows: 2,
+      const ta = el('textarea', {id: 'i_' + d.id + '_' + q.q, rows: 2, disabled: st.busy,
         placeholder: '补充（选「C. 需要先改」时必填：要改什么）',
-        oninput: e => { draft.texts[q.q] = e.target.value; }});
-      ta.value = draft.texts[q.q] || '';
+        oninput: e => { input(q, dr => { dr.texts[q.q] = e.target.value; }); }});
+      ta.value = cur.texts[q.q] || '';
       qbox.append(ta);
     } else {
       const row = el('div', {class: 'opts'});
       const mkRadio = (v, label) => {
-        const inp = el('input', {type: 'radio', name: 'i_' + d.id + '_' + q.q, value: v,
-          onchange: () => { draft.checked[q.q] = v; renderNeed(); }});
+        const inp = el('input', {type: 'radio', name: 'i_' + d.id + '_' + q.q, value: v, disabled: st.busy,
+          onchange: () => { if (st.busy) return; input(q, dr => { dr.checked[q.q] = v; dr.choices[q.q] = v.indexOf('opt:') === 0 ? label : ''; }); renderNeed(); }});
         if (sel === v) inp.checked = true;
         return el('label', {class: 'opt' + (sel === v ? ' go' : '')}, inp, el('span', {class: 'ot'}, label));
       };
@@ -2091,17 +2213,17 @@ function inlineCard(x) {
         qbox.append(el('p', {class: 'why'}, 'lead 建议：' + q.suggestion));
       }
       qbox.append(row);
-      const ta = el('textarea', {id: 'i_' + d.id + '_' + q.q, rows: 2, placeholder: '补充 / 原话（不选选项直接写，就算自由回答）',
-        oninput: e => { draft.texts[q.q] = e.target.value; }});
-      ta.value = draft.texts[q.q] || '';
+      const ta = el('textarea', {id: 'i_' + d.id + '_' + q.q, rows: 2, disabled: st.busy, placeholder: '补充 / 原话（不选选项直接写，就算自由回答）',
+        oninput: e => { input(q, dr => { dr.texts[q.q] = e.target.value; }); }});
+      ta.value = cur.texts[q.q] || '';
       qbox.append(ta);
     }
     box.append(qbox);
   }
-  const msg = st.msg ? el('div', {class: 'msgbar ' + st.msg.cls}, st.msg.text) : null;
   box.append(el('div', {class: 'opts'},
     el('button', {class: 'pri', id: 'inline_' + d.id, disabled: st.busy, onclick: () => startInline(d)},
       st.busy ? '提交中…' : (answered ? '提交更正' : '提交回答')),
+    editing ? el('button', {disabled: st.busy, onclick: () => { delete inlineEdit[d.id]; delete inlineDraft[d.id]; st.msg = null; renderNeed(); }}, '取消更正') : null,
     el('a', {class: 'ghost', href: '#' + d.id}, '在完整页打开 ↗')));
   if (msg) box.append(msg);
   return box;
@@ -2117,25 +2239,28 @@ function startInline(d) {
   if (d.kind === 'approval' && slots.Q1 && slots.Q1.choice === 'C. 需要先改' && !(slots.Q1.text || '').trim()) {
     st.msg = {cls: 'bad', text: '选「C. 需要先改」要写清楚改什么'}; renderNeed(); return;
   }
-  if (live.length > 1) { inlineSheet = {id: d.id, slots, d}; renderInlineSheet(); return; }
-  inlineSubmit(d, slots);
+  const dr = inlineDraftOf(d);
+  if (live.length > 1) { inlineSheet = {id: d.id, slots, d, rev: dr.rev, gen: dr.gen}; renderInlineSheet(); return; }
+  inlineSubmit(d, slots, dr.rev, dr.gen);
 }
 
-async function inlineSubmit(d, slots) {
+async function inlineSubmit(d, slots, rev, dgen) {
   const st = inlineGet(d.id);
   if (st.busy) return;
+  const [crev, arev] = String(rev || inlineRev(d)).split('/').map(Number);  // 用草稿自己的版本提交：版本变了服务端 409
   st.busy = true; st.gen++; st.msg = null; inlineSheet = null;
   const g = st.gen;
   renderInlineSheet(); renderNeed();
   let status = 0, j = {};
   try {
-    ({status, j} = await api(`/api/q/${encodeURIComponent(d.id)}/submit`,
-      {content_rev: d.content_rev, answer_rev: d.answer_rev, slots}));
+    ({status, j} = await api(`/api/q/${encodeURIComponent(d.id)}/submit`, {content_rev: crev, answer_rev: arev, slots}));
   } catch (e) { j = {error: String(e)}; }
   if (g !== st.gen) return;  // 迟到回包：不覆盖新的输入
   st.busy = false;
   if (status === 200) {
-    delete inlineDraft[d.id]; delete inlineEdit[d.id];
+    const dr = inlineDraft[d.id];
+    if (!dr || dr.gen === dgen) delete inlineDraft[d.id];  // 只清掉实际提交的那一版输入
+    delete inlineEdit[d.id];
     st.msg = {cls: 'ok', text: `已提交 Rev ${j.answer_rev}，正在发回 lead`};
     await loadNeed(true); refreshList();
   } else {
@@ -2147,7 +2272,7 @@ async function inlineSubmit(d, slots) {
 function renderInlineSheet() {
   const box = document.getElementById('sheet');
   if (!inlineSheet) { if (box && !sheet) { box.removeAttribute('data-open'); box.replaceChildren(); } return; }
-  const {d, slots} = inlineSheet;
+  const {d, slots, rev, gen} = inlineSheet;
   const rows = (d.questions || []).filter(q => !q.withdrawn).map(q =>
     el('div', {class: 'srow'}, el('strong', {}, q.q), el('div', {},
       el('div', {class: 'qq'}, q.text),
@@ -2157,55 +2282,69 @@ function renderInlineSheet() {
     el('p', {class: 'mute small'}, '确认后才会发回 lead；提交后这一版回答会锁定为只读，可再点「更正回答」。'),
     rows,
     el('div', {class: 'btns'}, el('button', {onclick: () => { inlineSheet = null; renderInlineSheet(); }}, '返回修改'),
-      el('button', {class: 'pri', onclick: () => inlineSubmit(d, slots)}, '确认提交'))));
+      el('button', {class: 'pri', onclick: () => inlineSubmit(d, slots, rev, gen)}, '确认提交'))));
 }
 
+// 输入框按需求分开记：正文、「同时发到 Issue」的勾选、发送中状态；重新渲染不丢
+let needDrafts = {}, needToIssue = {}, needSending = {}, needSendReq = {};
 function needComposer(n) {
   if (n.sealed) return el('div', {class: 'composer'}, el('div', {class: 'ph'}, '讨论已封存（不做）'));
-  const ta = el('textarea', {id: 'need_text', rows: 2, placeholder: '写消息给 ' + (n.ws ? 'lead-' + n.ws : '负责 lead') + '…',
-    oninput: e => { needTextDraft = e.target.value; needMsg2 = null; }});
-  ta.value = needTextDraft;
-  return el('div', {class: 'composer'},
+  const busy = !!needSending[n.id];
+  const ta = el('textarea', {id: 'need_text', rows: 2, disabled: busy, placeholder: '写消息给 ' + (n.ws ? 'lead-' + n.ws : '负责 lead') + '…',
+    oninput: e => { needDrafts[n.id] = e.target.value; needMsg2 = null; }});
+  ta.value = needDrafts[n.id] || '';
+  const chk = el('input', {type: 'checkbox', id: 'need_to_issue', disabled: busy || !n.to_issue,
+    onchange: e => { needToIssue[n.id] = !!e.target.checked; renderNeed(); }});
+  chk.checked = !!(n.to_issue && needToIssue[n.id]);
+  return el('div', {class: 'composer' + (chk.checked ? ' to-issue' : '')},
     ta,
     el('div', {class: 'row'},
-      el('label', {class: 'chk'}, el('input', {type: 'checkbox', id: 'need_to_issue'}), ' 同时发到 Issue（团队可见）'),
-      el('span', {class: 'mute small'}, n.to_issue ? '默认只进 7788 讨论；勾选后写到根 Issue。' : '还没有根 Issue：只能进 7788 讨论。'),
-      el('button', {class: 'send', id: 'need_send', disabled: needSendBusy, onclick: () => sendNeedMessage(n)},
-        needSendBusy ? '…' : icon('i-send', 14))),
-    el('div', {class: 'mute small hint'}, 'PR 和子 Issue 上的讨论不会汇总到这里，请到 GitHub 查看'),
+      el('label', {class: 'chk'}, chk, ' 同时发到 Issue（团队可见）'),
+      el('span', {class: 'mute small'}, !n.to_issue ? '还没有根 Issue：只能进 7788 讨论。'
+        : chk.checked ? '这条会写到根 Issue，团队可见。' : '默认只进 7788 讨论；勾选后写到根 Issue。'),
+      el('button', {class: 'send', id: 'need_send', disabled: busy, onclick: () => sendNeedMessage(n)},
+        busy ? '…' : icon('i-send', 14))),
+    el('div', {class: 'mute small hint'}, 'PR 上的讨论不会汇总到这里，请到 GitHub 查看'),
     el('div', {id: 'need_msg'}, needMsg2 ? el('div', {class: 'msgbar ' + needMsg2.cls}, needMsg2.text) : ''));
 }
 
 async function sendNeedMessage(n) {
-  if (needSendBusy) return;
-  const ta = document.getElementById('need_text');
-  const text = ta ? ta.value : '';
+  const id = n.id;
+  if (needSending[id]) return;
+  const text = needDrafts[id] || '';
   if (!text.trim()) { needMsg2 = {cls: 'bad', text: '先写内容'}; renderNeed(); return; }
-  const box = document.getElementById('need_to_issue');
-  const toIssue = !!(box && box.checked);
-  if (!needReqId || needReqText !== text) { needReqId = rid(); needReqText = text; }
-  needSendBusy = true; needMsg2 = null; renderNeed();
+  const toIssue = !!(n.to_issue && needToIssue[id]);
+  // 幂等键绑定「正文 + 发到哪」：同一段话重试用同一个；改了正文或改了去向就换新的
+  const rq = needSendReq[id];
+  if (!rq || rq.text !== text || rq.toIssue !== toIssue) needSendReq[id] = {rid: rid(), text, toIssue};
+  needSending[id] = true; needMsg2 = null; renderNeed();
   let status = 0, j = {};
-  try { ({status, j} = await api(`/api/need/${encodeURIComponent(n.id)}/comment`,
-    {body: text, request_id: needReqId, to_issue: toIssue})); } catch (e) { j = {error: String(e)}; }
-  needSendBusy = false;
+  try { ({status, j} = await api(`/api/need/${encodeURIComponent(id)}/comment`,
+    {body: text, request_id: needSendReq[id].rid, to_issue: toIssue})); } catch (e) { j = {error: String(e)}; }
+  needSending[id] = false;
   if (status === 200) {
-    needReqId = ''; needReqText = ''; needTextDraft = '';
-    needMsg2 = {cls: 'ok', text: toIssue ? '已发到 GitHub，团队可见；正在通知 lead' : '已发到 7788 讨论，正在通知 lead'};
+    delete needSendReq[id];
+    if ((needDrafts[id] || '') === text) delete needDrafts[id];  // 只清掉实际发出的那段
+    needToIssue[id] = false;
+    if (needId === id) needMsg2 = {cls: 'ok', text: toIssue ? '已发到 GitHub，团队可见；正在通知 lead' : '已发到 7788 讨论，正在通知 lead'};
     await loadNeed(true); loadBoard(false);
   } else {
-    needMsg2 = {cls: 'bad', text: (j.error || ('错误 ' + status)) + '（输入还在，可以重试）'};
-    renderNeed();
+    if (needId === id) needMsg2 = {cls: 'bad', text: (j.error || ('错误 ' + status)) + '（输入还在' + (toIssue ? '，仍勾着「发到 Issue」' : '') + '，可以重试）'};
+    if (mode === 'need' && needId === id) renderNeed();
   }
 }
 
-async function confirmNeed(n) {
+async function needAction(n, path, body, okText) {
   let status = 0, j = {};
-  try { ({status, j} = await api(`/api/need/${encodeURIComponent(n.id)}/confirm`, {card_rev: n.card_rev, request_id: rid()})); }
+  try { ({status, j} = await api(`/api/need/${encodeURIComponent(n.id)}/${path}`, body || {})); }
   catch (e) { j = {error: String(e)}; }
-  needMsg2 = status === 200 ? {cls: 'ok', text: `已确认理解卡 v${n.card_rev}，会通知负责 lead 建 Issue`}
-    : {cls: 'bad', text: j.error || ('错误 ' + status)};
+  needMsg2 = status === 200 ? {cls: 'ok', text: okText || j.note || '已完成'} : {cls: 'bad', text: j.error || ('错误 ' + status)};
   await loadNeed(true);
+}
+
+async function confirmNeed(n) {
+  const b = document.getElementById('confirm_' + n.id); if (b) b.disabled = true;
+  await needAction(n, 'confirm', {card_rev: n.card_rev, request_id: rid()}, `已确认理解卡 v${n.card_rev}，会通知负责 lead 建 Issue`);
 }
 
 function renderNeed() {
@@ -2222,7 +2361,9 @@ function renderNeed() {
     el('div', {class: 'rowflags'}, el('span', {class: 'chip ' + (n.column === 'done' ? 'ok' : n.column === 'wait' ? 'hot' : n.column === 'stuck' ? 'bad' : 'info')}, n.column_label),
       (n.flags || []).map(flagEl),
       n.status === 'discussing' && n.discuss === 'waiting_owner' && n.card_rev
-        ? el('button', {class: 'pri', id: 'confirm_' + n.id, onclick: () => confirmNeed(n)}, `确认理解卡 v${n.card_rev}`) : null)));
+        ? el('button', {class: 'pri', id: 'confirm_' + n.id, onclick: () => confirmNeed(n)}, `确认理解卡 v${n.card_rev}`) : null,
+      n.loop ? el('button', {id: 'unloop_' + n.id, onclick: () => needAction(n, 'unloop')}, '解除疑似循环') : null,
+      n.can_takeover ? el('button', {id: 'takeover_' + n.id, onclick: () => needAction(n, 'takeover')}, '请 Router 安排接手') : null)));
   if (n.body_html) wrap.append(el('div', {class: 'body prose'}, html(n.body_html)));
   else wrap.append(el('div', {class: 'body'}, n.text || ''));
   if ((n.subs || []).length) {
@@ -2256,7 +2397,7 @@ function renderNeed() {
   wrap.append(aside);
   main.replaceChildren(wrap);
   main.scrollTop = top;
-  const ta = document.getElementById('need_text'); if (ta) ta.value = needTextDraft;
+  const ta = document.getElementById('need_text'); if (ta) ta.value = needDrafts[n.id] || '';
   renderInlineSheet();
 }
 
@@ -2639,7 +2780,6 @@ function route() {
   mode = toTasks ? 'tasks' : toBoard ? 'board' : toNeed ? 'need' : 'inbox';
   taskFilter = toTasks ? next.slice(TASKS.length + 1) : '';
   needId = toNeed ? next.slice(NEEDP.length + 1) : '';
-  needTextDraft = '';
   boardWs = toBoard && next.length > BOARD.length + 1 ? next.slice(BOARD.length + 1) : '';
   needMsg2 = null; boardMsg = boardMsg && toBoard ? boardMsg : null;
   renderSheet(); renderModes(); renderSide();
@@ -2661,7 +2801,7 @@ setInterval(() => {
   refreshList(); load(false);
   if ((mode === 'tasks' || mode === 'needs') && !tasksLoading && Date.now() - tasksAt > 60000) loadTasks(false);  // 服务端也有 60 秒缓存
   if (mode === 'board' && Date.now() - boardAt > 20000) loadBoard(false);
-  if (mode === 'need' && !needSendBusy && Date.now() - needAt > 15000) loadNeed(false);
+  if (mode === 'need' && !needSending[needId] && Date.now() - needAt > 15000) loadNeed(false);
 }, 3000);
 </script></body></html>
 '''

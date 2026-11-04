@@ -410,12 +410,32 @@ class NeedDeliveryTest(RouterBase):
         st, h, _ = self.http('GET', '/api/list')
         self.assertEqual([t['id'] for t in h['needs_talk']], [nid])
         self.assertEqual(h['open_count'], 1)
-        self.lead_panes(gone=('w1:p1',))  # 修订 1 / §3：负责 lead 确认不在 → 叫醒 Router 安排接手，不改投别的 lead
+        self.lead_panes(gone=('w1:p1',))  # 负责 lead 不在了：只暂缓，不改投别的 lead、也不拉起谁
         self.post(f'/api/need/{nid}/reply', {'text': '在吗', 'request_id': 'req-reply-0009'})
-        self.wait_for(lambda: self.need(nid)['delivery_kind'] == 'takeover', msg='takeover')
-        self.assertIn(self.need(nid)['delivery'], ('pending', 'sending', 'sent', 'uncertain'))
+        self.wait_for(lambda: self.need(nid)['delivery'] == 'held', msg='held')
+        self.assertIn('负责 lead', self.need(nid)['last_error'])
         time.sleep(0.8)
-        self.assertEqual([c for c in self.herdr_calls() if 'prompt' in c and 'demo' in c], [])  # 没有投给（不在的）lead
+        self.assertEqual([c for c in self.herdr_calls() if 'prompt' in c and RT not in c], [])  # 没有 prompt 给任何 lead
+        self.assertEqual([c for c in self.all_calls() if 'start' in c], [])
+        # lead 决定（R1b）：立项前负责 lead 确认不在 → 自动请 Router 安排接手，**恰好一次**（held 和原因不变）
+        self.wait_for(lambda: self.router_prompts(), msg='takeover ask to router')
+        time.sleep(0.8)  # 再过几轮投递循环（held 退避后重试）也不重复叫
+        self.assertEqual(len(self.router_prompts()), 1)
+        self.assertIn('router takeover ' + nid, self.router_prompts()[0][-1])
+        self.assertEqual(self.need(nid)['delivery'], 'held')
+        self.assertIn('已请 Router 安排接手', self.need(nid)['last_error'])
+        # 页面不能显示「已通知」；看板进「卡住 · 没人管」；按钮保留作手动重试
+        st, d, _ = self.http('GET', f'/api/need/{nid}')
+        self.assertEqual(st, 200, d)
+        self.assertNotIn('已通知', d['receipt']['note'])
+        self.assertIn('暂缓', d['receipt']['note'])
+        self.assertIn('已请 Router 安排接手', json.dumps(d['timeline'], ensure_ascii=False))
+        self.assertTrue(d['can_takeover'])
+        self.assertIn('没人管', json.dumps(d['flags'], ensure_ascii=False))
+        st, j, _ = self.post(f'/api/need/{nid}/takeover', {})
+        self.assertEqual(st, 200, j)
+        self.wait_for(lambda: len(self.router_prompts()) == 2, msg='manual retry prompts router again')
+        self.assertEqual([c for c in self.all_calls() if 'start' in c], [])  # Router 在：不拉起
 
     def test_pause_stops_delivery_and_resume(self):
         self.start_server()
@@ -1640,7 +1660,8 @@ class RouterPageTest(unittest.TestCase):
         self.assertIn('理解卡 v2 等你确认', out['text'])
         self.assertIn('完成', out['text'])
         self.assertIn('#need:need-0007', out['hrefs'])
-        self.assertIn('online', out['cardCls'] + ' online')
+        self.assertEqual(out['cardCls'], 'rcard')  # Router 在线：不是 bad
+        self.assertIn('Router · 在线', out['text'])
         self.assertIn('全局暂停', out['buttons'])
         self.assertEqual(out['postsPending'], 1)
         self.assertEqual(out['goPending'], {'disabled': True, 'text': '提交中…'})

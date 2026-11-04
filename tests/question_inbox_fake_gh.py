@@ -10,8 +10,11 @@ State: JSON file at $FAKE_GH_STATE, re-read on every call:
 Every call is appended to $FAKE_GH_LOG as one JSON line (the argv).
 Supports:
   gh api [--include] graphql -f query=... -f owner=O -f name=N [-f number=N]
-  gh api [--include] repos/O/R/issues/comments[?per_page=..&page=..&since=..]
+  gh api [--include] repos/O/R/issues/comments[?per_page=..&page=..&since=..&sort=updated]
+  gh api repos/O/R/issues/comments/<id>          （按 id 读一条）
   gh api -X POST repos/O/R/issues/N/comments -F body=@file
+  看板 GraphQL（subIssues 查询）：按 board["O/R#N"] 返回；没有单独登记的子 Issue，从父节点的 subIssues 里合成
+  （没有孙子、没有 PR）；subIssues 每页 100 条，按 -f after=<偏移> 翻页。
   gh issue view <url> --json ...
 A failure mimics real gh: message on stderr, rc=1.
 """
@@ -62,6 +65,17 @@ def field(argv, name):
     return None
 
 
+def one_comment(argv, state):
+    path = next(a for a in argv if a.startswith('repos/') and re.search(r'/issues/comments/\d+$', a))
+    parts = path.split('/')
+    repo, cid = '/'.join(parts[1:3]), int(parts[-1])
+    hit = next((c for c in state.get('comments', {}).get(repo, []) if c.get('id') == cid), None)
+    if hit is None:
+        fail('gh: Not Found (HTTP 404)')
+    emit(state, hit)
+    sys.exit(0)
+
+
 def comments(argv, state):
     path = next(a for a in argv if a.startswith('repos/') and re.search(r'/issues/(?:\d+/)?comments', a))
     parsed = urlparse('https://x/' + path.split('?', 1)[0])
@@ -77,7 +91,10 @@ def comments(argv, state):
         items = [c for c in items if (c.get('issue_url') or '').endswith(f'/issues/{number}')]
     if since:
         items = [c for c in items if ts(c.get('updated_at') or c.get('created_at')) >= ts(since)]
-    items.sort(key=lambda c: c.get('id') or 0)
+    if (q.get('sort') or [''])[0] == 'updated':
+        items.sort(key=lambda c: (ts(c.get('updated_at') or c.get('created_at')), c.get('id') or 0))
+    else:
+        items.sort(key=lambda c: c.get('id') or 0)
     chunk = items[(page - 1) * per: page * per]
     emit(state, chunk, include='--include' in argv)
     sys.exit(0)
@@ -111,6 +128,34 @@ def post_comment(argv, state):
     sys.exit(0)
 
 
+def tree_node(state, repo, number, after):
+    board = state.get('board', {})
+    resp = board.get(f'{repo}#{number}')
+    if resp is None:  # 没单独登记：从某个父节点的 subIssues 里找
+        for parent in board.values():
+            if not isinstance(parent, dict):
+                continue
+            node = ((parent.get('data') or {}).get('repository') or {}).get('issue') or {}
+            for n in (node.get('subIssues') or {}).get('nodes') or []:
+                nrepo = ((n.get('repository') or {}).get('nameWithOwner') or repo)
+                if n.get('number') == number and nrepo.lower() == repo.lower():
+                    sub = dict(n, subIssues={'nodes': []}, timelineItems={'nodes': []},
+                               closedByPullRequestsReferences={'nodes': []})
+                    resp = {'data': {'repository': {'issue': sub}}}
+        if resp is None:
+            return None
+    if not isinstance(resp, dict):
+        return resp
+    resp = json.loads(json.dumps(resp))
+    node = ((resp.get('data') or {}).get('repository') or {}).get('issue')
+    if isinstance(node, dict) and isinstance(node.get('subIssues'), dict):
+        nodes = node['subIssues'].get('nodes') or []
+        off = int(after or 0)
+        node['subIssues'] = {'nodes': nodes[off:off + 100],
+                             'pageInfo': {'hasNextPage': off + 100 < len(nodes), 'endCursor': str(off + 100)}}
+    return resp
+
+
 def main(argv):
     with open(os.environ['FAKE_GH_LOG'], 'a', encoding='utf-8') as f:
         f.write(json.dumps(argv, ensure_ascii=False) + '\n')
@@ -121,6 +166,8 @@ def main(argv):
             fail(f'GraphQL: Could not resolve to an issue ({argv[2]})')
         print(json.dumps(info, ensure_ascii=False))
         sys.exit(0)
+    if any(re.search(r'^repos/.*/issues/comments/\d+$', a) for a in argv) and 'POST' not in argv:
+        return one_comment(argv, state)
     if re.search(r'/issues/(?:\d+/)?comments', ' '.join(argv)):
         if any(a == '-X' for a in argv) and 'POST' in argv:
             return post_comment(argv, state)
@@ -134,7 +181,7 @@ def main(argv):
     owner, name = field(argv, 'owner'), field(argv, 'name')
     if 'subIssues(first:' in query:
         number = int(field(argv, 'number') or 0)
-        resp = state.get('board', {}).get(f'{owner}/{name}#{number}')
+        resp = tree_node(state, f'{owner}/{name}', number, field(argv, 'after'))
         if resp is None:
             fail(f'GraphQL: Could not resolve to an issue #{number}')
     else:

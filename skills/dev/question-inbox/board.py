@@ -35,9 +35,12 @@ def column(need, tree, ctx=None):
     prs = tree.get('prs') or []
     questions = [q for q in ctx.get('questions') or [] if q.get('open')]
     if root.get('state') == 'CLOSED':
+        flags.append({'kind': 'muted', 'text': '不做' if root.get('state_reason') == 'NOT_PLANNED' else '已完成'})
         left = [s for s in subs if s.get('state') != 'CLOSED'] + questions
         if left:
             flags.append({'kind': 'bad', 'text': f'有遗留：{len(left)} 项未完成'})
+        if tree.get('truncated'):
+            flags.append({'kind': 'bad', 'text': '需求树没读全，遗留情况待核'})
         return 'done', flags
     # 待处理：理解卡等确认、挂在需求上的未答题 / 审批、已批准待 Owner 操作的 PR
     if need.get('discuss') == 'waiting_owner':
@@ -56,9 +59,10 @@ def column(need, tree, ctx=None):
     if need.get('loop_suspect'):
         flags.append({'kind': 'bad', 'text': '疑似循环：已停止自动投递'})
     lead = ctx.get('lead') or ('absent' if not need.get('lead') else 'unknown')
-    if status == 'filed' and lead == 'absent':
+    claimed = bool(need.get('lead')) and status in qstore.LEAD_STATES  # 有负责 lead 的需求（立项前后都算）
+    if claimed and lead == 'absent':
         flags.append({'kind': 'bad', 'text': '没人管：负责 lead 已不在'})
-    elif status == 'filed' and lead == 'unknown':
+    elif claimed and lead == 'unknown':
         flags.append({'kind': 'mute', 'text': 'lead 状态待核'})
     if ctx.get('blocked'):
         flags.append({'kind': 'bad', 'text': 'lead 被 blocked'})
@@ -160,7 +164,8 @@ def _next(need, tree, flags, col):
         ck = {'SUCCESS': 'checks ✓', 'FAILURE': 'checks ✗', 'PENDING': 'checks 运行中', '': ''}.get(p.get('checks'), p.get('checks') or '')
         return f'PR #{p.get("number")} · {rv}' + (f' · {ck}' if ck else '')
     if col == 'done':
-        return '已完成' if need.get('status') != 'dropped' else '不做'
+        closed_np = ((tree or {}).get('root') or {}).get('state_reason') == 'NOT_PLANNED'
+        return '不做' if need.get('status') == 'dropped' or closed_np else '已完成'
     p = next((p for p in tree.get('prs') or [] if p.get('state') == 'OPEN'), {})
     if p:
         return f'PR #{p["number"]} · 处理中'
@@ -177,6 +182,9 @@ def _card(need, tree, ctx, col, flags, err):
             'issue': (qstore.root_issue(need) or ('', 0, ''))[2], 'title': root.get('title') or (need.get('text') or '').split('\n')[0][:120],
             'ws': need.get('ws') or '', 'column': col, 'flags': flags, 'next': _next(need, tree or {}, flags, col),
             'issue_numbers': [n for _, n, _ in qstore.need_issue_refs(need)] + [s.get('number') for s in subs if s.get('number')],
+            # 待处理页按「repo#号」合并（不能只按号：另一个 repo 同号的题不能被吞掉）
+            'issue_keys': list(dict.fromkeys([f'{r}#{n}' for r, n, _ in qstore.need_issue_refs(need)]
+                                             + [f'{s["repo"]}#{s["number"]}' for s in subs if s.get('repo') and s.get('number')])),
             'who': f'lead-{need.get("ws")}' if lead else ('Router' if need.get('status') != 'filed' else '没人'),
             'live': bool(lead and ctx.get('lead') == 'present' and col in ('doing', 'review')),
             'updated': root.get('updated') or need.get('updated') or need.get('created') or '',

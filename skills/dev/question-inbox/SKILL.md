@@ -156,11 +156,12 @@ Owner 在页面「需求」栏提交一句话 → `needs/need-NNNN.json` → 服
 | `$Q need claim <id> [--takeover]` | 那个 ws 的 lead：pane 的 cwd **恰好**是 lead 目录、agent 名 `lead-<ws>`（worker 在子目录里，不能 claim） | 登记为负责 lead；takeover 只在原负责 lead **确认**不在时可用（查询失败、超时、多个匹配都算查不清，拒绝） |
 | `$Q need card <id> --body <文件>` | 只有负责 lead | 发理解卡：`## 理解` / `## 范围` / `## 不做什么` / `## 验收草案` / `## 开放问题`（开放问题每条带推荐，可空）；每发一张版本 + 1 |
 | `$Q need link <id> --issue <URL>…` / `$Q need drop <id> --issue <URL> --why "…"` | 只有负责 lead | 建好 Issue 后登记（讨论过的必须已确认；第一次 link 时核对根 Issue 在本 ws 主 repo、正文第一个非空行是 `需求：need-NNNN`；并自动贴一条「已确认的理解」评论，没有理解卡时贴「按原话立项（未单独讨论）」；水位回填到根 Issue 创建时间）/ 不做 |
-| `$Q need inbox <id> [--ack <评论 id>…]` | 只有负责 lead | 列出未读的 Issue 评论（正文现场从 GitHub 取，不改状态）；`--ack` 才标已读 |
+| `$Q need inbox <id> [--ack <口令>…]` | 只有负责 lead | 列出没读的 7788 消息和 Issue 评论（评论正文现场从 GitHub 取，不改状态）；读完照它打印的口令 `--ack`：评论 `<id>@<版本>`、7788 消息 `m:<id>`。只确认**这次读到的那一份**：之后新来的、读后被编辑的不受影响 |
 | `$Q need say <id> --text "…"` | 只有负责 lead | 在 7788 讨论线程里说一句（小进展，不进 GitHub、不投递） |
-| `$Q need comment <id> --body <文件>` | 只有负责 lead | 把**结论**写到根 Issue（团队可见）；不贴讨论原文 |
+| `$Q need comment <id> --body <文件> [--request-id K]` | 只有负责 lead | 把**结论**写到根 Issue（团队可见，≤ 10,000 字）；不贴讨论原文。**GitHub 评论只能经这条命令发，不要直接 `gh issue comment` / `gh api` 发**（不经它发的评论没有记账，会被当成「来源未核实」投回给你）。同一正文重跑不会重复发；报「结果不明」时稍后原样重跑，它先对账 |
 | `$Q need hold <id> --why "…"` | Router（routing）或负责 lead（已立项不要 hold） | 卡住，页面显示原因 |
-| `$Q router takeover <id>` | 只有 Router | 已立项需求的负责 lead **确认不在**：安排同 ws 的新 lead 接手（claim --takeover + need inbox） |
+| `$Q router takeover <id>` | 只有 Router | 负责 lead **确认不在**：安排同 ws 的新 lead 接手（claim --takeover + need inbox）。立项前、立项后都由服务在确认不在时自动叫 Router；页面上的「请 Router 安排接手」只是手动重试 |
+| `$Q need unloop <id>` | 只有负责 lead | 解除「疑似循环」（页面上 Owner 也能解除） |
 | `$Q router register` / `$Q router paused` / `$Q router status` | Router / 任何人 | 登记身份；暂停开关；登记、拉起次数、最近投递 |
 
 身份不符一律退出码 4，状态不允许退出码 3。上面这些 Router / 负责 lead 的命令，身份**只取执行者自己 pane 的** `$HERDR_SESSION` / `$HERDR_PANE_ID`：
@@ -174,6 +175,13 @@ Router 起 lead、写派工书（`<lead 目录>/dispatch/`）、claim 校验都�
 - **修订 1：讨论默认留在 7788，结论才进 Issue。** Owner 在详情页发的消息默认只进讨论线程、投给负责 lead；
   输入框旁的「同时发到 Issue（团队可见）」默认关，打开后才走 GitHub 评论路径（发送意图、comment id 记账、对账），
   回执显示「已发到 GitHub → 已通知 lead → lead 已读」。时间线来源分「7788 讨论」/「Issue 评论 · 经 7788」/「Issue 评论」。
+- **发 GitHub 评论的三个入口**（Owner 勾选发到 Issue、`need comment`、立项评论）走同一套发送记账：先记发送意图，过写门
+  （跨进程串行、间隔 ≥ 1 秒、每需求 20 次/分钟、暂停复核包住实际写动作）再发。确定没发出去（暂停、限流、gh 起不来、GitHub 4xx）可以原样重试；
+  结果不明（超时、5xx、回包丢失）先到根 Issue 对账——只认完整尾标 + 发布正文哈希 + 可信账号，复制尾标或正文片段都不算——
+  读完也找不到、且超过宽限期，才判定没发出去重发。轮询对账找到的和主动发送一样投给负责 lead。
+- **投给负责 lead**：同一个 lead 的多种消息（Issue 评论、7788 回复、确认、收尾）合并成一次唤醒，提示词按这次实际带上的消息写，不会互相覆盖；
+  收尾真正投出去才算「已发收尾通知」。子 Issue 从根 Issue 的真实子树发现（多层、跨 repo），上面的评论同样投给负责 lead；PR 讨论不汇聚。
+- **疑似循环**只认「我们自己发的评论被投回」：带本需求尾标、却对不上任何发送记录的评论连续 3 轮。Owner 直接在 GitHub 写、团队 `@lead-<ws>` 点名都照常投递。
 - lead 判断什么时候把**结论**写进 Issue：范围 / 验收 / 取舍 / 优先级变化，或 Owner 明确说「记一下」时，用 `need comment`；
   小进展用 `need say` 留在 7788。Issue 评论是协作输入，不是授权。
 - **Owner 在页面上**：对还没有负责 lead 的需求写的是「补充 / 纠正」（记成 note，Router 正在处理时投给 Router）；有负责 lead 之后写的是「回复」，
@@ -181,7 +189,10 @@ Router 起 lead、写派工书（`<lead 目录>/dispatch/`）、claim 校验都�
   等 Owner 回复或确认的需求出现在「待处理」最上面的「需求讨论」一栏。
 - 还没 lead claim 的需求（assigned）：Owner 的补充投给 Router；分派后 30 分钟（`QI_UNCLAIMED_AFTER` 秒）仍没人 claim，服务自动补投 Router 一次，页面也给「重新通知」。
 - 投递和回答投递同一套机制：按 agent_session 定位、写前记账、held / uncertain、退避、不重复发，同一批最多合并 5 条。
-  投给负责 lead 时找不到它（pane 关了、换了会话）只暂缓，不改投别的 lead、也不拉起谁（由 Router 的看门狗处理）。
+  投给负责 lead 时找不到它（pane 关了、换了会话）：不改投别的 lead、也不拉起谁。负责 lead **确认不在**时服务自动请 Router 安排接手：
+  已立项的排一次 takeover 投给 Router；立项前的消息记成暂缓（页面写「负责 lead 不在，已请 Router 安排接手」、看板进「卡住 · 没人管」），
+  同时直接请 Router 一次（同一需求 `QI_TAKEOVER_REASK` 秒内、默认 30 分钟只叫一次；全局暂停时不叫、只记录）。查不清只暂缓，不叫 Router。
+  页面上的「请 Router 安排接手」是手动重试。新 lead `claim --takeover` 后，没 ack 的消息重新投给它。
 - **Router 不在时自动拉起**（没登记、或登记的 pane 没了 / agent 已退出）：服务在 session router 里建 workspace `Router`（cwd `~/workspaces`）、
   `agent start router --kind claude -- --dangerously-skip-permissions --model opus`，信任弹窗读屏后选「信任」，再发「读 skill router、register、处理待办」。
   session 的 socket 不在就只报暂缓、不创建；同一时间只拉一次，1 小时最多 3 次，超过页面标红「Router 起不来」并停止自动拉起（页面可重试，Router 登记后自动解除）。

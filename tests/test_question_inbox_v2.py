@@ -187,7 +187,7 @@ class V2PollTest(V2Base):
         self.assertEqual(len([c for c in rec['comments'] if c['id'] >= 2000]), 150)  # 翻完了所有页（排除 link 评论）
         self.assertEqual(rec['delivery_kind'], 'comments')
         self.assertTrue(rec['delivery'])
-        self.edit_comment(2007, '评论 7 编辑过（结论变了）', updated=ts(timedelta(seconds=1)))
+        self.edit_comment(2007, '评论 7 编辑过（结论变了）', updated=ts(timedelta(seconds=-2)))  # 明确晚于创建时间
         poll.clear_cache()
         poll.scan()
         rec = qstore.read_need(nid)
@@ -219,10 +219,11 @@ class V2PollTest(V2Base):
         self.assertEqual(next(c for c in rec['comments'] if c['id'] == 3001)['state'], 'pending')
         self.assertEqual((rec['delivery'], rec['delivery_kind']), ('pending', 'comments'))
 
-    def test_three_unverified_or_same_lead_triggers_loop_brake(self):
+    def test_three_rounds_of_own_echo_trigger_loop_brake(self):
+        # 带本需求尾标、却对不上任何发送意图的评论 = 我们自己发的被当成新消息投回；连续 3 轮才刹车
         nid = self.filed()
         for i in range(3):
-            self.add_comment(30, 4000 + i, f'lead 漏走入口发的 {i}', author='demo-owner')
+            self.add_comment(30, 4000 + i, f'自己发的被投回 {i}\n\n<!-- qi:{nid} i-{"ab" * 16} -->', author='demo-owner')
             poll.scan()
             rec = qstore.read_need(nid)
             if rec.get('delivery') in ('pending', 'held', 'sending'):
@@ -232,7 +233,7 @@ class V2PollTest(V2Base):
                     qstore._save_need(cur, '模拟 lead 已读')
         rec = qstore.read_need(nid)
         self.assertTrue(rec['loop_suspect'])
-        self.add_comment(30, 4009, '第四条', author='demo-owner')
+        self.add_comment(30, 4009, '第四条（人写的）', author='demo-owner')
         poll.scan()
         rec = qstore.read_need(nid)
         self.assertEqual(rec['comments'][-1]['state'], 'held')
@@ -302,13 +303,15 @@ class V2TakeoverTest(V2Base):
         inbox = qstore.lead_inbox(nid, [], ident_b, poll.body_fetcher)
         self.assertEqual([c['id'] for c in inbox['comments']], [5001])
         self.assertEqual([x['text'] for x in inbox['thread']], ['新补充'])
-        qstore.lead_inbox(nid, ['5001'], ident_b, poll.body_fetcher)
-        self.assertEqual(qstore.lead_inbox(nid, [], ident_b, poll.body_fetcher)['comments'], [])
+        qstore.lead_inbox(nid, [c['ack'] for c in inbox['comments']] + [x['ack'] for x in inbox['thread']], ident_b, poll.body_fetcher)
+        again = qstore.lead_inbox(nid, [], ident_b, poll.body_fetcher)
+        self.assertEqual((again['comments'], again['thread']), ([], []))  # 恰好读一次
         # 旧 lead 迟到的 ack：身份不符，不能吞掉新 lead 的未读
         self.add_comment(30, 5002, '又一条', author='teammate')
         poll.scan()
+        tok = qstore.comment_ack(next(c for c in qstore.read_need(nid)['comments'] if c['id'] == 5002))
         with self.assertRaises(qstore.QError) as e:
-            qstore.lead_inbox(nid, ['5002'], self.as_ident('w1:p1'), poll.body_fetcher)
+            qstore.lead_inbox(nid, [tok], self.as_ident('w1:p1'), poll.body_fetcher)
         self.assertEqual(e.exception.code, 403)
         self.assertEqual([c['id'] for c in qstore.lead_inbox(nid, [], ident_b, poll.body_fetcher)['comments']], [5002])
 
