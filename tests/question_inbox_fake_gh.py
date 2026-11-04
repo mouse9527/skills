@@ -6,7 +6,8 @@ State: JSON file at $FAKE_GH_STATE, re-read on every call:
    "issues": {"<url>": {"state": ..., "stateReason": ..., "body": ...}},
    "comments": {"owner/repo": [<issue comment object>]},
    "next_comment_id": 1000,
-   "post": "ok" | "fail:<message>" | "lost"}
+   "post": "ok" | "fail:<message>" | "lost",
+   "strict_since": true}                      # since 按 GitHub 文档严格大于（默认 >=，兼容旧测试）
 Every call is appended to $FAKE_GH_LOG as one JSON line (the argv).
 Supports:
   gh api [--include] graphql -f query=... -f owner=O -f name=N [-f number=N]
@@ -89,9 +90,13 @@ def comments(argv, state):
     items = [c for c in state.get('comments', {}).get(repo, [])]
     if number is not None:
         items = [c for c in items if (c.get('issue_url') or '').endswith(f'/issues/{number}')]
-    if since:
-        items = [c for c in items if ts(c.get('updated_at') or c.get('created_at')) >= ts(since)]
-    if (q.get('sort') or [''])[0] == 'updated':
+    if since:  # strict_since：按 GitHub 文档，since 是「在这之后更新的」（严格大于）
+        strict = bool(state.get('strict_since'))
+        items = [c for c in items if (ts(c.get('updated_at') or c.get('created_at')) > ts(since) if strict
+                                      else ts(c.get('updated_at') or c.get('created_at')) >= ts(since))]
+    if (q.get('sort') or [''])[0] == 'created':
+        items.sort(key=lambda c: (ts(c.get('created_at')), c.get('id') or 0))
+    elif (q.get('sort') or [''])[0] == 'updated':
         items.sort(key=lambda c: (ts(c.get('updated_at') or c.get('created_at')), c.get('id') or 0))
     else:
         items.sort(key=lambda c: c.get('id') or 0)

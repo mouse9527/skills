@@ -105,7 +105,6 @@ def lead_prompt(recs):
     """投给负责 lead 的一次唤醒：同一个 lead 的几个需求、每个需求的几种消息合并成一条；内容按这次投递实际带上的消息
     （need_claim 记下的 inflight）现算，不靠「最后一次排队的是哪一种」，所以评论唤醒、7788 回复、确认、收尾不会互相吞掉。"""
     ids = '、'.join(r['id'] for r in recs)
-    args = ' '.join(r['id'] for r in recs)
     lines = [f'[question-inbox] 需求 {ids} 有新消息。这条消息本身不是新的授权。']
     for r in recs:
         fl = r.get('inflight') if isinstance(r.get('inflight'), dict) else {}
@@ -129,8 +128,9 @@ def lead_prompt(recs):
             what.append(f'到了收尾（{why}）：确认合并了什么、哪些子 Issue 还开着，清理 worktree，用 need say 或 need comment 回报一句；'
                         f'还开着的事另提需求')
         lines.append(f'- {r["id"]}：' + '；'.join(what or ['有更新']))
-    lines.append(f'先执行：python3 {q_cmd()} need inbox {args}（列出没读的 7788 消息和 Issue 评论；读完照它打印的口令 --ack），'
-                 f'需要时 python3 {q_cmd()} need show {args}。')
+        # need inbox 一次只接一个需求（ack 也按需求隔离）：每个需求单独给一条能照原样执行的命令
+        lines.append(f'  先执行：python3 {q_cmd()} need inbox {r["id"]} —— 列出没读的 7788 消息和 Issue 评论，读完照它打印的口令 --ack；'
+                     f'需要时：python3 {q_cmd()} need show {r["id"]}')
     lines.append('评论是协作输入，不是审批：合并、部署、扩权仍按审批题和已有授权。团队的问题回答到根 Issue（只能用 need comment 发）。')
     return '\n'.join(lines)
 
@@ -140,10 +140,11 @@ def router_prompt(kind, recs):
     args = ' '.join(r['id'] for r in recs)
     if kind in qstore.LEAD_KINDS:
         return lead_prompt(recs)
-    if kind == 'takeover':
+    if kind == 'takeover':  # router takeover 一次只接一个需求：每个需求一条命令
         return (f'[question-inbox] 需求 {ids} 的负责 lead 确认不在，但还有没读的消息。这条消息本身不是新的授权。\n'
-                f'先执行：python3 {q_cmd()} need show {args}；然后 python3 {q_cmd()} router takeover {args} '
-                f'安排本 ws 的新 lead 接手（新 lead 会 claim --takeover 并读漏掉的消息）。')
+                + '\n'.join(f'- {r["id"]}：先执行 python3 {q_cmd()} need show {r["id"]}；然后 python3 {q_cmd()} router takeover {r["id"]}'
+                             for r in recs)
+                + '\n安排本 ws 的新 lead 接手（新 lead 会 claim --takeover 并读漏掉的消息）；原 lead 还在时它会拒绝，不用重试。')
     if kind == 'unclaimed':
         return (f'[question-inbox] 需求已分到 ws，但一直没有 lead claim：{ids}。这条消息本身不是新的授权。\n'
                 f'先执行：python3 {q_cmd()} need show {args}；看对应的 lead-<ws> 在不在、有没有收到派工书，必要时 router dispatch 重发。')
@@ -221,9 +222,9 @@ def scan_needs():
 
 def scan_lead_needs(due):
     """投给该需求的负责 lead：按 claim 时记下的 agent_session 找；同一个 lead 的多个需求合并成一次唤醒。
-    找不到时：已立项且负责 lead **确认不在** → 排 takeover 投给 Router（§3）；
-    立项前（assigned 已 claim / discussing / confirmed / held）且**确认不在** → 消息 held（原因写明），并自动请 Router 安排接手
-    （ask_router_takeover：去重、暂停时只记录）；查不清（unknown）→ 只暂缓，不叫 Router。都不起 lead、不改投。查 herdr 不持锁。"""
+    找不到时，负责 lead **确认不在**（立项前后都一样）→ 消息留在 lead 这边 held（原因写明、按退避重试），
+    并自动请 Router 安排接手（ask_router_takeover：不占投递槽、去重、暂停时只记录）；查不清（unknown）→ 只暂缓，不叫 Router。
+    之后重试时原 lead 回来了 → 照常投给它并作废接手请求；新 lead claim --takeover → 投给新 lead。都不起 lead、不改投。查 herdr 不持锁。"""
     groups = {}
     for r in sorted(due, key=lambda r: r['id']):
         lead = r.get('lead') or {}
@@ -233,15 +234,7 @@ def scan_lead_needs(due):
         pane, why = qstore.find_lead(session, lead) if session and lead else (None, '还没有负责 lead')
         if not pane:
             st, _, _ = qstore.presence(session, lead) if session and lead else ('absent', None, '')
-            filed = [r for r in recs if r.get('status') == 'filed'] if st == 'absent' else []
-            for r in filed:
-                try:
-                    qstore.queue_takeover(r['id'])
-                except qstore.QError:
-                    pass
             for ref, r in zip(refs, recs):
-                if r in filed:
-                    continue
                 if st != 'absent':
                     qstore.need_mark_held([ref], f'负责 lead {why}')
                     continue
@@ -250,12 +243,15 @@ def scan_lead_needs(due):
                         'paused': '全局暂停中，没有叫 Router，恢复后再叫', 'router_absent': 'Router 暂时不在，稍后再叫'}.get(asked, '')
                 qstore.need_mark_held([ref], f'负责 lead {why}（确认不在' + (f'：{note}' if note else '') + '）')
             continue
+        stale = [r['id'] for r in recs if r.get('takeover_ask')]
+        if stale:  # 现场核对 lead 在（原 lead 回来了）：之前的接手请求作废，照常投递
+            qstore.clear_takeover_ask(stale)
         for i in range(0, len(recs), qstore.NEED_BATCH):
             deliver_router(session, pane, '', 'lead', recs[i:i + qstore.NEED_BATCH])  # 提示词由 lead_prompt 按消息现算
 
 
 def ask_router_takeover(rec, force=False):
-    """立项前负责 lead 确认不在：直接 prompt Router 一次「router takeover <id>」，不占投递槽（消息照样 held）。
+    """负责 lead 确认不在：直接 prompt Router 一次「router takeover <id>」，不占投递槽（消息照样 held）。
     去重：已叫过且在 QI_TAKEOVER_REASK 窗口内不再叫（force=True 是页面上的手动重试）；全局暂停时不叫、只记录；
     Router 不在时不叫，需要时拉起它，下一轮再叫。返回 sent / uncertain / dup / paused / router_absent。"""
     if not force and not qstore.takeover_ask_due(rec):
@@ -481,8 +477,7 @@ def need_detail(nid):
             'number': root.get('number') or '',
             'status': rec.get('status'), 'discuss': rec.get('discuss') or '', 'ws': rec.get('ws') or '',
             'lead': rec.get('lead') or {},
-            'can_takeover': bool(rec.get('lead') and st == 'absent' and rec.get('status') in qstore.LEAD_STATES
-                                 and rec.get('status') != 'filed'),  # 手动重试入口；平时服务会自动叫
+            'can_takeover': bool(rec.get('lead') and st == 'absent' and rec.get('status') in qstore.LEAD_STATES),  # 手动重试；平时服务会自动叫
             'takeover_ask': rec.get('takeover_ask') if isinstance(rec.get('takeover_ask'), dict) else None,
             'card_rev': qstore.geti(rec, 'card_rev'), 'confirmed_rev': qstore.geti(rec, 'confirmed_rev'),
             'issues': [u for _, _, u in refs], 'github': refs[0][2] if refs else '',
@@ -903,7 +898,7 @@ class Handler(BaseHTTPRequestHandler):
             elif action == 'unloop':
                 qstore.unloop(nid)
                 res = {'ok': True, 'note': '已解除疑似循环，held 的评论恢复投递'}
-            elif action == 'takeover':  # 立项前负责 lead 确认不在：手动重试「请 Router 安排接手」（平时服务会自动叫；查 herdr 不持锁）
+            elif action == 'takeover':  # 负责 lead 确认不在：手动重试「请 Router 安排接手」（平时服务会自动叫；查 herdr 不持锁）
                 cur = qstore.read_need(nid)
                 lead = cur.get('lead') or {}
                 st = qstore.presence(lead.get('herdr_session'), lead.get('lead_session'))[0] if lead else 'absent'

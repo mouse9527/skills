@@ -25,7 +25,7 @@ ANY_TAG_RE = re.compile(r'\n*<!--\s*qi:[^>]{0,120}-->\s*$')  # 渲染时去掉�
 WRITE_INTERVAL = float(os.environ.get('QI_GH_WRITE_INTERVAL') or 1.0)
 PER_NEED_PER_MIN = 20
 MAX_COMMENT = 10000  # 发到 Issue 的正文上限（设计 §2）；7788 线程仍是 qstore.MAX_TEXT
-LIST_MAX_PAGES = 50  # 一轮按 repo 最多读这么多页；没读完就只把水位推进到读到的最后一条
+LIST_MAX_PAGES = 50  # 一轮按 repo 最多读这么多页；没读完就记下页游标，下一轮接着读
 ISSUE_MAX_PAGES = 200
 TREE_MAX_NODES = 300
 
@@ -122,14 +122,17 @@ def _check_repo(repo):
         raise GHError(400, f'repo 不合法：{repo!r}', 'bad_repo')
 
 
-def list_comments(repo, since=None, per_page=100, max_pages=None, include_headers=True):
-    """某个 repo 的 Issue 评论（含 PR 评论，调用方按 Issue 号过滤），按 updated_at 升序。
-    返回 (评论列表, 是否读完)。没读完（到了页数上限）时调用方只能把水位推进到读到的最后一条，不能当成扫完。"""
+def list_comments(repo, since=None, per_page=100, max_pages=None, include_headers=True, start_page=1):
+    """某个 repo 的 Issue 评论（含 PR 评论，调用方按 Issue 号过滤），since 筛「之后更新的」，按**创建**顺序翻页：
+    编辑过的评论留在原位置，多页扫描期间有人编辑也不会把后面的评论挤到已读过的页里（按 updated 排序会）。
+    从 start_page 开始最多读 max_pages 页。返回 (评论列表, 是否读完, 下一页页码)。
+    没读完时调用方要记下 (since, 下一页) 接着读，不能当成扫完、也不能用时间戳续扫（同秒的会漏或卡住）。"""
     _check_repo(repo)
     max_pages = max_pages or LIST_MAX_PAGES
-    page, out = 1, []
-    while page <= max_pages:
-        q = f'repos/{repo}/issues/comments?sort=updated&direction=asc&per_page={per_page}&page={page}'
+    page, out = max(1, int(start_page)), []
+    last = page + max_pages
+    while page < last:
+        q = f'repos/{repo}/issues/comments?sort=created&direction=asc&per_page={per_page}&page={page}'
         if since:
             q += f'&since={quote(since)}'
         argv = [gh_bin(), 'api', *( ['--include'] if include_headers else []), q]
@@ -137,10 +140,10 @@ def list_comments(repo, since=None, per_page=100, max_pages=None, include_header
         if not isinstance(data, list):
             raise GHError(409, f'{repo} 评论返回的不是列表', 'json')
         out += [c for c in data if isinstance(c, dict) and isinstance(c.get('id'), int)]
-        if len(data) < per_page:
-            return out, True
         page += 1
-    return out, False
+        if len(data) < per_page:
+            return out, True, page
+    return out, False, page
 
 
 def issue_comments(repo, number, per_page=100, max_pages=None):
@@ -218,32 +221,42 @@ def definitely_not_sent(e):
     return 400 <= (e.status or 0) < 500 and e.status != 408
 
 
-def trusted_authors():
-    """对账时认可的发布账号：配置的 Owner 登录名 + 我们发评论时 GitHub 回包里的账号。"""
-    out = {a for a in (qstore.owner_login(), _read_write_state().get('poster') or '') if a}
-    return {a.lower() for a in out}
+def poster():
+    """我们发评论用的 GitHub 账号：只认我们自己 POST 成功时回包里记下的（不靠配置猜）。没有记录返回 ''。"""
+    return (_read_write_state().get('poster') or '').lower()
+
+
+CLOCK_SKEW = 120  # 秒：本机和 GitHub 的时钟偏差容忍
 
 
 def matches_intent(comment, nid, intent):
-    """一条评论是不是某个发送意图发出去的那条：完整尾标（含随机意图 id）+ 发布正文哈希 + 可信作者，三项都对上才算。"""
+    """一条评论是不是某个发送意图发出去的那条：完整尾标（含随机意图 id）+ 发布正文哈希 + 我们的发布账号，三项都对上，
+    且评论不早于意图（减时钟偏差）才算。还不知道发布账号（poster 没有记录）→ 一律不算：未知，不能当成我们自己发的。
+    对账（send / poll）和回声识别（poll.ingest）都只用这一个判定。"""
     body = comment.get('body') or ''
     tid = intent.get('tag_id') or ''
     if not tid or tag(nid, tid) not in body:
         return False
-    if intent.get('posted_hash') and qstore._hash(norm_body(body)) != intent['posted_hash']:
+    if not intent.get('posted_hash') or qstore._hash(norm_body(body)) != intent['posted_hash']:
         return False
-    author = ((comment.get('user') or {}).get('login') or '').lower()
-    trusted = trusted_authors()
-    return not trusted or author in trusted
+    who = poster()
+    if not who or ((comment.get('user') or {}).get('login') or '').lower() != who:
+        return False
+    made = qstore.parse_time((comment.get('created_at') or '').replace('Z', '+00:00'))
+    since = qstore.parse_time(intent.get('at'))
+    return not (made and since and made < since - timedelta(seconds=CLOCK_SKEW))
 
 
 def find_intent(repo, number, nid, intent):
-    """对账：到目标 Issue 上找这个意图发出去的评论。返回 (评论或 None, 是否完整读过)。"""
+    """对账：到目标 Issue 上找这个意图发出去的评论。返回 (评论或 None, 结论)：
+    complete = 读完了；incomplete = 没读完 / 读失败；no_poster = 还不知道我们的发布账号（判不了，不能当作没发）。"""
+    if not poster():
+        return None, 'no_poster'
     try:
         items = issue_comments(repo, number)
     except GHError:
-        return None, False
-    return next((c for c in items if matches_intent(c, nid, intent)), None), True
+        return None, 'incomplete'
+    return next((c for c in items if matches_intent(c, nid, intent)), None), 'complete'
 
 
 # ---------- 写门：跨进程串行（state/gh-write.lock）、间隔 ≥1 秒、每个需求 20 次/分钟、暂停复核包住实际写动作 ----------

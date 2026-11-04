@@ -2,10 +2,14 @@
 
 - 按 repo `issues/comments?since=…&per_page=100` 翻完所有页，再按需求关联的 Issue 号过滤；
 - 以本轮开始时间为保守水位，完整扫完并落盘后才推进，边界重叠 2 分钟，按 (id, updated_at, 正文哈希) 去重；
+  一轮读不完就记下 (since, 页) 游标下一轮接着读（不用时间戳续扫，同秒的不漏不卡）；
+- 并入按批短暂持锁、每批落盘一次；排投递按落盘状态做，进程中途退出后下一轮会补上；
 - 评论正文不落盘：`need inbox` / 详情页现场从 GitHub 取；
 - 编辑过的评论当「更新」再投一次（不是新的授权）；
 - 子 Issue 从根的真实子树里发现（含跨 repo、多层），新发现的整段回填一次；
-- 疑似循环只认「我们自己发的评论被投回」（带本需求尾标、对不上发送记录），连续 3 轮 → 停止自动投递；
+- 回声只认「我们自己发的内容又出现」（和对账同一个判定：完整尾标 + 正文哈希 + 我们的发布账号），记成自己的、不投回；
+  连续 3 轮都是回声 → 标疑似循环、停止自动投递。团队引用尾标不算；
+  不经 need comment 直接用 gh 发的评论（没有尾标、和 Owner 直写分不出）照常投递，这一条只靠 skill 的硬规定约束；
 - 查 herdr 不在这里做（不持锁调 herdr）：只记账、排投递，投给谁由服务的投递循环判断。
 """
 import json
@@ -83,13 +87,8 @@ def _issue_of(comment):
 
 
 def _source(rec, comment):
-    """这条（不是 own、也对不上发送意图的）评论从哪来：
-    echo：正文带我们给这个需求打的尾标——我们自己发的评论被当成新消息投回（循环迹象）；
-    unverified：Owner 的账号直接在 GitHub 写的；team-<账号>：别人（含 @lead-<ws> 点名，点名不改变来源）。"""
-    body = comment.get('body') or ''
-    nid = rec['id']
-    if f'qi:{nid} ' in body or f'qi:need-{nid} ' in body:
-        return 'echo'
+    """这条（不是 own、也不是我们自己发的）评论从哪来：unverified = Owner 的账号直接在 GitHub 写的；
+    team-<账号> = 别人（含 @lead-<ws> 点名、引用我们的尾标——引用不改变来源）。"""
     author = ((comment.get('user') or {}).get('login') or '').lower()
     owner = qstore.owner_login()
     if owner and author == owner:
@@ -105,24 +104,42 @@ def _row(comment, repo, number, self_by=''):
             'hash': qstore._hash(updated + (comment.get('body') or '')), 'self': self_by}
 
 
+def _echo_of(rec, comment):
+    """回声：这条评论按对账的同一判定（完整尾标 + 发布正文哈希 + 我们的发布账号）就是某个发送意图发出的内容，
+    但不是那次记下的评论——我们自己发的内容又出现了一次。返回那个意图，否则 None。团队引用、复制都对不上账号，不算。"""
+    cid = int(comment['id'])
+    for it in (rec.get('send_intents') or {}).values():
+        if int(it.get('comment_id') or 0) != cid and ghapi.matches_intent(comment, rec['id'], it):
+            return it
+    return None
+
+
 def ingest(rec, comment, repo, number):
-    """把一条评论并进需求记录（调用方持锁，不查 herdr）。返回来源（见 _source；新的或编辑过、需要投给 lead 时）或 ''。
-    不在这里排投递：一轮扫完后按需求统一记循环轮次、排一次唤醒。"""
-    own = qstore.own_comment(rec, int(comment['id']))
+    """把一条评论并进需求记录（调用方持锁，不查 herdr、不做网络 IO）。返回来源（新的或编辑过时）或 ''：
+    owner = 经 7788 发到 Issue 的 Owner 消息被编辑过；echo = 我们自己发的内容又出现（记成自己的，不投回）；
+    其余见 _source。不在这里排投递：一批落盘后由 _settle 按落盘状态排。"""
+    cid = int(comment['id'])
+    own = qstore.own_comment(rec, cid)
     self_by = (own.get('by') or 'owner') if own else ''
+    echo = None if own else _echo_of(rec, comment)
+    if echo:
+        qstore.add_own_comment(rec, cid, echo.get('by') or 'owner', issue=echo.get('issue') or '')
+        self_by = 'echo'
     is_new = qstore.upsert_comment(rec, _row(comment, repo, number, self_by))
+    if echo:
+        return 'echo' if is_new else ''
     if self_by and self_by != 'owner':
         return ''  # lead 自己发的：不投回给它
     if not is_new:
         return ''
     if self_by == 'owner':
-        return 'owner'  # 经 7788 发到 Issue 的 Owner 消息（被编辑过才会到这里）
+        return 'owner'
     return _source(rec, comment)
 
 
 def _reconcile_intents(rec, comment, repo, number):
-    """后台对账：结果不明 / 发送中的意图，只认**目标 Issue** 上完整尾标 + 发布正文哈希 + 可信账号都对上的评论。
-    对上了就和主动发送一样补记账并排投递（send.complete_intent）。"""
+    """后台对账：结果不明 / 发送中的意图，只认**目标 Issue** 上 ghapi.matches_intent 对上的评论。
+    对上了就和主动发送一样补记账并排投递（send.complete_intent）。调用方持锁、负责落盘。"""
     import send
     for rid, it in (rec.get('send_intents') or {}).items():
         if it.get('state') not in ('sending', 'uncertain'):
@@ -132,40 +149,57 @@ def _reconcile_intents(rec, comment, repo, number):
             continue
         if ghapi.matches_intent(comment, rec['id'], it):
             send.complete_intent(rec, rid, comment)
-            qstore._save_need(rec, f'对账找到评论 {comment["id"]}（{rid} 已补记，和主动发送一样排投递）')
+            rec['log'] = (rec.get('log') or []) + [{'at': qstore.now(), 'text': f'对账找到评论 {comment["id"]}（{rid} 已补记，和主动发送一样排投递）'}]
             return True
     return False
 
 
-def _take(cur, c, key, sources):
-    if _reconcile_intents(cur, c, key[0], key[1]):
-        return
-    src = ingest(cur, c, key[0], key[1])
-    if src:
-        sources.setdefault(cur['id'], []).append(src)
-    qstore._save_need(cur)
+INGEST_BATCH = 200  # 一次持锁最多并入这么多条评论（落盘一次），然后放锁
+
+
+def _apply(nid, items, sources):
+    """把 [(评论, (repo, number))] 并进需求：网络 IO 都在调用方（锁外）做完；这里按批短暂持锁、每批只落盘一次，
+    批与批之间放锁，前台的回复 / ack / 投递不用等整段回填。每批都重新读记录，不会用旧快照覆盖期间别人写的。"""
+    for i in range(0, len(items), INGEST_BATCH):
+        with qstore.locked():
+            cur = qstore.read_need(nid)
+            for c, key in items[i:i + INGEST_BATCH]:
+                if _reconcile_intents(cur, c, key[0], key[1]):
+                    continue
+                src = ingest(cur, c, key[0], key[1])
+                if src:
+                    sources.setdefault(nid, []).append(src)
+            qstore._save_need(cur)
 
 
 def _settle(nid, srcs):
-    """一轮扫完：记循环轮次；没刹车就给负责 lead 排**一次**唤醒（多条合并，提示词按未通知的消息现算）。"""
+    """一轮扫完（也在每轮开头之后对所有需求跑一遍）：记循环轮次；没刹车时，**按落盘状态**决定要不要排唤醒——
+    有待投递的评论、又没有正在进行 / 暂缓中的 lead 投递，就排一次。所以进程在「评论已落盘、还没排投递」时退出，
+    下一轮也会补上。返回是否排了投递。"""
     with qstore.locked():
         rec = qstore.read_need(nid)
-        if rec.get('loop_suspect') or qstore.note_round(rec, srcs):
+        if srcs and qstore.note_round(rec, srcs) or rec.get('loop_suspect'):
             n = 0
             for c in rec['comments']:
                 if c.get('state') == 'pending':
                     c['state'] = 'held'
                     n += 1
-            rec['last_error'] = '疑似循环：连续 3 轮新评论都是我们自己发的评论被投回（带本需求尾标、对不上发送记录），已停止自动投递'
-            qstore._save_need(rec, f'疑似循环：{n} 条评论只记下，不自动投递')
+            if n or srcs:
+                rec['last_error'] = '疑似循环：连续 3 轮新评论都是我们自己发的内容又出现（对账判定为我们的发送），已停止自动投递'
+                qstore._save_need(rec, f'疑似循环：{n} 条评论只记下，不自动投递')
+            return False
+        busy = rec.get('delivery_to') == 'lead' and rec.get('delivery') in ('pending', 'held', 'sending', 'uncertain')
+        if not rec.get('lead') or busy or not any(c.get('state') == 'pending' for c in rec['comments']):
+            if srcs:
+                qstore._save_need(rec)
             return False
         qstore._queue_need(rec, 'comments')
-        qstore._save_need(rec, f'轮询到 {len(srcs)} 条新的 / 编辑过的 Issue 评论，排投递')
+        qstore._save_need(rec, f'有 {sum(c.get("state") == "pending" for c in rec["comments"])} 条待投递的 Issue 评论，排投递')
         return True
 
 
 def scan(force=False):
-    """扫一轮。返回 {repo: {'ok','new','error','at','remaining'}}；失败保留上次水位不推进。"""
+    """扫一轮。返回 {repo: {'ok','complete','new','error','at','remaining'}}；失败保留上次水位 / 游标不推进。"""
     if not SCAN_LOCK.acquire(blocking=False):
         return {'busy': True}
     try:
@@ -176,7 +210,7 @@ def scan(force=False):
 
 def _backfill(needs, trees, sources):
     """新发现的子 Issue（GitHub 上后挂进来的、没逐一 need link 的）：整段读一次它的评论，不靠 repo 水位
-    （水位早已越过它的旧评论）。读成功才记进 watch，下一轮不再整段读。"""
+    （水位早已越过它的旧评论）。读评论在锁外，并入按批短暂持锁；全部并入成功才记进 watch，下一轮不再整段读。"""
     out = {}
     for rec in needs:
         if rec.get('status') != 'filed':
@@ -193,10 +227,9 @@ def _backfill(needs, trees, sources):
             except ghapi.GHError as e:
                 out[key] = e.message
                 continue
+            _apply(rec['id'], [(c, (repo, number)) for c in items], sources)
             with qstore.locked():
                 cur = qstore.read_need(rec['id'])
-                for c in items:
-                    _take(cur, c, (repo, number), sources)
                 cur['watch'] = list(dict.fromkeys((cur.get('watch') or []) + [key]))
                 qstore._save_need(cur, f'开始轮询子 Issue {key}（回填 {len(items)} 条评论）')
     return out
@@ -217,46 +250,50 @@ def _scan(force):
     for repo in repos:
         ent = st.get(repo) if isinstance(st.get(repo), dict) else {}
         now = datetime.now(qstore.TZ)
-        since = ent.get('since') or (now - timedelta(days=1)).isoformat(timespec='seconds')
-        # 上一轮没读完时水位是 GitHub 上最后读到那条的时间（没有时钟偏差），不再回退 2 分钟，否则页数上限内永远读不到后面
-        overlap = (qstore.parse_time(since) or now) - (timedelta() if ent.get('kind') == 'partial' else timedelta(minutes=2))
+        cursor = ent.get('cursor') if isinstance(ent.get('cursor'), dict) else None
+        if cursor:  # 上一轮没读完：同一个 since 从记下的页接着读，多读前一页吸收翻页期间的增删位移
+            q_since, page, started = cursor.get('since'), int(cursor.get('page') or 1), cursor.get('started')
+            start, pages = max(1, page - 1), ghapi.LIST_MAX_PAGES + (1 if page > 1 else 0)
+        else:
+            since = ent.get('since') or (now - timedelta(days=1)).isoformat(timespec='seconds')
+            q_since = ((qstore.parse_time(since) or now) - timedelta(minutes=2)).isoformat(timespec='seconds')
+            start, pages, started = 1, ghapi.LIST_MAX_PAGES, now.isoformat(timespec='seconds')
         try:
-            comments, complete = ghapi.list_comments(repo, overlap.isoformat(timespec='seconds'))
+            comments, complete, nxt = ghapi.list_comments(repo, q_since, start_page=start, max_pages=pages)
         except ghapi.GHError as e:
             ent.update({'error': e.message, 'kind': e.kind, 'at': ent.get('at') or '',
                         'tried': now.isoformat(timespec='seconds')})
             st[repo] = ent
             out[repo] = {'ok': False, 'error': e.message, 'kind': e.kind, 'at': ent.get('at') or ''}
             continue
-        touched, new = set(), 0
+        groups = {}
         for c in comments:
             key = _issue_of(c)
-            if not key or key not in idx:
-                continue
-            for rec in idx[key]:
-                with qstore.locked():
-                    cur = qstore.read_need(rec['id'])
-                    before = len(sources.get(rec['id']) or [])
-                    _take(cur, c, key, sources)
-                    new += len(sources.get(rec['id']) or []) - before
-                touched.add(rec['id'])
-        if complete:
-            mark = now.isoformat(timespec='seconds')
-        else:  # 没读完（到了页数上限）：只推进到读到的最后一条，下一轮从那里接着读，不跳过
-            last = max((qstore.parse_time((c.get('updated_at') or '').replace('Z', '+00:00')) for c in comments
-                        if c.get('updated_at')), default=None)
-            mark = last.astimezone(qstore.TZ).isoformat(timespec='seconds') if last else ent.get('since') or since
-        ent.update({'since': mark, 'at': now.isoformat(timespec='seconds'),
-                    'error': '' if complete else f'评论太多，这一轮只读到 {mark}，下一轮接着读', 'kind': '' if complete else 'partial',
+            if key and key in idx:
+                for rec in idx[key]:
+                    groups.setdefault(rec['id'], []).append((c, key))
+        new = 0
+        for nid, items in groups.items():
+            before = len(sources.get(nid) or [])
+            _apply(nid, items, sources)
+            new += len(sources.get(nid) or []) - before
+        if complete:  # 整段读完：水位推进到这一串续扫的第一轮开始时间（期间的新改动下一轮带 2 分钟重叠再读）
+            ent['since'] = started
+            ent.pop('cursor', None)
+        else:
+            ent['cursor'] = {'since': q_since, 'page': nxt, 'started': started}
+        ent.update({'at': now.isoformat(timespec='seconds'),
+                    'error': '' if complete else f'评论太多，这一轮读到第 {nxt - 1} 页，下一轮接着读', 'kind': '' if complete else 'partial',
                     'tried': now.isoformat(timespec='seconds'), 'remaining': ghapi.remaining()})
         st[repo] = ent
         out[repo] = {'ok': True, 'complete': complete, 'new': new, 'at': ent['at'], 'remaining': ghapi.remaining(),
-                     'needs': sorted(touched)}
+                     'needs': sorted(groups)}
     errs = _backfill(needs, trees, sources)
     if errs:
         out['_backfill'] = errs
-    for nid, srcs in sources.items():
-        _settle(nid, srcs)
+    for rec in needs:  # 按落盘状态补排：上一轮中途退出时已落盘、没排投递的评论在这里补上
+        if sources.get(rec['id']) or (rec.get('lead') and rec.get('status') in qstore.LEAD_STATES):
+            _settle(rec['id'], sources.get(rec['id']) or [])
     _write_state(st)
     return out
 

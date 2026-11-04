@@ -41,7 +41,10 @@ class FixBase(v2.V2Base):
     def age_intent(self, nid, rid, seconds=600):
         with qstore.locked():
             cur = qstore.read_need(nid)
-            cur['send_intents'][rid]['tried_at'] = ts(timedelta(seconds=seconds))
+            it = cur['send_intents'][rid]
+            it['tried_at'] = ts(timedelta(seconds=seconds))
+            if it.get('posting_at'):  # 宽限期从实际 POST 算：「时间过去了」要连 POST 时刻一起回拨
+                it['posting_at'] = ts(timedelta(seconds=seconds))
             qstore._save_need(cur)
 
 
@@ -401,9 +404,13 @@ class LoopBrakeTest(FixBase):
 
     def test_echo_brake_can_be_cleared_from_page(self):
         nid = self.filed()
+        send.lead_comment(nid, '会被重复发出的结论', self.as_ident('w1:p1'))
+        ours = self.gh_state()['comments']['owner/repo'][-1]['body']
         for i in range(3):
-            self.add_comment(30, 43000 + i, f'回声 {i}\n\n<!-- qi:{nid} i-{"cd" * 16} -->', author='demo-owner')
+            self.add_comment(30, 43000 + i, ours, author='demo-owner')  # 我们自己的内容又出现（回声）
             poll.scan()
+        self.add_comment(30, 43009, '刹车之后来的团队评论', author='teammate')
+        poll.scan()
         self.assertTrue(qstore.read_need(nid)['loop_suspect'])
         self.start_server()
         st, d, _ = self.http('GET', f'/api/need/{nid}')
@@ -509,14 +516,15 @@ class TakeoverFixTest(FixBase):
         self.assertEqual(rec['delivery'], 'held')
         self.assertNotIn('takeover_ask', rec)
 
-    def test_filed_still_uses_takeover_delivery(self):
-        """已立项的不变：确认不在 → 排 takeover 投给 Router（设计 §3）。"""
+    def test_filed_absence_also_holds_and_asks_router(self):
+        """已立项的同样（R2，Claude R2 I1）：确认不在 → 消息 held 在 lead 这边，自动请 Router 接手，不占投递槽。"""
         nid = self.filed()
         self.lead_panes(gone=('w1:p1',))
         qstore.owner_reply(nid, '立项后在吗', 'req-filed-gone-1')
         self.deliver_now(nid)
         rec = qstore.read_need(nid)
-        self.assertEqual((rec['delivery'], rec['delivery_kind']), ('pending', 'takeover'))
+        self.assertEqual((rec['delivery'], rec['delivery_to']), ('held', 'lead'))
+        self.assertEqual(len(self.asks()), 1)
 
 
 # ---------- 7. 需求树与通知范围 ----------

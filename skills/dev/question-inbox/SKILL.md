@@ -177,11 +177,17 @@ Router 起 lead、写派工书（`<lead 目录>/dispatch/`）、claim 校验都�
   回执显示「已发到 GitHub → 已通知 lead → lead 已读」。时间线来源分「7788 讨论」/「Issue 评论 · 经 7788」/「Issue 评论」。
 - **发 GitHub 评论的三个入口**（Owner 勾选发到 Issue、`need comment`、立项评论）走同一套发送记账：先记发送意图，过写门
   （跨进程串行、间隔 ≥ 1 秒、每需求 20 次/分钟、暂停复核包住实际写动作）再发。确定没发出去（暂停、限流、gh 起不来、GitHub 4xx）可以原样重试；
-  结果不明（超时、5xx、回包丢失）先到根 Issue 对账——只认完整尾标 + 发布正文哈希 + 可信账号，复制尾标或正文片段都不算——
-  读完也找不到、且超过宽限期，才判定没发出去重发。轮询对账找到的和主动发送一样投给负责 lead。
+  结果不明（超时、5xx、回包丢失）先到根 Issue 对账——只认完整尾标 + 发布正文哈希 + **我们记下的发布账号**（POST 成功时回包里的账号；
+  还没有这个记录就判为未知、不认也不重发），复制尾标或正文片段都不算——读完也找不到、且距**实际发出 POST** 超过宽限期，才判定没发出去重发
+  （排队等写锁的时间不算）。同一条消息只会真正 POST 一次：发之前在跨进程写锁里再核对一次「是否已发 / 别的请求已在发」。
+  轮询对账找到的和主动发送一样投给负责 lead。
 - **投给负责 lead**：同一个 lead 的多种消息（Issue 评论、7788 回复、确认、收尾）合并成一次唤醒，提示词按这次实际带上的消息写，不会互相覆盖；
   收尾真正投出去才算「已发收尾通知」。子 Issue 从根 Issue 的真实子树发现（多层、跨 repo），上面的评论同样投给负责 lead；PR 讨论不汇聚。
-- **疑似循环**只认「我们自己发的评论被投回」：带本需求尾标、却对不上任何发送记录的评论连续 3 轮。Owner 直接在 GitHub 写、团队 `@lead-<ws>` 点名都照常投递。
+- **循环刹车只拦「我们自己发的评论被投回给自己」**：判定和对账同一个（完整尾标 + 发布正文哈希 + 我们的发布账号）。
+  我们发的内容又出现一次就记成自己的、不投回；连续 3 轮都是这种才标「疑似循环」停止自动投递。
+  Owner 直接在 GitHub 写、团队 `@lead-<ws>` 点名、团队引用或复制我们的尾标，都照常投递，不算回声。
+  **边界（Owner / lead 已定）**：不经 `need comment` 直接用 gh 发的评论（没有尾标，和 Owner 本人在 GitHub 上写的分不出来）
+  会作为「来源未核实」照常投给负责 lead，刹车**不拦**——这一条只靠本 skill 和 workspace skill 的硬规定约束：GitHub 评论只能经 `need comment` 发。
 - lead 判断什么时候把**结论**写进 Issue：范围 / 验收 / 取舍 / 优先级变化，或 Owner 明确说「记一下」时，用 `need comment`；
   小进展用 `need say` 留在 7788。Issue 评论是协作输入，不是授权。
 - **Owner 在页面上**：对还没有负责 lead 的需求写的是「补充 / 纠正」（记成 note，Router 正在处理时投给 Router）；有负责 lead 之后写的是「回复」，
@@ -189,10 +195,10 @@ Router 起 lead、写派工书（`<lead 目录>/dispatch/`）、claim 校验都�
   等 Owner 回复或确认的需求出现在「待处理」最上面的「需求讨论」一栏。
 - 还没 lead claim 的需求（assigned）：Owner 的补充投给 Router；分派后 30 分钟（`QI_UNCLAIMED_AFTER` 秒）仍没人 claim，服务自动补投 Router 一次，页面也给「重新通知」。
 - 投递和回答投递同一套机制：按 agent_session 定位、写前记账、held / uncertain、退避、不重复发，同一批最多合并 5 条。
-  投给负责 lead 时找不到它（pane 关了、换了会话）：不改投别的 lead、也不拉起谁。负责 lead **确认不在**时服务自动请 Router 安排接手：
-  已立项的排一次 takeover 投给 Router；立项前的消息记成暂缓（页面写「负责 lead 不在，已请 Router 安排接手」、看板进「卡住 · 没人管」），
-  同时直接请 Router 一次（同一需求 `QI_TAKEOVER_REASK` 秒内、默认 30 分钟只叫一次；全局暂停时不叫、只记录）。查不清只暂缓，不叫 Router。
-  页面上的「请 Router 安排接手」是手动重试。新 lead `claim --takeover` 后，没 ack 的消息重新投给它。
+  投给负责 lead 时找不到它（pane 关了、换了会话）：不改投别的 lead、也不拉起谁。负责 lead **确认不在**时（立项前后一样）
+  消息留在 lead 这边记成暂缓（页面写「负责 lead 不在，已请 Router 安排接手」、看板进「卡住 · 没人管」、按退避重试），
+  同时直接请 Router 一次（不占投递槽；同一需求 `QI_TAKEOVER_REASK` 秒内、默认 30 分钟只叫一次；全局暂停时不叫、只记录）。查不清只暂缓，不叫 Router。
+  重试时原 lead 回来了 → 照常投给它，接手请求作废；新 lead `claim --takeover` 后，没 ack 的消息重新投给它。页面上的「请 Router 安排接手」是手动重试。
 - **Router 不在时自动拉起**（没登记、或登记的 pane 没了 / agent 已退出）：服务在 session router 里建 workspace `Router`（cwd `~/workspaces`）、
   `agent start router --kind claude -- --dangerously-skip-permissions --model opus`，信任弹窗读屏后选「信任」，再发「读 skill router、register、处理待办」。
   session 的 socket 不在就只报暂缓、不创建；同一时间只拉一次，1 小时最多 3 次，超过页面标红「Router 起不来」并停止自动拉起（页面可重试，Router 登记后自动解除）。

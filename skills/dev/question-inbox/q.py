@@ -326,10 +326,10 @@ def cmd_need_inbox(args):
     if r['comments']:
         print(f'## Issue 评论（{len(r["comments"])} 条）')
         for c in r['comments']:
-            print(f'\n### [{c.get("ack")}] {c.get("author") or "?"} · {c.get("repo")}#{c.get("number")} · {c.get("updated")}'
-                  + ('（编辑过）' if c.get('edited') else ''))
+            print(f'\n### [{c.get("ack") or c.get("id")}] {c.get("author") or "?"} · {c.get("repo")}#{c.get("number")} · {c.get("updated")}'
+                  + ('（编辑过）' if c.get('edited') else '') + ('（正文读不到，这条先不要确认）' if c.get('unreadable') else ''))
             print(c.get('body') or '')
-    acks = [x.get('ack') for x in r.get('thread') or []] + [c.get('ack') for c in r['comments']]
+    acks = [x.get('ack') for x in r.get('thread') or []] + [c.get('ack') for c in r['comments'] if c.get('ack')]
     if acks:  # 只确认这一次读到的那几条（带版本）；之后新来的 / 被编辑的不受影响
         print('\n读完执行：python3 ' + str(Path(__file__).resolve()) + f' need inbox {args.id} '
               + ' '.join(f'--ack {a}' for a in acks))

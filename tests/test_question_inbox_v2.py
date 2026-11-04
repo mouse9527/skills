@@ -220,10 +220,13 @@ class V2PollTest(V2Base):
         self.assertEqual((rec['delivery'], rec['delivery_kind']), ('pending', 'comments'))
 
     def test_three_rounds_of_own_echo_trigger_loop_brake(self):
-        # 带本需求尾标、却对不上任何发送意图的评论 = 我们自己发的被当成新消息投回；连续 3 轮才刹车
+        # 回声 = 和对账同一判定（完整尾标 + 正文哈希 + 我们的发布账号）对上某个发送意图、却不是那次记下的评论：
+        # 我们自己发的内容又出现了；记成自己的、不投回，连续 3 轮才刹车（R2：不再看正文片段）
         nid = self.filed()
+        send.lead_comment(nid, '一条结论', self.as_ident('w1:p1'))
+        ours = self.gh_state()['comments']['owner/repo'][-1]['body']
         for i in range(3):
-            self.add_comment(30, 4000 + i, f'自己发的被投回 {i}\n\n<!-- qi:{nid} i-{"ab" * 16} -->', author='demo-owner')
+            self.add_comment(30, 4000 + i, ours, author='demo-owner')
             poll.scan()
             rec = qstore.read_need(nid)
             if rec.get('delivery') in ('pending', 'held', 'sending'):
@@ -294,9 +297,12 @@ class V2TakeoverTest(V2Base):
         poll.scan()
         self.lead_panes(gone=('w1:p1',))  # 原 lead-a 退出，lead-b 还在
         qstore.owner_reply(nid, '新补充', 'req-after-gone')
-        self.deliver_now(nid)  # 投给负责 lead 失败，确认不在 → 叫 Router 安排接手
+        self.deliver_now(nid)  # 投给负责 lead 失败，确认不在 → 消息留在 lead 这边暂缓，并请 Router 安排接手（R2：不再占投递槽）
         rec = qstore.read_need(nid)
-        self.assertEqual((rec['delivery'], rec['delivery_kind']), ('pending', 'takeover'))
+        self.assertEqual((rec['delivery'], rec['delivery_to']), ('held', 'lead'))
+        self.assertIn('已请 Router 安排接手', rec['last_error'])
+        self.assertEqual(rec['takeover_ask']['result'], 'sent')
+        self.assertIn('router takeover ' + nid, self.router_prompts()[-1][-1])
         ident_b = self.as_ident('w1:p2')
         qstore.claim_need(nid, ident_b, takeover=True)  # 新 lead 接手
         self.assertEqual(qstore.read_need(nid)['lead']['pane_id'], 'w1:p2')

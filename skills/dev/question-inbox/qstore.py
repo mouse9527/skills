@@ -1378,11 +1378,11 @@ def _check_request_id(request_id):
 def _queue_need(rec, kind):
     """排一次投递；delivery_seq + 1，让正在发的那次回包（finish）不覆盖这次。reply / confirm / comments / closeout 投给负责 lead，
     其余投给 Router。投给 lead 的几种消息**合并**进 delivery_kinds，不互相覆盖；提示词按当时还没通知的消息现算。
-    负责 lead 确认不在、已经叫 Router 安排接手（takeover 还没被 Router 领取）时，新来的 lead 消息不改投：消息本身都有记账，
-    新 lead claim --takeover 后会重新投给它。"""
+    旧记录里投递槽还停在 takeover：只有它**还没投出**（pending / sending）时新来的 lead 消息先不排；一旦投出（sent 及以后），
+    lead 消息照常排队——投递时会现场核对负责 lead：回来了就照常投，仍不在就暂缓并（去重地）再请 Router，不会被吞掉。
+    （现在的接手请求不再占投递槽，见 server.ask_router_takeover。）"""
     to = 'lead' if kind in LEAD_KINDS else 'router'
-    open_ = rec.get('delivery') in ('pending', 'sending', 'held', 'uncertain', 'sent')
-    if to == 'lead' and rec.get('delivery_kind') == 'takeover' and open_:
+    if to == 'lead' and rec.get('delivery_kind') == 'takeover' and rec.get('delivery') in ('pending', 'sending'):
         return
     kinds = [kind]
     if to == 'lead' and rec.get('delivery_to') == 'lead' and rec.get('delivery') in ('pending', 'held', 'sending', 'uncertain'):
@@ -1732,8 +1732,8 @@ def lead_inbox(nid, ack, ident, fetch_body):
     for c in rows:
         try:
             c['body'] = fetch_body(c.get('repo'), c.get('number'), int(c.get('id')))
-        except QError as e:
-            c['body'] = f'（正文暂时读不到：{e.message}）'
+        except QError as e:  # 没读到的不给确认口令：只确认真正读过的；下次读成功再拿口令
+            c.update({'body': f'（正文暂时读不到：{e.message}）', 'ack': '', 'unreadable': True})
     return {'acked': 0, 'stale': [], 'comments': rows, 'thread': thread, 'closeout': closeout}
 
 
@@ -1744,24 +1744,12 @@ def outstanding(rec):
             'closeout': bool(isinstance(rec.get('closeout'), dict) and not rec.get('closed_notified'))}
 
 
-def queue_takeover(nid):
-    """服务发现「已立项、有没投出去的消息 + 负责 lead 确认不在」：去重叫醒 Router 安排接手（Router 领取之前不重复叫）。"""
-    with locked():
-        rec = read_need(nid)
-        if rec.get('status') != 'filed':
-            raise QError(409, f'{nid} 还没立项：负责 lead 不在时只暂缓，由 Owner 在页面上请 Router 安排接手')
-        if rec.get('delivery_kind') == 'takeover' and rec.get('delivery') in ('pending', 'sending', 'sent', 'held', 'uncertain'):
-            return
-        _queue_need(rec, 'takeover')
-        _save_need(rec, '负责 lead 确认不在：叫 Router 安排接手')
-
-
 def request_takeover(nid, lead_state):
-    """页面上「请 Router 安排接手」（手动重试入口）的校验：有负责 lead、还没立项、负责 lead **确认不在**。
+    """页面上「请 Router 安排接手」（手动重试入口）的校验：有负责 lead、负责 lead **确认不在**（立项前后都可以）。
     lead_state 是调用方锁外查好的 presence。只校验，真正去叫 Router 由服务的 ask_router_takeover 做（不动投递槽，held 保持）。"""
     rec = read_need(nid)
-    if not rec.get('lead') or rec.get('status') not in LEAD_STATES or rec.get('status') == 'filed':
-        raise QError(409, f'{nid} 状态是 {rec.get("status")}：只有立项前、有负责 lead 的需求走这里（已立项的由服务自动安排）')
+    if not rec.get('lead') or rec.get('status') not in LEAD_STATES:
+        raise QError(409, f'{nid} 状态是 {rec.get("status")}：没有负责 lead，不需要接手')
     if lead_state != 'absent':
         raise QError(409, '负责 lead 还在，不安排接手' if lead_state == 'present' else '核对不了负责 lead 是否还在，稍后再试')
     return rec
@@ -1773,13 +1761,25 @@ def takeover_reask():
 
 
 def takeover_ask_due(rec, at=None):
-    """立项前负责 lead 确认不在时，这次要不要去叫 Router：已经叫过（sent / uncertain）且还在去重窗口内就不叫；
+    """负责 lead 确认不在时，这次要不要去叫 Router：已经叫过（sent / uncertain）且还在去重窗口内就不叫；
     暂停 / Router 不在时没叫成，不算叫过。"""
     a = rec.get('takeover_ask') if isinstance(rec.get('takeover_ask'), dict) else {}
     t = parse_time(a.get('at'))
     if a.get('result') in ('sent', 'uncertain') and t:
         return ((at or datetime.now(TZ)) - t).total_seconds() >= takeover_reask()
     return True
+
+
+def clear_takeover_ask(ids):
+    """投递时现场核对到负责 lead 在：之前的接手请求作废（原 lead 回来了），下次再不在时重新去叫。"""
+    with locked():
+        for nid in ids:
+            try:
+                rec = read_need(nid)
+            except QError:
+                continue
+            if rec.pop('takeover_ask', None) is not None:
+                _save_need(rec, '负责 lead 又在了：之前的「请 Router 安排接手」作废，照常投递')
 
 
 def note_takeover_ask(nid, result, why=''):
