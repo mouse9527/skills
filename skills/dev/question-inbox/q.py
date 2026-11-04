@@ -14,7 +14,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import qstore  # noqa: E402
+import poll  # noqa: E402
 import routerctl  # noqa: E402
+import send  # noqa: E402
 import tasks  # noqa: E402
 
 EXIT = {400: 1, 404: 1, 409: 3, 410: 3, 403: 4}
@@ -195,6 +197,12 @@ def need_text(rec):
                 out += [f'### {x.get("at")} {"Owner" if x.get("by") == "owner" else "lead"} · 回复', x.get('text', '')]
     if rec.get('issues'):
         out += ['', '## Issue（第一个是根）'] + [f'- {u}' for u in rec['issues']]
+    unread = qstore.unread_comments(rec)
+    if unread:
+        out += ['', f'## 未读的 Issue 评论（{len(unread)} 条，正文用 need inbox 读）']
+        out += [f'- {c.get("id")} {c.get("author") or "?"} {c.get("updated") or ""}' for c in unread]
+    if rec.get('loop_suspect'):
+        out += ['', '⚠️ 疑似循环：连续 3 次投递都来自未核实来源 / 同一 lead，已停止自动投递。']
     if st in qstore.SEALED:
         out += ['', '（已封存：线程只读）']
     return '\n'.join(out)
@@ -274,9 +282,84 @@ def cmd_need_card(args):
 
 def cmd_need_link(args):
     rec = qstore.read_need(args.id)
+    first = rec.get('status') != 'filed'
     rec = qstore.link(args.id, args.issue, privileged(args), issue_info=tasks.issue_body,
                       main_repo=routerctl.main_repo(rec.get('ws') or ''))
-    print(f'{rec["id"]} 已立项（filed），关联 {len(rec["issues"])} 个 Issue；讨论线程已封存')
+    print(f'{rec["id"]} 已立项（filed），关联 {len(rec["issues"])} 个 Issue；讨论线程继续可用')
+    # 第一次立项贴「已确认的理解」；上次没贴成（失败 / 结果不明）时重跑 need link 接着贴（同一个幂等键，不会贴第二条）
+    retry = not first and (rec.get('send_intents') or {}).get(send.link_request_id(rec['id'])) is not None
+    if not (first or retry) or not send.link_pending(rec):
+        return 0
+    try:
+        got = send.link_comment(rec, privileged(args))
+    except qstore.QError as e:
+        print(f'✗ 已确认的理解没能贴到根 Issue：{e.message}', file=sys.stderr)
+        print(f'  需求仍是 filed；稍后重跑同一条 need link 会接着贴（先对账，不会重复）', file=sys.stderr)
+        return EXIT.get(e.code, 1)
+    if first:
+        try:
+            poll.seed_watermark(rec['issues'][0])
+        except qstore.QError:
+            pass  # 回填水位失败不影响立项，下一轮按原水位扫
+    print(f'已在根 Issue 贴「已确认的理解」（评论 {got["comment_id"]}{"" if got["created"] else "，之前已发出，这次只补记账"}）')
+    return 0
+
+
+def cmd_need_inbox(args):
+    ident = privileged(args)
+    r = qstore.lead_inbox(args.id, args.ack, ident, poll.body_fetcher)
+    if args.ack:
+        print(f'{args.id} 已确认已读 {r["acked"]} 条')
+        if r.get('stale'):
+            print(f'⚠️ 这些评论在你读过之后又被编辑，没有确认：{"、".join(r["stale"])}；重新 need inbox {args.id} 读新版本')
+        return 0
+    if not r['comments'] and not r.get('thread') and not r.get('closeout'):
+        print(f'{args.id} 没有未读消息')
+        return 0
+    if r.get('closeout'):
+        print(f'## 待收尾：{r["closeout"].get("why")}（{r["closeout"].get("at")}）')
+    if r.get('thread'):
+        print(f'## 7788 线程里还没读的 Owner 消息（{len(r["thread"])} 条）')
+        for x in r['thread']:
+            what = f'确认了理解卡 v{x.get("rev")}' if x.get('kind') == 'confirm' else x.get('text')
+            print(f'- [{x.get("ack")}] {x.get("at")} {what}')
+    if r['comments']:
+        print(f'## Issue 评论（{len(r["comments"])} 条）')
+        for c in r['comments']:
+            print(f'\n### [{c.get("ack") or c.get("id")}] {c.get("author") or "?"} · {c.get("repo")}#{c.get("number")} · {c.get("updated")}'
+                  + ('（编辑过）' if c.get('edited') else '') + ('（正文读不到，这条先不要确认）' if c.get('unreadable') else ''))
+            print(c.get('body') or '')
+    acks = [x.get('ack') for x in r.get('thread') or []] + [c.get('ack') for c in r['comments'] if c.get('ack')]
+    if acks:  # 只确认这一次读到的那几条（带版本）；之后新来的 / 被编辑的不受影响
+        print('\n读完执行：python3 ' + str(Path(__file__).resolve()) + f' need inbox {args.id} '
+              + ' '.join(f'--ack {a}' for a in acks))
+    return 0
+
+
+def cmd_need_say(args):
+    text = Path(args.body).read_text(encoding='utf-8') if args.body else args.text
+    qstore.lead_say(args.id, text or '', privileged(args))
+    print(f'{args.id} 已在 7788 线程里记一句（不投递、不进 GitHub）')
+
+
+def cmd_need_comment(args):
+    body = Path(args.body).read_text(encoding='utf-8') if args.body else args.text
+    got = send.lead_comment(args.id, body or '', privileged(args), getattr(args, 'request_id', '') or '')
+    print(f'{args.id} 的结论已写到根 Issue：{got["url"]}（评论 {got["comment_id"]}'
+          + ('' if got['created'] else '，这条之前已经发出，没有重发') + '）')
+
+
+def cmd_need_unloop(args):
+    qstore._check_lead(qstore.read_need(args.id), privileged(args))
+    rec = qstore.unloop(args.id)
+    print(f'{rec["id"]} 已解除疑似循环；held 的评论恢复投递')
+
+
+def cmd_router_takeover(args):
+    ident = privileged(args)
+    qstore.check_router(ident)
+    path, pane, new = routerctl.takeover(args.id)
+    print(f'{args.id} 已安排接手：lead-{qstore.read_need(args.id)["ws"]}（pane {pane}，{"新起" if new else "续派"}）；任务书 {path}')
 
 
 def cmd_need_drop(args):
@@ -514,9 +597,23 @@ def main(argv=None):
     r = n('card', cmd_need_card, '负责 lead：发理解卡（## 理解 / 范围 / 不做什么 / 验收草案 / 开放问题）')
     r.add_argument('id')
     r.add_argument('--body', required=True, help='理解卡 markdown 文件')
-    r = n('link', cmd_need_link, '负责 lead：建好 Issue 后登记（完整 URL，第一个是根）→ filed')
+    r = n('link', cmd_need_link, '负责 lead：建好 Issue 后登记（完整 URL，第一个是根）→ filed；并把已确认的理解贴成评论')
     r.add_argument('id')
     r.add_argument('--issue', action='append', required=True)
+    r = n('inbox', cmd_need_inbox, '负责 lead：列出未读的 Issue 评论（正文现场从 GitHub 取，不改状态）；--ack 才标已读')
+    r.add_argument('id')
+    r.add_argument('--ack', action='append', metavar='TOKEN',
+                   help='读完后确认，可以重复；照 inbox 打印的口令原样写：评论 <id>@<版本>，7788 消息 m:<id>')
+    for name, fn, h in (('say', cmd_need_say, '负责 lead：在 7788 线程里说一句（小进展，不进 GitHub）'),
+                        ('comment', cmd_need_comment, '负责 lead：把结论写到根 Issue（团队可见；GitHub 评论只能经这条命令发）')):
+        r = n(name, fn, h)
+        r.add_argument('id')
+        r.add_argument('--body', help='正文 markdown 文件')
+        r.add_argument('--text', help='直接写正文（二选一）')
+        if name == 'comment':
+            r.add_argument('--request-id', help='幂等键（默认由需求 + 正文派生：同一正文重跑不会重复发，结果不明时先对账）')
+    r = n('unloop', cmd_need_unloop, '负责 lead：解除「疑似循环」（确认不是自己的评论被投回之后）')
+    r.add_argument('id')
     r = n('drop', cmd_need_drop, '负责 lead：不做（Issue 要先写理由并以 not planned 关闭）')
     r.add_argument('id')
     r.add_argument('--issue', required=True, help='那个 not planned Issue 的完整 URL')
@@ -530,6 +627,8 @@ def main(argv=None):
     r = rt('close-lead', cmd_router_close_lead, '关闭 Router 自己建的 L·<ws> workspace（只认 router-leads.json 里的记录，三项对得上才关）')
     r.add_argument('ws')
     r = rt('dispatch', cmd_router_dispatch, '把 assigned 的需求交给 lead-<ws>：写任务书 dispatch/<id>.md、确保 lead 在、prompt 它')
+    r.add_argument('id')
+    r = rt('takeover', cmd_router_takeover, '已立项需求的负责 lead 不在：安排同 ws 的新 lead 接手（claim --takeover + need inbox）')
     r.add_argument('id')
     args = p.parse_args(argv)
     for stream in (sys.stdout, sys.stderr):  # Owner 原话要逐字输出，不受 locale 影响

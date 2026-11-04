@@ -433,6 +433,7 @@ const TV = JSON.parse(process.argv[4]);
   out.hrefs = findAll(e => e.tagName === 'A', main).map(a => a.attrs.href);
   out.indent = findAll(e => /\btrow\b/.test(e.className), main).map(e => e.className);
   out.modes = text(modes);
+  out.side = text(side);
   button('刷新', main).dispatch('click'); await flush();
   out.refreshing = {disabled: byId('tasks_refresh').disabled, paths: taskGets()};
   answer('/api/tasks?refresh=1', 500, {error: '任务视图出错'}); await flush();
@@ -473,7 +474,7 @@ class TasksPageTest(unittest.TestCase):
         for s in ('等你', '待开工', '无法刷新 owner/repo', '只显示最近更新的 100 个', '子 Issue 1/3 已关', '父 ', '依据：题 demo-0001', '（已合并）'):
             self.assertIn(s, out['text'])
         self.assertTrue(any('d1' in c for c in out['indent']))
-        self.assertIn('任务', out['modes'])
+        self.assertIn('全部 Issue', out['side'])
         self.assertEqual(out['refreshing']['disabled'], True)
         self.assertEqual(out['refreshing']['paths'], ['/api/tasks', '/api/tasks?refresh=1'])
         self.assertIn('无法刷新：任务视图出错', out['afterFail'])

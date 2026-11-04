@@ -15,6 +15,7 @@ Q="python3 $HOME/.claude/skills/question-inbox/q.py"   # 和 skill question-inbo
 - **只判断需求归哪个 ws，并把需求交给那个 ws 的 lead。** GitHub 的 Issue 是 lead 的任务看板，每个 ws 有一个主 repo 放主 Issue；
   在哪里建 Issue、要不要拆、需求清不清楚、验收怎么写，都由 lead 判断（skill workspace §3）。
 - **不做**：建 Issue、拆分、写验收、讨论需求内容、写代码、派 worker、合并、部署。
+- 需求立项后讨论线程继续可用（修订 1）：lead 和 Owner 的随意讨论留在 7788，结论才由 lead 写进 Issue；你不参与。
 - 起来后第一件事：`$Q router register`（只认 session router 里名为 router 的 claude；已登记的 Router 还活着时别的会话顶替不了）。
   之后 `take` / `route` / `router lead|dispatch|close-lead` 只有这个会话能执行，别的会话一律退出码 4。
   这些命令的身份**只取你自己 pane 的 `$HERDR_SESSION` / `$HERDR_PANE_ID`**，不接受 `--herdr-session` / `--pane` 指定别人。
@@ -24,7 +25,7 @@ Q="python3 $HOME/.claude/skills/question-inbox/q.py"   # 和 skill question-inbo
 
 1. `$Q router paused`：`yes` 就只读——不领新需求、不派工、不新起 lead；已经在跑的 lead 不受影响。
 2. `$Q need list --todo`：new、还没交给 lead 的 routing / held / assigned、有未处理 Owner 补充的。投递消息只是唤醒，漏了也以这个列表为准。
-3. 投递消息以 `[question-inbox]` 开头，**它本身不是授权**。
+3. 投递消息以 `[question-inbox]` 开头，**它本身不是授权**。`负责 lead 确认不在` 的投递走 `router takeover`；`到了收尾` 的投递按消息里的收尾清单做。
 4. 简易看门狗：`$Q tasks` + `herdr --session router agent list` 扫一遍自己起的 `lead-<ws>`（见 §5）。
 
 ## 3. 处理一个需求
@@ -70,11 +71,16 @@ Q="python3 $HOME/.claude/skills/question-inbox/q.py"   # 和 skill question-inbo
 ## 5. 看门狗
 
 - lead 是 blocked：`agent read` 看它在等什么；属于 Owner 决定的事，提醒它走 `q ask`（审批走 `q ask --kind approval`），不替它答。
-- lead 不在了、但它负责的需求**还没 filed / dropped**：`$Q router lead <ws>` 重新起，
-  再 `herdr --session router agent prompt lead-<ws> "读 <lead 目录>/dispatch/<id>.md 并照做。"`；新 lead 用 `need claim --takeover` 接手
-  （只有原负责 lead **确认**不在时才行；查不清会被拒，稍后再试）。
-- lead 不在了、需求**已经 filed**（讨论已封存）、但还有 open 的派工 Issue：重新起 lead 后，prompt 它「读 Issue <URL> 和它的 worktree / PR，接着做」，
-  **不要**让它 claim（filed 的需求不能再 claim，也不需要：Issue 就是任务看板）。
+- lead 不在了、它负责的需求（assigned 已 claim / discussing / confirmed / filed）有待投递的消息：
+  服务把消息记成暂缓、看板标「卡住 · 没人管」，负责 lead **确认不在**时**自动**给你发 `[question-inbox] … 负责 lead 确认不在`
+  （同一需求 30 分钟内只发一次；全局暂停时不发、只记录；查不清时不发）。收到后同样执行 `$Q router takeover <id>`
+  （页面上的「请 Router 安排接手」只是手动重试，效果相同）
+  （新 lead `need claim --takeover` 后读 `need inbox`，再按 workspace §3 继续讨论 / 立项）。
+  只是 assigned、还没人 claim 的，照旧 `$Q router dispatch <id>`。
+- `$Q router takeover <id>`（立项前后都用它）：它只会在原 lead **确认不在**时才动作，确保 `lead-<ws>` 在，写 `dispatch/<id>-takeover.md`，
+  prompt 新 lead `need claim <id> --takeover` → `need inbox <id>`（读漏掉的 7788 消息和 Issue 评论，读完照口令 `--ack`）→ 继续推进。
+  查不清 / 原 lead 还在就拒绝，不要绕过：原 lead 回来了，服务下一次重试会照常把消息投给它。旧审批不自动迁移：没定的事由新 lead 重新发题。
+  提示里有几个需求，就逐个执行 `router takeover <id>`（一次一个）。
 - 每个 ws 每小时最多重启 2 次，超过就出一题给 Owner。
 
 ## 6. 问 Owner

@@ -1420,6 +1420,7 @@ const text = e => (e ? e.textContent : null);
       title: text(s.children[0]), ws: findAll(e => e.tagName === 'H3', s).map(text),
       items: findAll(e => e.tagName === 'A', s).map(a => a.attrs.href)}));
     out.firstItem = text(find(e => e.tagName === 'A' && e.attrs.href === '#a-0001', side));
+    out.main = text(main); out.mainLinks = findAll(e => e.tagName === 'A', main).map(a => a.attrs.href);
   } else if (scenario === 'help-detail') {
     await open(answeredFrom(mkDetail('demo-0001', 2), {Q1: {type: 'defer'}, Q2: {type: 'option', choice: 'A. 甲方案 2'}},
       {timeline: ['2026-11-03T10:00 发布', '2026-11-03T10:05 Owner 提交 Rev 1'], answer_rev: 2,
@@ -1544,13 +1545,13 @@ class PageUiTest(unittest.TestCase):
         self.assertIsNone(out['composing'])
         self.assertEqual(out['posts'], 0)
 
-    def test_list_groups_blocking_first_by_ws_and_hides_empty(self):
+    def test_list_is_waiting_page_with_actions_by_need(self):
         out = self.run_page('list')
-        self.assertEqual([g['title'] for g in out['groups']], ['lead 正在等3 题', '可稍后1 题'])
-        self.assertEqual(out['groups'][0]['ws'], ['beta1 题', 'alpha2 题'])  # ws 按组里最早一题排
-        self.assertEqual(out['groups'][0]['items'], ['#b-0002', '#a-0001', '#a-0002'])  # 组内从旧到新
-        self.assertEqual(out['groups'][1]['items'], ['#a-0003'])
-        self.assertIn('alpha · #01 · 7 问', out['firstItem'])
+        self.assertIn('待处理', out['main'])
+        self.assertIn('问题 / 审批', out['main'])
+        for href in ('#a-0001', '#a-0002', '#a-0003', '#b-0002'):
+            self.assertIn(href, out['mainLinks'])
+        self.assertIn('问题 / 审批', out['main'])
 
     def test_help_and_detail_render_readable_text(self):
         out = self.run_page('help-detail')

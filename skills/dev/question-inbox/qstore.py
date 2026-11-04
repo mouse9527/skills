@@ -79,6 +79,19 @@ def router_session():
     return os.environ.get('QI_ROUTER_SESSION') or 'router'
 
 
+def owner_login():
+    """Owner 的 GitHub 登录名（用来标记「同账号但来源未核实」）；配置 tasks.json 的 owner 或 QI_OWNER_LOGIN。"""
+    v = os.environ.get('QI_OWNER_LOGIN')
+    if v:
+        return v.strip().lower()
+    try:
+        data = json.loads(tasks_config_path().read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        data = {}
+    v = data.get('owner') if isinstance(data, dict) else None
+    return v.strip().lower() if isinstance(v, str) else ''
+
+
 FIELDS = (
     'id', 'kind', 'ws', 'title', 'issue', 'group', 'blocking', 'status', 'content_rev', 'answer_rev', 'withdrawn_qs',
     'herdr_session', 'pane_id', 'agent_kind', 'lead_session',
@@ -1244,16 +1257,23 @@ NEED_ID_RE = re.compile(r'^need-(\d{4,})$')
 # 修订 1：Router 只路由；ws lead claim 后判断清不清楚，不清楚就在需求线程里发理解卡讨论，确认后在本 ws 主 repo 建 Issue
 NEED_STATUSES = ('new', 'routing', 'assigned', 'discussing', 'confirmed', 'filed', 'dropped', 'held')
 DISCUSS = ('', 'waiting_owner', 'waiting_lead')
-SEALED = ('filed', 'dropped')  # 线程只读封存
-LEAD_STATES = ('assigned', 'discussing', 'confirmed', 'held')  # 负责 lead 能发卡 / link / drop / hold 的状态
-NEED_KINDS = ('new', 'note', 'unclaimed', 'reply', 'confirm')  # reply / confirm 投给负责 lead，其余投给 Router
+SEALED = ('dropped',)  # 修订 1：讨论线程贯穿整个生命周期，只有「不做」封存
+LEAD_STATES = ('assigned', 'discussing', 'confirmed', 'held', 'filed')  # 立项后仍可 claim --takeover / 发结论
+NEED_KINDS = ('new', 'note', 'unclaimed', 'reply', 'confirm', 'comments', 'takeover', 'closeout')  # reply / confirm / comments / closeout 投给负责 lead，其余投给 Router
+COMMENT_STATES = ('pending', 'notified', 'read', 'own', 'held', 'uncertain')
 CARD_SECTIONS = ('理解', '范围', '不做什么', '验收草案', '开放问题')
 ISSUE_URL_RE = re.compile(r'^https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/issues/(\d+)$')
 REQUEST_ID_RE = re.compile(r'^[A-Za-z0-9_-]{8,64}$')
 NEED_FIELDS = ('id', 'text', 'created', 'updated', 'status', 'discuss', 'ws', 'why', 'lead', 'issues', 'card_rev',
                'confirmed_rev', 'thread', 'notes', 'notes_acked', 'request_id', 'delivery', 'delivery_to',
                'delivery_kind', 'delivery_seq', 'attempt_id', 'attempts', 'hold_count', 'next_try_at', 'last_error',
-               'router_session', 'herdr_accepted_at', 'log')
+               'router_session', 'herdr_accepted_at', 'log',
+               # v2：GitHub 评论记账（只存元数据）、自己发的评论、发送意图、循环刹车、收尾
+               'own_comments', 'comments', 'send_intents', 'triggers', 'loop_suspect', 'closed_notified',
+               # R1 修复：同一个 lead 的多种消息合并成一次唤醒（delivery_kinds）、这一次投递实际带了哪些消息（inflight）、收尾
+               'delivery_kinds', 'inflight', 'closeout')
+LEAD_KINDS = ('reply', 'confirm', 'comments', 'closeout')  # 投给负责 lead；其余（new / note / unclaimed / takeover）投给 Router
+COMMENTS_KEEP = 500  # 已读 / 自己发的评论元数据超过这么多才裁掉最旧的；未读、结果不明的从不裁
 NEED_BATCH = 5
 ENSURE_PER_HOUR = 3
 
@@ -1276,11 +1296,19 @@ def _need_load(p):
     if not isinstance(rec, dict):
         return None
     rec.setdefault('id', p.stem)
-    for k, v in (('issues', []), ('notes', []), ('log', []), ('thread', [])):
+    for k, v in (('issues', []), ('notes', []), ('log', []), ('thread', []), ('own_comments', []), ('comments', []),
+                 ('triggers', [])):
         if not isinstance(rec.get(k), list):
             rec[k] = v
+    for k in ('send_intents',):
+        if not isinstance(rec.get(k), dict):
+            rec[k] = {}
     if not isinstance(rec.get('lead'), dict):
         rec['lead'] = {}
+    for x in rec['thread']:
+        if isinstance(x, dict) and not x.get('mid'):  # 旧记录：按内容派生，重复加载得到同一个 id
+            x['mid'] = 'm' + _hash(json.dumps([x.get('at'), x.get('by'), x.get('kind'), x.get('text'), x.get('rev')],
+                                              ensure_ascii=False))[:12]
     return rec
 
 
@@ -1348,8 +1376,18 @@ def _check_request_id(request_id):
 
 
 def _queue_need(rec, kind):
-    """排一次投递；delivery_seq + 1，让正在发的那次回包（finish）不覆盖这次。reply / confirm 投给负责 lead，其余投给 Router。"""
-    rec.update({'delivery': 'pending', 'delivery_kind': kind, 'delivery_to': 'lead' if kind in ('reply', 'confirm') else 'router',
+    """排一次投递；delivery_seq + 1，让正在发的那次回包（finish）不覆盖这次。reply / confirm / comments / closeout 投给负责 lead，
+    其余投给 Router。投给 lead 的几种消息**合并**进 delivery_kinds，不互相覆盖；提示词按当时还没通知的消息现算。
+    旧记录里投递槽还停在 takeover：只有它**还没投出**（pending / sending）时新来的 lead 消息先不排；一旦投出（sent 及以后），
+    lead 消息照常排队——投递时会现场核对负责 lead：回来了就照常投，仍不在就暂缓并（去重地）再请 Router，不会被吞掉。
+    （现在的接手请求不再占投递槽，见 server.ask_router_takeover。）"""
+    to = 'lead' if kind in LEAD_KINDS else 'router'
+    if to == 'lead' and rec.get('delivery_kind') == 'takeover' and rec.get('delivery') in ('pending', 'sending'):
+        return
+    kinds = [kind]
+    if to == 'lead' and rec.get('delivery_to') == 'lead' and rec.get('delivery') in ('pending', 'held', 'sending', 'uncertain'):
+        kinds = list(dict.fromkeys([k for k in (rec.get('delivery_kinds') or [rec.get('delivery_kind')]) if k in LEAD_KINDS] + [kind]))
+    rec.update({'delivery': 'pending', 'delivery_kind': kind, 'delivery_kinds': kinds, 'delivery_to': to,
                 'delivery_seq': geti(rec, 'delivery_seq') + 1, 'attempt_id': '', 'attempts': 0, 'hold_count': 0,
                 'next_try_at': now(), 'last_error': ''})
 
@@ -1368,7 +1406,9 @@ def create_need(text, request_id=''):
         t = now()
         rec = {'id': nid, 'text': text, 'created': t, 'updated': t, 'status': 'new', 'discuss': '', 'ws': '',
                'why': '', 'lead': {}, 'issues': [], 'card_rev': 0, 'confirmed_rev': 0, 'thread': [], 'notes': [],
-               'notes_acked': 0, 'request_id': request_id, 'router_session': '', 'log': []}
+               'notes_acked': 0, 'request_id': request_id, 'router_session': '', 'log': [],
+               'own_comments': [], 'comments': [], 'send_intents': {}, 'triggers': [], 'loop_suspect': False,
+               'closed_notified': False}
         _queue_need(rec, 'new')
         _save_need(rec, 'Owner 提交')
         return rec, True
@@ -1393,11 +1433,12 @@ def owner_reply(nid, text, request_id=''):
         if _seen(rec, request_id):
             return rec, False
         if rec.get('status') in SEALED:
-            raise QError(409, f'{nid} 已{"立项" if rec["status"] == "filed" else "不做"}，讨论已封存；要改范围请找 lead 或另提需求')
+            raise QError(409, f'{nid} 已不做，讨论已封存；要改范围请另提需求')
         extra = {'request_id': request_id} if request_id else {}
         if rec['lead']:
-            rec['thread'].append({'at': now(), 'by': 'owner', 'kind': 'reply', 'text': text, **extra})
-            rec.update({'status': 'discussing', 'discuss': 'waiting_lead'})
+            add_thread(rec, {'at': now(), 'by': 'owner', 'kind': 'reply', 'text': text, **extra})
+            if rec.get('status') != 'filed':  # 修订 1：立项后线程继续用，不改 GitHub 状态
+                rec.update({'status': 'discussing', 'discuss': 'waiting_lead'})
             _queue_need(rec, 'reply')
             _save_need(rec, 'Owner 回复，投给负责 lead')
         else:
@@ -1421,12 +1462,355 @@ def owner_confirm(nid, card_rev, request_id=''):
         if int(card_rev) != geti(rec, 'card_rev'):
             raise QError(409, f'理解卡已更新到 v{geti(rec, "card_rev")}，你确认的是 v{card_rev}：请刷新后看最新一张')
         n = geti(rec, 'card_rev')
-        rec['thread'].append({'at': now(), 'by': 'owner', 'kind': 'confirm', 'rev': n,
-                              **({'request_id': request_id} if request_id else {})})
+        add_thread(rec, {'at': now(), 'by': 'owner', 'kind': 'confirm', 'rev': n,
+                         **({'request_id': request_id} if request_id else {})})
         rec.update({'status': 'confirmed', 'discuss': '', 'confirmed_rev': n})
         _queue_need(rec, 'confirm')
         _save_need(rec, f'Owner 确认理解卡 v{n}，投给负责 lead')
         return rec, True
+
+
+def need_issue_refs(rec):
+    """[(repo, number, url)]：第一个是根 Issue。"""
+    out = []
+    for u in rec.get('issues') or []:
+        m = ISSUE_URL_RE.match(u or '')
+        if m:
+            out.append((f'{m.group(1)}/{m.group(2)}'.lower(), int(m.group(3)), u))
+    return out
+
+
+def root_issue(rec):
+    refs = need_issue_refs(rec)
+    return refs[0] if refs else None
+
+
+def _hash(text):
+    import hashlib
+    return hashlib.sha1((text or '').encode('utf-8')).hexdigest()
+
+
+def add_own_comment(rec, comment_id, by, at=None, issue=''):
+    """把自己的评论记账（repo + comment id 是唯一可靠的「我们自己发的」依据）。"""
+    cid = int(comment_id)
+    if any(int(c.get('id') or 0) == cid for c in rec['own_comments']):
+        return False
+    rec['own_comments'] = rec['own_comments'] + [{'id': cid, 'by': by, 'at': at or now(), 'issue': issue}]  # 身份依据，不裁
+    return True
+
+
+def own_comment(rec, comment_id):
+    return next((c for c in rec['own_comments'] if int(c.get('id') or 0) == int(comment_id)), None)
+
+
+def upsert_comment(rec, item):
+    """轮询到的一条评论只存元数据。返回 True 表示新的或编辑过的（需要再投一次）。
+    item: {id, repo, number, author, created, updated, hash, self}
+    编辑过的评论按「更新」再投一次，但不算新的授权。"""
+    cid = int(item['id'])
+    cur = next((c for c in rec['comments'] if int(c.get('id') or 0) == cid), None)
+    if cur is None:
+        row = {k: item.get(k) for k in ('id', 'repo', 'number', 'author', 'created', 'updated', 'hash', 'self')}
+        row.update({'state': 'pending' if item.get('self') == 'owner' else ('own' if item.get('self') else 'pending'),
+                    'notified_at': '', 'read_at': '',
+                    'edited': bool(item.get('created')) and item.get('created') != item.get('updated')})
+        rec['comments'] = _trim_comments(rec['comments'] + [row])
+        return item.get('self') != 'own'
+    if cur.get('hash') == item.get('hash') and cur.get('updated') == item.get('updated'):
+        return False
+    cur.update({k: item.get(k) for k in ('author', 'created', 'updated', 'hash', 'self')})
+    cur['edited'] = bool(cur.get('created')) and cur.get('created') != cur.get('updated')
+    if item.get('self') and item.get('self') != 'owner':
+        cur['state'] = 'own'
+    else:
+        cur['state'] = 'pending'
+        cur['notified_at'] = ''
+        cur['read_at'] = ''
+    return item.get('self') != 'own'
+
+
+def _trim_comments(rows):
+    """超过 COMMENTS_KEEP 条时只丢最旧的已读 / 自己发的；未读和结果不明的一条都不丢。"""
+    extra = len(rows) - COMMENTS_KEEP
+    if extra <= 0:
+        return rows
+    drop = set()
+    for i, c in enumerate(rows):
+        if len(drop) >= extra:
+            break
+        if c.get('state') in ('read', 'own'):
+            drop.add(i)
+    return [c for i, c in enumerate(rows) if i not in drop]
+
+
+def pending_comments(rec):
+    return [c for c in rec['comments'] if c.get('state') in ('pending', 'held', 'uncertain')]
+
+
+def unread_comments(rec):
+    """`need inbox` 列出的：还没 lead 读过、不是自己发的。"""
+    return [c for c in rec['comments'] if c.get('state') in ('pending', 'notified', 'held', 'uncertain')]
+
+
+def mark_comments(rec, ids, state, field=None):
+    want = {int(i) for i in ids}
+    got = 0
+    t = now()
+    for c in rec['comments']:
+        if int(c.get('id') or 0) in want and c.get('state') != 'own':
+            c['state'] = state
+            if field:
+                c[field] = t
+            got += 1
+    return got
+
+
+LOOP_ROUNDS = 3
+
+
+def note_round(rec, sources):
+    """记一轮轮询里这个需求新到的评论来源（每轮一次，不是每条一次）。只有 `echo`（正文带我们给这个需求打的尾标，
+    却对不上任何发送意图、也不在 own_comments——即我们自己发的评论被当成新消息投回）才算循环迹象；
+    Owner 直接在 GitHub 写（unverified）、团队评论、@lead 点名都会让计数归零。连续 LOOP_ROUNDS 轮都是 echo 才标疑似循环。"""
+    if not sources:
+        return bool(rec.get('loop_suspect'))
+    tag = 'echo' if all(s == 'echo' for s in sources) else 'other'
+    rec['triggers'] = ((rec.get('triggers') or []) + [tag])[-LOOP_ROUNDS:]
+    if len(rec['triggers']) == LOOP_ROUNDS and all(t == 'echo' for t in rec['triggers']):
+        rec['loop_suspect'] = True
+    return bool(rec.get('loop_suspect'))
+
+
+def clear_loop(rec):
+    rec['loop_suspect'] = False
+    rec['triggers'] = []
+
+
+def unloop(nid):
+    """Owner / 负责 lead 解除疑似循环：held 的评论恢复成待投递，排一次投给负责 lead。"""
+    with locked():
+        rec = read_need(nid)
+        if not rec.get('loop_suspect'):
+            raise QError(409, f'{nid} 没有标疑似循环')
+        clear_loop(rec)
+        n = 0
+        for c in rec['comments']:
+            if c.get('state') == 'held':
+                c['state'] = 'pending'
+                n += 1
+        if rec.get('last_error', '').startswith('疑似循环'):
+            rec['last_error'] = ''
+        if n and rec.get('lead'):
+            _queue_need(rec, 'comments')
+        _save_need(rec, f'解除疑似循环（{n} 条评论恢复投递）')
+        return rec
+
+
+INTENT_STATES = ('sending', 'uncertain', 'failed', 'sent')  # failed = 确定没发出去，可以用同一个 request_id 重发
+
+
+def send_intent(rec, request_id, text, issue, by='owner'):
+    """发送意图：先落盘再调 gh。同一 request_id 同正文返回原记录；不同正文 409。
+    tag_id 是服务端生成的随机意图 id，只写进那条评论的尾标，对账靠它 + 发布正文哈希 + 可信账号。"""
+    cur = (rec.get('send_intents') or {}).get(request_id)
+    h = _hash(text)
+    if cur:
+        if cur.get('hash') != h:
+            raise QError(409, '同一个 request_id 不能用来发不同的内容；请重新发送')
+        return cur, False
+    it = {'hash': h, 'at': now(), 'issue': issue, 'by': by, 'tag_id': uuid.uuid4().hex, 'posted_hash': '',
+          'state': 'sending', 'tried_at': now(), 'comment_id': 0, 'error': ''}
+    rec['send_intents'] = dict(rec.get('send_intents') or {}, **{request_id: it})
+    return it, True
+
+
+def intent_done(rec, request_id, comment_id):
+    it = (rec.get('send_intents') or {}).get(request_id)
+    if not it:
+        return
+    it.update({'state': 'sent', 'comment_id': int(comment_id), 'error': ''})
+
+
+def intent_fail(rec, request_id, state, error):
+    it = (rec.get('send_intents') or {}).get(request_id)
+    if it:
+        it.update({'state': state, 'error': one_line(error)[:300]})
+
+
+def receipt(rec, at=None):
+    """给页面的一条回执：【已发到 GitHub →】已通知 lead → lead 已读。"""
+    who = f'lead-{rec.get("ws")}' if rec.get('ws') else 'lead'
+    d, err = rec.get('delivery'), rec.get('last_error') or ''
+    if rec.get('delivery_kind') == 'takeover' and d not in ('received', 'none', None):
+        return {'notified': False, 'read': False, 'note': f'负责 {who} 不在：已请 Router 安排接手，消息会转给接手的 lead'}
+    if rec.get('delivery_to') != 'lead':
+        return {'notified': False, 'read': False, 'note': '还没有负责 lead：Router 处理时会看到' if not rec.get('lead') else ''}
+    if d == 'pending':
+        return {'notified': False, 'read': False, 'note': '排队通知'}
+    if d == 'held':
+        return {'notified': False, 'read': False, 'note': f'暂缓通知（{err or "负责 lead 暂时收不到"}），会自动重试'}
+    if d == 'sending':
+        return {'notified': False, 'read': False, 'note': '正在通知'}
+    if d == 'uncertain':
+        return {'notified': False, 'read': False, 'note': '不确定是否送达 ' + who}
+    if d in ('sent', 'received'):
+        return {'notified': True, 'read': False, 'note': f'已通知 {who}'}
+    return {'notified': False, 'read': False, 'note': ''}
+
+
+def add_thread(rec, item):
+    item.setdefault('mid', 'm' + uuid.uuid4().hex[:12])
+    rec['thread'] = rec['thread'] + [item]  # 不裁：讨论线程就是记录本身（§9 例外）
+    return item
+
+
+def owner_unread(rec):
+    """Owner 在 7788 线程里写的、负责 lead 还没确认读过的消息（回复 + 确认理解卡）。"""
+    return [x for x in rec['thread'] if x.get('by') == 'owner' and x.get('kind') in ('reply', 'confirm') and not x.get('read_at')]
+
+
+def lead_say(nid, text, ident):
+    """负责 lead 在 7788 线程里说一句（小进展）；不进 GitHub，不投递。"""
+    text = _clean_text(text, '内容')
+    with locked():
+        rec = read_need(nid)
+        _check_lead(rec, ident)
+        if rec.get('status') in SEALED:
+            raise QError(409, f'{nid} 已不做，线程已封存')
+        add_thread(rec, {'at': now(), 'by': 'lead', 'kind': 'say', 'text': text})
+        _save_need(rec, 'lead 在 7788 线程里说明')
+        return rec
+
+
+def comment_ack(c):
+    """`need inbox` 给每条评论的确认口令：id@版本（正文哈希前 8 位）。评论之后被编辑，旧口令就对不上。"""
+    return f'{c.get("id")}@{(c.get("hash") or "")[:8]}'
+
+
+def lead_inbox(nid, ack, ident, fetch_body):
+    """lead 读未读消息：正文现场从 GitHub 取（fetch_body(repo, number, comment_id) → 正文），不改状态；
+    --ack 只确认**读到的那一份**：评论用 `<id>@<版本>`（被编辑过就不算读过），7788 消息用 `m:<消息 id>`，口令都由 inbox 打印。
+    旧 lead 迟到的 ack：身份对不上直接 403，不会吞新 lead 的消息。返回 {acked, stale, comments, thread}。"""
+    if ack:
+        with locked():
+            rec = read_need(nid)
+            _check_lead(rec, ident)
+            rows = {str(c.get('id')): c for c in rec['comments']}
+            mids = {x.get('mid'): x for x in owner_unread(rec) + [x for x in rec['thread'] if x.get('by') == 'owner']}
+            want_c, want_m, bad = [], [], []
+            for a in ack:
+                a = (a or '').strip()
+                if a.startswith('m:') and a[2:] in mids:
+                    want_m.append(mids[a[2:]])
+                elif re.fullmatch(r'(?:c:)?\d+@[0-9a-f]{8}', a) and a.lstrip('c:').split('@')[0] in rows:
+                    cid, ver = a.lstrip('c:').split('@')
+                    want_c.append((rows[cid], ver))
+                else:
+                    bad.append(a)
+            if bad:
+                raise QError(400, '对不上的确认口令：' + '、'.join(bad) + '（照 need inbox 打印的 --ack 原样确认：评论 <id>@<版本>，7788 消息 m:<id>）')
+            t, n, stale = now(), 0, []
+            for c, ver in want_c:
+                if (c.get('hash') or '')[:8] != ver:
+                    stale.append(str(c.get('id')))  # 读过之后又被编辑：这版没读过，不确认
+                    continue
+                if c.get('state') not in ('own', 'read'):
+                    c.update({'state': 'read', 'read_at': t})
+                    n += 1
+            for x in want_m:
+                if not x.get('read_at'):
+                    x['read_at'] = t
+                    n += 1
+            _save_need(rec, f'lead 确认已读 {n} 条' + (f'（{len(stale)} 条读后被编辑，未确认）' if stale else ''))
+            return {'acked': n, 'stale': stale, 'comments': [], 'thread': []}
+    with locked():
+        rec = read_need(nid)
+        _check_lead(rec, ident)
+        rows = [dict(c, ack=comment_ack(c)) for c in unread_comments(rec)]
+        thread = [dict(x, ack='m:' + x['mid']) for x in owner_unread(rec)]
+        closeout = dict(rec['closeout']) if isinstance(rec.get('closeout'), dict) else None
+    for c in rows:
+        try:
+            c['body'] = fetch_body(c.get('repo'), c.get('number'), int(c.get('id')))
+        except QError as e:  # 没读到的不给确认口令：只确认真正读过的；下次读成功再拿口令
+            c.update({'body': f'（正文暂时读不到：{e.message}）', 'ack': '', 'unreadable': True})
+    return {'acked': 0, 'stale': [], 'comments': rows, 'thread': thread, 'closeout': closeout}
+
+
+def outstanding(rec):
+    """还没通知负责 lead 的消息：待投递的评论、Owner 在 7788 写的未通知消息、待发的收尾。"""
+    return {'comments': [[c.get('id'), c.get('hash') or ''] for c in rec['comments'] if c.get('state') == 'pending'],
+            'thread': [x['mid'] for x in owner_unread(rec) if not x.get('notified_at')],
+            'closeout': bool(isinstance(rec.get('closeout'), dict) and not rec.get('closed_notified'))}
+
+
+def request_takeover(nid, lead_state):
+    """页面上「请 Router 安排接手」（手动重试入口）的校验：有负责 lead、负责 lead **确认不在**（立项前后都可以）。
+    lead_state 是调用方锁外查好的 presence。只校验，真正去叫 Router 由服务的 ask_router_takeover 做（不动投递槽，held 保持）。"""
+    rec = read_need(nid)
+    if not rec.get('lead') or rec.get('status') not in LEAD_STATES:
+        raise QError(409, f'{nid} 状态是 {rec.get("status")}：没有负责 lead，不需要接手')
+    if lead_state != 'absent':
+        raise QError(409, '负责 lead 还在，不安排接手' if lead_state == 'present' else '核对不了负责 lead 是否还在，稍后再试')
+    return rec
+
+
+def takeover_reask():
+    """同一需求请 Router 安排接手之后，这么久之内不再叫（默认 30 分钟；新 lead claim 后清零）。"""
+    return float(os.environ.get('QI_TAKEOVER_REASK') or 1800)
+
+
+def takeover_ask_due(rec, at=None):
+    """负责 lead 确认不在时，这次要不要去叫 Router：已经叫过（sent / uncertain）且还在去重窗口内就不叫；
+    暂停 / Router 不在时没叫成，不算叫过。"""
+    a = rec.get('takeover_ask') if isinstance(rec.get('takeover_ask'), dict) else {}
+    t = parse_time(a.get('at'))
+    if a.get('result') in ('sent', 'uncertain') and t:
+        return ((at or datetime.now(TZ)) - t).total_seconds() >= takeover_reask()
+    return True
+
+
+def clear_takeover_ask(ids):
+    """投递时现场核对到负责 lead 在：之前的接手请求作废（原 lead 回来了），下次再不在时重新去叫。"""
+    with locked():
+        for nid in ids:
+            try:
+                rec = read_need(nid)
+            except QError:
+                continue
+            if rec.pop('takeover_ask', None) is not None:
+                _save_need(rec, '负责 lead 又在了：之前的「请 Router 安排接手」作废，照常投递')
+
+
+def note_takeover_ask(nid, result, why=''):
+    """记一次「请 Router 安排接手」的结果：sent / uncertain（算叫过）、paused / router_absent（没叫成，只记录）。"""
+    with locked():
+        rec = read_need(nid)
+        rec['takeover_ask'] = {'at': now(), 'result': result, 'why': one_line(why)[:200]}
+        label = {'sent': '已请 Router 安排接手', 'uncertain': '请 Router 安排接手：不确定是否送达（不自动重发）',
+                 'paused': '全局暂停中：没有叫 Router，只记录', 'router_absent': 'Router 暂时不在：没叫成，稍后再叫'}.get(result, result)
+        _save_need(rec, f'负责 lead 确认不在（立项前）：{label}' + (f'（{why}）' if why else ''))
+        return rec
+
+
+def closeout_due(rec, tree):
+    """根 Issue 关闭，或者关联 PR 全部合并 → 给负责 lead 排一条收尾消息。收尾单独记在 closeout 里，
+    不会被后来的评论 / 回复覆盖；真正投出去（need_finish sent）才置 closed_notified。"""
+    if rec.get('closed_notified') or isinstance(rec.get('closeout'), dict):
+        return None
+    root = tree.get('root') or {}
+    prs = tree.get('prs') or []
+    if root.get('state') == 'CLOSED':
+        why = '根 Issue 已关闭'
+    elif prs and all(p.get('state') == 'MERGED' for p in prs):
+        why = '关联 PR 全部合并'
+    else:
+        return None
+    rec['closeout'] = {'why': why, 'at': now()}
+    _queue_need(rec, 'closeout')
+    rec['notes'].append({'at': now(), 'by': 'service', 'text': f'收尾：{why}'})
+    _save_need(rec, f'排收尾通知（{why}）')
+    return why
 
 
 # ----- Router 身份：$QI_STATE_DIR/router.json -----
@@ -1752,6 +2136,8 @@ def hold(nid, why, ident):
     unknown / present 不放宽。查 herdr 不持锁，写之前在锁内核对负责 lead 没变。"""
     why = one_line(_clean_text(why, '原因'))[:500]
     pre = read_need(nid)
+    if pre.get('status') == 'filed':
+        raise QError(409, f'{nid} 已立项：卡住请在讨论线程 / Issue 上说明，或由 lead 发 need comment；不要把它退回 held')
     old = pre.get('lead') or {}
     lead_gone = False
     if pre.get('status') == 'assigned' and old:
@@ -1801,7 +2187,7 @@ def claim_need(nid, ident, takeover=False, name_of=None):
     （查询失败 / 多匹配算未知，拒绝）。查 herdr 不持锁；写之前在锁内重新核对 status / ws / lead，有变化就 409。"""
     rec = read_need(nid)
     if rec.get('status') not in LEAD_STATES:
-        raise QError(409, f'{nid} 状态是 {rec.get("status")}：只有 Router 分到 ws 之后（assigned）才能 claim')
+        raise QError(409, f'{nid} 状态是 {rec.get("status")}：只有 Router 分到 ws 之后（assigned）才能 claim；已立项的需求原 lead 不在时可以 --takeover')
     ws = rec.get('ws') or ''
     want = lead_cwd(ws).resolve()
     try:
@@ -1831,6 +2217,18 @@ def claim_need(nid, ident, takeover=False, name_of=None):
         cur['lead'] = {'herdr_session': ident['herdr_session'], 'lead_session': ident['lead_session'],
                        'pane_id': ident['pane_id'], 'claimed_at': now()}
         _ack_delivery(cur, 'lead')
+        if old and not same:  # §3：新 lead 登记后，所有没 ack 的消息重新投给它（旧 lead 的「已通知」不算数）
+            _ack_delivery(cur, 'router')
+            cur.pop('takeover_ask', None)  # 接手完成：下次再有人不在，重新去叫
+            for c in cur['comments']:
+                if c.get('state') == 'notified':
+                    c.update({'state': 'pending', 'notified_at': ''})
+            for x in owner_unread(cur):
+                x.pop('notified_at', None)
+            todo = outstanding(cur)
+            if todo['comments'] or todo['thread'] or todo['closeout']:
+                cur['delivery_kind'] = ''
+                _queue_need(cur, 'comments' if todo['comments'] else 'closeout' if todo['closeout'] else 'reply')
         if not same:
             _save_need(cur, ('lead 接手（takeover）' if old else 'lead claim') + f'：{ident["herdr_session"]} pane {ident["pane_id"]}')
         return cur
@@ -1859,10 +2257,10 @@ def card(nid, text, ident):
     with locked():
         rec = read_need(nid)
         _check_lead(rec, ident)
-        if rec.get('status') not in LEAD_STATES:
-            raise QError(409, f'{nid} 状态是 {rec.get("status")}，讨论已封存')
+        if rec.get('status') not in LEAD_STATES or rec.get('status') == 'filed':
+            raise QError(409, f'{nid} 状态是 {rec.get("status")}，讨论已结束：立项后的变更用 need comment 写进 Issue')
         n = geti(rec, 'card_rev') + 1
-        rec['thread'].append({'at': now(), 'by': 'lead', 'kind': 'card', 'rev': n, 'card': sec})
+        add_thread(rec, {'at': now(), 'by': 'lead', 'kind': 'card', 'rev': n, 'card': sec})
         rec.update({'card_rev': n, 'status': 'discussing', 'discuss': 'waiting_owner'})
         _ack_delivery(rec, 'lead')
         _save_need(rec, f'lead 发理解卡 v{n}，等 Owner 回复或确认')
@@ -1902,7 +2300,7 @@ def link(nid, urls, ident, issue_info=None, main_repo=''):
         rec['issues'] = list(dict.fromkeys(rec['issues'] + urls))
         rec.update({'status': 'filed', 'discuss': ''})
         _ack_delivery(rec, 'lead')
-        _save_need(rec, f'lead link {" ".join(urls)}（filed，线程封存）')
+        _save_need(rec, f'lead link {" ".join(urls)}（filed，讨论线程继续可用）')
         return rec
 
 
@@ -1969,6 +2367,8 @@ def need_claim(refs):
                 continue
             aid = uuid.uuid4().hex[:12]
             rec.update({'delivery': 'sending', 'attempt_id': aid, 'attempts': geti(rec, 'attempts') + 1})
+            if rec.get('delivery_to') == 'lead':  # 这次投递实际覆盖的消息：只有它们在 sent 后记成「已通知」
+                rec['inflight'] = dict(outstanding(rec), aid=aid, kinds=rec.get('delivery_kinds') or [rec.get('delivery_kind')])
             _save_need(rec, f'开始投递给 {"负责 lead" if rec.get("delivery_to") == "lead" else "Router"}（attempt {aid}）')
             out.append((nid, seq, aid))
     return out
@@ -1983,6 +2383,12 @@ def need_finish(claimed, outcome, error='', router_lead=''):
                 rec = read_need(nid)
             except QError:
                 continue
+            fl = rec.get('inflight') if isinstance(rec.get('inflight'), dict) else {}
+            if outcome == 'sent' and fl.get('aid') == aid:  # 投递期间又排了新的（seq 变了）也照样记下这次已送达的那几条
+                _mark_notified(rec, fl)
+                rec['inflight'] = {}
+                if rec.get('attempt_id') != aid or rec.get('delivery') != 'sending' or geti(rec, 'delivery_seq') != seq:
+                    _save_need(rec, f'投给 lead：herdr 已接受（attempt {aid}；之后又有新消息排队）')
             if rec.get('attempt_id') != aid or rec.get('delivery') != 'sending' or geti(rec, 'delivery_seq') != seq:
                 continue  # 期间被 take / 新补充 / 重启修复改过：不覆盖
             rec['delivery'] = outcome
@@ -2001,6 +2407,21 @@ def need_finish(claimed, outcome, error='', router_lead=''):
             if info:
                 info['last_delivery_at'] = now()
                 _write_state('router.json', info)
+
+
+def _mark_notified(rec, fl):
+    t = now()
+    want = {(int(i), h) for i, h in fl.get('comments') or []}
+    for c in rec['comments']:
+        if (int(c.get('id') or 0), c.get('hash') or '') in want and c.get('state') == 'pending':
+            c.update({'state': 'notified', 'notified_at': t})
+    mids = set(fl.get('thread') or [])
+    for x in rec['thread']:
+        if x.get('mid') in mids and not x.get('notified_at'):
+            x['notified_at'] = t
+    if fl.get('closeout') and isinstance(rec.get('closeout'), dict):
+        rec['closed_notified'] = True
+        rec['closeout']['notified_at'] = t
 
 
 def need_renotify(nid):
