@@ -58,7 +58,7 @@ def fixture():
     """每个 stage 至少一个；号即用途。"""
     return response([
         issue(1),                                                         # 等你回答（题挂上）
-        issue(2, refs=[pr(102, body='Part of owner/repo#2')]),            # 等你合并：open PR checks 绿
+        issue(2, refs=[pr(102, body='Part of owner/repo#2')]),            # 待合并检查：open PR checks 绿
         issue(3, refs=[pr(103, state='MERGED', body='Part of #3')]),      # 等你验收：合并了、Issue 未关
         issue(4),                                                         # 卡住：agent blocked（cwd）
         issue(5, refs=[pr(105, checks='FAILURE', closing=[5])]),          # 卡住：PR check 失败（GitHub 关联）

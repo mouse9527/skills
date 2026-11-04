@@ -21,6 +21,7 @@ worker 能写哪些文件、交付物怎么验、谁能授权什么，由调用�
 - **认 lead 看左侧 agents 侧栏**：worker 必有 name（`agent start <NAME>`），无 name、显示 kind（如 `claude`）的是 lead。
 - **不在 lead 的 tab 里 split**（覆盖 herdr 内置 skill「默认 sibling pane」的建议）。
 - **不改名、不关闭任何 lead 的 tab**（包括自己的）。认 lead 看侧栏，不看 tab 名 —— tab 名常常是过时的。
+  唯一例外：Router 可以在 session `router` 里关闭**它自己建的** `L·<ws>` workspace（条件见 skill `router`）。
 - lead 的所有 worker 放进同一个 tab `W·<lead 主线>`，**话题不同也放一起**，别每个话题开一个 tab。
   名字按 lead 实际在做的事起（`W·CI`、`W·issue-42`，不带 `#`），不照抄 lead tab 的名字。
 - 复用 `W·` tab 前确认是自己建的或明确交接给自己的；前缀相同不代表归属。
@@ -169,4 +170,4 @@ sleep 8; herdr agent get <name>                          # 必须变 working
 - 某个 worker 的事已交付且无后续 → 关它的 pane（不是每次 prompt 返回 done 就关，那会丢掉可复用的上下文）：
   `herdr pane close <pane_id>`（位置参数，没有 `--pane`）；pane_id 用 `herdr agent get <name>` 取。
 - lead 结束 → 关它的 `W·` tab。
-- 只关自己建的 pane / tab；别人的先问。lead 的 tab 永远不由别的 agent 关。
+- 只关自己建的 pane / tab；别人的先问。lead 的 tab 永远不由别的 agent 关——例外只有 Router 关它自己在 session `router` 里建的 `L·<ws>` workspace（skill `router`）。

@@ -26,10 +26,11 @@ LINK_PREFIX = 'https://github.com/'
 HOLD_LABEL_RE = re.compile(r'^(?:status[:/]\s*)?(?:blocked|on[- ]?hold|paused)$', re.I)
 PART_OF_RE = re.compile(r'Part of\s+(?:([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+))?#(\d+)', re.I)
 NAME_RE = re.compile(r'^(?:w|rv)-(\d+)(?:-|$)')
+NEED_LINE_RE = re.compile(r'^需求[:：]\s*(need-\d{4,})\s*$')  # 根 Issue 正文第一行，Router 写入
 
 # 分组顺序 = 「要不要你动手」；stage 判定顺序见 stage_of
 GROUPS = (('you', '等你'), ('stuck', '卡住'), ('doing', '在做'), ('todo', '待开工'), ('hold', '停着'), ('closed', '最近关闭'))
-STAGES = {'answer': ('you', '等你回答'), 'merge': ('you', '等你合并'), 'accept': ('you', '等你验收'),
+STAGES = {'answer': ('you', '等你回答'), 'merge': ('you', '待合并检查'), 'accept': ('you', '等你验收'),
           'stuck': ('stuck', '卡住'), 'doing': ('doing', '在做'), 'todo': ('todo', '待开工'), 'hold': ('hold', '停着'),
           'done': ('closed', '已完成'), 'dropped': ('closed', '不做')}
 
@@ -42,7 +43,7 @@ QUERY = '''query($owner:String!,$name:String!,$closedQ:String!){
  }
  closed:search(type:ISSUE,first:100,query:$closedQ){issueCount nodes{...on Issue{...I}}}
 }
-fragment I on Issue{number title url state stateReason updatedAt closedAt labels(first:20){nodes{name}}
+fragment I on Issue{number title url state stateReason updatedAt closedAt body labels(first:20){nodes{name}}
  parent{number repository{nameWithOwner}} subIssuesSummary{total completed}
  closedByPullRequestsReferences(first:%(linked)d,includeClosedPrs:true){totalCount nodes{...P}}}
 fragment P on PullRequest{number title url state isDraft updatedAt mergedAt body author{login}
@@ -54,7 +55,7 @@ fragment P on PullRequest{number title url state isDraft updatedAt mergedAt body
 # ---------- 配置 ----------
 
 def config_path():
-    return Path(os.environ.get('QI_TASKS_CONFIG') or Path.home() / '.config' / 'question-inbox' / 'tasks.json')
+    return qstore.tasks_config_path()
 
 
 def load_config():
@@ -63,14 +64,16 @@ def load_config():
     try:
         data = json.loads(p.read_text(encoding='utf-8'))
     except FileNotFoundError:
-        raise ValueError(f'没有配置文件 {p}（格式：{{"repos":[{{"ws":"demo","repo":"owner/repo"}}]}}）')
+        raise ValueError(f'没有配置文件 {p}（格式：{{"repos":[{{"ws":"demo","repo":"owner/repo","lead_cwd":"可选"}}]}}）')
     except (OSError, ValueError) as e:
         raise ValueError(f'配置文件 {p} 读不了：{e}')
     out = []
     for r in (data.get('repos') if isinstance(data, dict) else None) or []:
         ws, repo = (r or {}).get('ws'), (r or {}).get('repo')
+        lc = (r or {}).get('lead_cwd')  # 可选：ws 的 lead 工作目录（默认 ~/workspaces/<ws>），见 qstore.lead_cwd
         if not (isinstance(ws, str) and qstore.WS_RE.match(ws) and isinstance(repo, str)
-                and re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repo)):
+                and re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repo)
+                and (lc is None or (isinstance(lc, str) and Path(lc).expanduser().is_absolute()))):
             raise ValueError(f'配置文件 {p} 里有不合法的条目：{r!r}')
         out.append((ws, repo))
     return out
@@ -164,16 +167,17 @@ def herdr_sessions():
 
 
 def fetch_session(s):
-    """一个 session 的 [{session, pane}]。缓存和失败都以 session 为边界：这里失败只影响这个 session。"""
-    r = qstore.pane_list(s)
+    """一个 session 的 [{session, pane}]，只含有 agent 的 pane。用 `agent list`：它带 agent 名（`agent start <NAME>`），
+    `pane list` 没有这个字段（真实 herdr 0.9.5 实测）。缓存和失败都以 session 为边界：这里失败只影响这个 session。"""
+    r = qstore.agent_list(s)
     if r['ok']:
-        panes = r['panes']
-        if not isinstance(panes, list):
-            raise RuntimeError(f'herdr {s} pane list 输出不是列表')
-        return [{'session': s, 'pane': p} for p in panes if isinstance(p, dict)]
+        agents = r['agents']
+        if not isinstance(agents, list):
+            raise RuntimeError(f'herdr {s} agent list 输出不是列表')
+        return [{'session': s, 'pane': a} for a in agents if isinstance(a, dict)]
     if r['code'] in ('server_not_running', 'no_socket'):  # 残留 socket：这个 session 没在跑，不算错
         return []
-    raise RuntimeError(f'herdr {s} pane list 失败：{r["code"]} {r["message"]}'.strip())
+    raise RuntimeError(f'herdr {s} agent list 失败：{r["code"]} {r["message"]}'.strip())
 
 
 # ---------- 内存缓存：每个来源单独保留上一次成功的数据 ----------
@@ -328,7 +332,7 @@ def stage_of(t, now, unknown=()):
     merged = [p for p in t['prs'] if p['state'] == 'MERGED']
     green = [p for p in open_prs if not p['draft'] and p['checks'] == 'SUCCESS']  # 只有明确 SUCCESS 才算全绿
     if green:
-        hits.append(('merge', '、'.join(pr_name(p, t) for p in green) + ' checks 全绿'))
+        hits.append(('merge', '、'.join(pr_name(p, t) for p in green) + ' checks 全绿，审查和授权需在 PR 上核对'))
     elif merged and not open_prs:
         hits.append(('accept', '、'.join(pr_name(p, t) for p in merged) + ' 已合并，Issue 未关'))
     blocked = [a for a in t['agents'] if a['status'] == 'blocked']
@@ -363,8 +367,16 @@ def stage_of(t, now, unknown=()):
     return hits
 
 
+def need_of(body):
+    """正文第一个非空行是 `需求：need-NNNN` 就返回编号。"""
+    first = next((l.strip() for l in (body or '').split('\n') if l.strip()), '')
+    m = NEED_LINE_RE.match(first)
+    return m.group(1) if m else ''
+
+
 def _task(ws, repo, n):
-    return {'ws': ws, 'repo': repo, 'number': n['number'], 'title': n.get('title') or '', 'url': safe_url(n.get('url')),
+    return {'ws': ws, 'repo': repo, 'need': need_of(n.get('body')), 'number': n['number'],
+            'title': n.get('title') or '', 'url': safe_url(n.get('url')),
             'state': n.get('state') or 'OPEN', 'state_reason': n.get('stateReason') or '',
             'updated': n.get('updatedAt') or '', 'closed': n.get('closedAt') or '',
             'labels': [l['name'] for l in ((n.get('labels') or {}).get('nodes') or []) if l and l.get('name')],
@@ -409,11 +421,31 @@ def build(repos, results, herdr_res, allq, now=None):
             tasks[key] = t
     for qs in linked_q.values():  # issue 字段对不上任何任务（repo 不在配置、或 Issue 不在列表里）
         loose_q += qs
+    by_need = _needs(tasks)
     for s, e in sorted(herdr_res.items()):  # 一个 session 一个来源：失败的单独标出，并保留它上次的数据
         sources.append({'name': f'herdr {s}', 'ws': '', 'ok': not e.get('error'), 'error': e.get('error') or '',
                         'at': _iso(e['at']) if e.get('at') else '', 'more': [], 'has_data': e.get('data') is not None})
     return {'generated_at': _iso(now), 'sources': sources, 'groups': _group(tasks), 'unlinked': loose_q,
-            'stale': any(s['error'] for s in sources), 'count': len(tasks)}
+            'stale': any(s['error'] for s in sources), 'count': len(tasks), 'needs': by_need}
+
+
+def _needs(tasks):
+    """按根 Issue 正文的 `需求：need-NNNN` 归组：子 Issue 跟着它的根走（沿 parent 往上找）。
+    返回 {need: [{repo, number, title, url, stage, sub, depth}]}，根在前；同时给每个任务填 need。"""
+    def root_need(t, seen=()):
+        if t['need'] or not t['parent']:
+            return t['need']
+        p = tasks.get((t['parent']['repo'], t['parent']['number']))
+        return root_need(p, seen + (_key(t),)) if p and _key(p) not in seen else ''
+    out = {}
+    for t in tasks.values():
+        t['need'] = root_need(t)
+    for t in sorted(tasks.values(), key=lambda t: (t['parent'] is not None, t['repo'], t['number'])):
+        if t['need']:
+            out.setdefault(t['need'], []).append(
+                {'repo': t['repo'], 'number': t['number'], 'title': t['title'], 'url': t['url'],
+                 'stage': t['stage'], 'sub': t['sub'], 'depth': 1 if t['parent'] else 0})
+    return out
 
 
 ORDER = ('answer', 'merge', 'accept', 'stuck', 'doing', 'todo', 'hold', 'done', 'dropped')
@@ -476,13 +508,43 @@ def _group(tasks):
     return out
 
 
+def issue_state(url):
+    """(state, stateReason)，例如 ('CLOSED', 'NOT_PLANNED')；need drop 用来核对留痕 Issue。"""
+    data = issue_info(url, 'state,stateReason')
+    return (str(data.get('state') or '').upper(), str(data.get('stateReason') or '').upper())
+
+
+def issue_body(url):
+    """need link 用来核对根 Issue 正文第一行。"""
+    return issue_info(url, 'body')
+
+
+def issue_info(url, fields):
+    """`gh issue view <url> --json <fields>`；只读，argv 调用。查不到抛 QError(409)。"""
+    try:
+        res = subprocess.run([gh_bin(), 'issue', 'view', url, '--json', fields], capture_output=True,
+                             text=True, encoding='utf-8', timeout=gh_timeout())
+    except subprocess.TimeoutExpired:
+        raise qstore.QError(409, 'gh 超时，无法核对 Issue 状态')
+    except OSError as e:
+        raise qstore.QError(409, f'无法执行 gh：{e}')
+    try:
+        data = json.loads(res.stdout or 'null')
+    except ValueError:
+        data = None
+    if res.returncode != 0 or not isinstance(data, dict):
+        raise qstore.QError(409, f'gh 查不到 {url}：{(res.stderr or res.stdout).strip()[:200]}')
+    return data
+
+
 def view(refresh=False, now=None):
     """页面和 CLI 共用的入口。配置错误也返回结构化数据（error 字段），不抛。"""
     try:
         repos = load_config()
     except ValueError as e:
         return {'generated_at': _iso(now or datetime.now(qstore.TZ)), 'config_error': str(e), 'sources': [],
-                'groups': [], 'unlinked': question_refs(qstore.all_questions())[1], 'stale': True, 'count': 0}
+                'groups': [], 'unlinked': question_refs(qstore.all_questions())[1], 'stale': True, 'count': 0,
+                'needs': {}}
     fetchers = [(repo, (lambda r=repo: fetch_repo(r))) for repo in dict.fromkeys(r for _, r in repos)]
     fetchers += [('herdr:' + s, (lambda x=s: fetch_session(x))) for s in herdr_sessions()]
     got = CACHE.get(fetchers, refresh=refresh, now=now)

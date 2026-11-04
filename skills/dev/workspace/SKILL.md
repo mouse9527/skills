@@ -67,7 +67,21 @@ README 超过约 300 行就体检：每段问「是纪律还是操作手册」�
 **Owner 关心的是任务，不是哪个 lead / session。** 任务 = Issue（大需求是一棵 Issue 树：父子用 sub-issue，先后用依赖，相关写 `Relates to <owner>/<repo>#<号>`，三种关系不混用）。
 lead、worker 只是「当前谁在做」，可以换；状态从 Issue + PR + checks + 收件箱现算。
 
-**一句话需求**：Owner 对任何 lead 说一句就算交给你了，不用他选 ws、找仓库。收到的 lead 当场评估：
+**一句话需求**：入口优先用问题收件箱页面（127.0.0.1:7788「需求」栏）提交，由 Router 判断归哪个 ws、交给那个 ws 的 lead（skill `router`）；
+Owner 直接对任何 lead 说一句也照旧有效，不用他选 ws、找仓库。**授权终点默认是可审的 PR**（Owner 2026-11-03）：合并、部署按 README / Issue 已有的授权，没有就出审批题（`q ask --kind approval`）；原话是「只读 / 只分析」的以原话为准。
+
+**来自 7788 需求的**（Router 的派工任务书 `dispatch/need-NNNN.md`）：
+
+- 先 `q need claim <id>` 登记自己为负责 lead（只有 lead 能 claim：cwd 恰好是本 ws 的 lead 目录、agent 名 `lead-<ws>`；**不要把 claim 交给 worker**），再 `q need show <id>` 看原话、补充和讨论线程。
+- **不清楚**就在需求的讨论线程里发理解卡（`q need card <id> --body <文件>`：`## 理解` / `## 范围` / `## 不做什么` / `## 验收草案` / `## 开放问题`，开放问题每条带推荐）。
+  **不出题、不开 Issue、不写代码**；Owner 在页面回复或确认时服务会投递给你，回复后按需要再发新一版。
+  线程里冒出明确的离散决定（审批、二选一）仍可单独 `q ask`，线程不替代审批。
+- **清楚、或 Owner 已确认最新一版理解卡**，才建 Issue：在本 ws **主 repo**（README「Issue 开在哪个 repo」）建根 Issue，正文**第一行**写 `需求：need-NNNN`，
+  验收标准来自已确认的理解卡；跨 repo 的部分建子 Issue 挂到根下。然后 `q need link <id> --issue <根 URL> [--issue <子 URL> …]`，讨论线程随之封存。
+- 不做：照下面第 3 步「不做」开 Issue 写理由并 not planned 关闭，再 `q need drop <id> --issue <URL> --why "…"`。
+- lead 换人：新 lead `q need claim <id> --takeover`，只有原负责 lead 已不在 herdr 里时才行。
+
+收到的 lead 当场评估：
 
 1. 查重：已有 Issue 的补充就补到那个 Issue，不另开。
 2. 判断做不做、归哪个 ws（按各 ws README 的 Issue repo）、要不要拆。拆只拆**能独立验收或独立授权**的结果，实现步骤留在任务书里。
@@ -213,7 +227,11 @@ git -C repos/<repo> worktree prune
 ## 9. 防膨胀
 
 - **不为这套流程写工具**：不建 CLI、状态机、本地 backlog、证据库、跨 ws 注册表。Issue 状态从 Issue + PR + checks 现算，不落盘。
-  **唯一例外**（Owner 2026-11-02 批准）：问题收件箱（skill `question-inbox`）。它只放等 Owner 决定的问题，不放 Issue 进度、PR、CI 状态；决定答复后仍由 lead 落到 Issue / PR。
+  **例外只有两项**：
+  1. 问题收件箱（skill `question-inbox`，Owner 2026-11-02 批准）。它只放等 Owner 决定的问题和审批，不放 Issue 进度、PR、CI 状态；决定答复后仍由 lead 落到 Issue / PR。
+  2. 需求记录 + Router（Owner 2026-11-03 批准）。需求记录（`needs/need-NNNN.json`）只存 Owner 原话、分配结论（ws、理由）、负责 lead 的身份、讨论线程（理解卡 / 回复 / 确认）、Issue 链接、notes 和投递记账，
+     **不存**进度、stage、PR、谁在做——这些照旧从 Issue + PR + checks + herdr 现算。
+     Router（skill `router`）只在 herdr session `router` 里起停**它自己建的** workspace（`Router`、`L·<ws>`），不碰别的 session 和人工打开的 pane。
 - 规则只写一处：通用的在 skill，ws 特有的（参数、目录映射、验收命令、Owner 确认的例外）在它的 README；不复制，只指向。
 - 评价一条规则看它有没有改变判断、防住具体错误，不看短期内被加载了几次。
 - 一条规则连续几个 Issue 都没帮你做出不同决定，删掉。

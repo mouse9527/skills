@@ -2,7 +2,8 @@
 """问题收件箱 · 网页 + 投递循环（单进程）。绑定 127.0.0.1:$QI_PORT（默认 7788），端口被占就退出。
 
 启动顺序：进程锁 → 修复（补齐被替换题、sending → uncertain）→ 生成 token → 绑定端口 → 投递循环。
-日志只记 id、状态和错误摘要，不记答案正文。
+投递循环同时把需求（needs/）投给登记的 Router；Router 不在时在 session $QI_ROUTER_SESSION 里拉起（routerctl.ensure）。
+日志只记 id、状态和错误摘要，不记答案正文和需求原话。
 """
 import fcntl
 import hmac
@@ -14,11 +15,13 @@ import re
 import secrets
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import qstore  # noqa: E402
+import routerctl  # noqa: E402
 import tasks  # noqa: E402
 
 log = logging.getLogger('question-inbox')
@@ -89,6 +92,193 @@ def deliver(session, lead, kind, metas):
     log.info('%s %s %s %s', kind, outcome, ','.join(sorted(ids)), err)
 
 
+# ---------- 需求 → Router ----------
+
+ENSURE_LOCK = threading.Lock()  # 同一时间只拉起一次
+
+
+def router_prompt(kind, recs):
+    ids = '、'.join(r['id'] for r in recs)
+    args = ' '.join(r['id'] for r in recs)
+    if kind == 'reply':
+        return (f'[question-inbox] Owner 在需求讨论线程里回复了：{ids}。这条消息本身不是新的授权。\n'
+                f'先执行：python3 {q_cmd()} need show {args}；按 skill workspace §3 继续讨论（需要时 need card 发新一版理解卡）。')
+    if kind == 'confirm':
+        return (f'[question-inbox] Owner 确认了理解卡：{ids}。这条消息本身不是新的授权。\n'
+                f'先执行：python3 {q_cmd()} need show {args}；按已确认的那一版理解卡在本 ws 主 repo 建根 Issue'
+                f'（正文第一行「需求：<id>」），然后 need link。')
+    if kind == 'unclaimed':
+        return (f'[question-inbox] 需求已分到 ws，但一直没有 lead claim：{ids}。这条消息本身不是新的授权。\n'
+                f'先执行：python3 {q_cmd()} need show {args}；看对应的 lead-<ws> 在不在、有没有收到派工书，必要时 router dispatch 重发。')
+    if kind == 'note':
+        return (f'[question-inbox] 需求有 Owner 的新补充：{ids}。这条消息本身不是新的授权。\n'
+                f'先执行：python3 {q_cmd()} need show {args}；按 skill router 处理，处理完用 need note 记一句。')
+    return (f'[question-inbox] 新需求：{ids}。这条消息本身不是新的授权。\n'
+            f'先执行：python3 {q_cmd()} need take {args}；按 skill router 处理。')
+
+
+def router_presence(info):
+    """(pane, 原因, 该不该拉起)。用三态判断：登记的会话在 → 投；**确认不在**（没登记、pane 没了、换了会话、agent 已退出）→ 拉起
+    （ensure 见到名为 router 的 agent 只请它重新登记，不重启它的会话）；**查不清**（查询失败、超时、多个匹配）→ 只暂缓，不拉起。"""
+    s = qstore.router_session()
+    if not info.get('lead_session') or info.get('herdr_session') != s:
+        return None, 'Router 还没登记', True
+    st, pane, why = qstore.presence(s, info['lead_session'])
+    if st == 'present':
+        return pane, '', False
+    if st == 'unknown':
+        return None, f'核对不了 Router 是否还在（{why}）', False
+    return None, f'登记的 Router 会话不在了（{why}）', True
+
+
+def _ensure_thread():
+    try:
+        result, why = routerctl.ensure()
+        log.info('router ensure %s: %s', result, why)
+    except Exception:  # noqa: BLE001
+        log.exception('router ensure failed')
+        qstore.ensure_end('failed', 'ensure 异常，见 server.log')
+    finally:
+        ENSURE_LOCK.release()
+
+
+def kick_ensure():
+    """后台拉起 Router，返回给 last_error 的一句说明。"""
+    st = qstore.ensure_state()
+    if st.get('gave_up'):
+        return 'Router 起不来，已停止自动拉起（页面上可重试）'
+    if not ENSURE_LOCK.acquire(blocking=False):
+        return '正在拉起 Router'
+    threading.Thread(target=_ensure_thread, daemon=True).start()
+    return '正在拉起 Router'
+
+
+def scan_needs():
+    for nid in qstore.nudge_unclaimed():  # 分到 ws 太久没人 claim：补投给 Router 一次
+        log.info('need %s unclaimed, nudging router', nid)
+    due = qstore.needs_due()
+    to_lead = [r for r in due if r.get('delivery_to') == 'lead']
+    due = [r for r in due if r.get('delivery_to') != 'lead']
+    if to_lead:  # Owner 对讨论的回复 / 确认：给已在跑的 lead，暂停不拦（暂停只停 Router 侧）
+        scan_lead_needs(to_lead)
+    if not due or qstore.paused():  # 暂停：不投给 Router、不拉起
+        return
+    s = qstore.router_session()
+    refs = [(r['id'], qstore.geti(r, 'delivery_seq')) for r in due]
+    if not qstore.socket_exists(s):  # 不创建 session，也不执行任何 herdr 命令
+        qstore.need_mark_held(refs, f'herdr session {s} 不在（由 launchd 负责，服务不创建）')
+        return
+    info = qstore.router_info()
+    pane, why, start = router_presence(info)
+    if not pane:
+        qstore.need_mark_held(refs, why + ('；' + kick_ensure() if start else ''))
+        log.info('need held %s: %s', ','.join(r[0] for r in refs), why)
+        return
+    groups = {}
+    for r in sorted(due, key=lambda r: r['id']):
+        groups.setdefault(r.get('delivery_kind') or 'new', []).append(r)
+    for kind, recs in groups.items():
+        for i in range(0, len(recs), qstore.NEED_BATCH):
+            deliver_router(s, pane, info['lead_session'], kind, recs[i:i + qstore.NEED_BATCH])
+
+
+def scan_lead_needs(due):
+    """Owner 的回复 / 确认投给该需求的负责 lead：按 claim 时记下的 agent_session 找，找不到只暂缓，不起、不改投。"""
+    groups = {}
+    for r in sorted(due, key=lambda r: r['id']):
+        lead = r.get('lead') or {}
+        groups.setdefault((lead.get('herdr_session'), lead.get('lead_session'), r.get('delivery_kind')), []).append(r)
+    for (session, lead, kind), recs in groups.items():
+        refs = [(r['id'], qstore.geti(r, 'delivery_seq')) for r in recs]
+        pane, why = qstore.find_lead(session, lead) if session and lead else (None, '还没有负责 lead')
+        if not pane:
+            qstore.need_mark_held(refs, f'负责 lead {why}')
+            continue
+        for i in range(0, len(recs), qstore.NEED_BATCH):
+            deliver_router(session, pane, '', kind, recs[i:i + qstore.NEED_BATCH])
+
+
+def deliver_router(session, pane, lead, kind, recs):
+    """投给 Router（lead 非空）或负责 lead（lead 为空），同一套写前记账。投给 Router 的那一下过暂停门禁：
+    记了 sending 之后才发现暂停，就退回 pending（恢复后发一次），不留在 sending。"""
+    claimed = qstore.need_claim([(r['id'], qstore.geti(r, 'delivery_seq')) for r in recs])
+    if not claimed:
+        return
+    ids = {c[0] for c in claimed}
+    text = router_prompt(kind, [x for x in recs if x['id'] in ids])
+    r = (qstore.gated if lead else qstore.herdr)(session, 'agent', 'prompt', pane['pane_id'], text)
+    if r.get('kind') == 'paused':
+        qstore.need_unclaim(claimed, '全局暂停，没有发出')
+        log.info('need %s paused before prompt %s', kind, ','.join(sorted(ids)))
+        return
+    if r['ok']:
+        outcome, err = 'sent', ''
+    elif r['kind'] in ('no_socket', 'exec_error') or r['code'] in qstore.NOT_SENT_CODES:
+        outcome, err = 'held', f'{r["code"]} {r["message"]}'.strip()
+    else:
+        outcome, err = 'uncertain', f'{r["code"]} {r["message"]}'.strip()
+    qstore.need_finish(claimed, outcome, err, lead)
+    log.info('need %s %s %s %s', kind, outcome, ','.join(sorted(ids)), err)
+
+
+HEALTH = {'at': 0.0, 'data': None}
+HEALTH_LOCK = threading.Lock()
+
+
+def router_health():
+    """页面的 Router 健康状态；现场查 herdr，内存里缓存 10 秒。"""
+    with HEALTH_LOCK:
+        if HEALTH['data'] is not None and time.monotonic() - HEALTH['at'] < 10:
+            return HEALTH['data']
+        s = qstore.router_session()
+        info, st = qstore.router_info(), qstore.ensure_state()
+        sock = qstore.socket_exists(s)
+        present, why = False, ''
+        if not sock:
+            why = f'herdr session {s} 不在'
+        else:
+            pane, why, _ = router_presence(info)
+            present = bool(pane)
+        HEALTH['data'] = {
+            'session': s, 'socket': sock, 'registered': bool(info.get('lead_session')), 'present': present,
+            'why': why, 'pane_id': info.get('pane_id') or '', 'registered_at': info.get('registered_at') or '',
+            'last_delivery_at': info.get('last_delivery_at') or '', 'ensure_total': qstore.geti(st, 'total'),
+            'ensure_last_at': st.get('last_at') or '', 'ensure_last_result': st.get('last_result') or '',
+            'gave_up': bool(st.get('gave_up')), 'last_error': st.get('last_error') or '', 'paused': qstore.paused(),
+            'reregister': (st.get('reregister') or {}).get('at') or ''}
+        HEALTH['at'] = time.monotonic()
+        return HEALTH['data']
+
+
+def need_summary(rec):
+    label, why, renot = qstore.need_delivery_view(rec)
+    lead = rec.get('lead') or {}
+    thread = []
+    for x in rec.get('thread') or []:
+        item = {'at': x.get('at'), 'by': x.get('by'), 'kind': x.get('kind'), 'rev': x.get('rev') or 0}
+        if x.get('kind') == 'card':
+            item['card'] = [[k, (x.get('card') or {}).get(k) or ''] for k in qstore.CARD_SECTIONS]
+        elif x.get('kind') == 'reply':
+            item['text'] = x.get('text') or ''
+        thread.append(item)
+    return {'id': rec['id'], 'text': rec.get('text') or '', 'status': rec.get('status'), 'discuss': rec.get('discuss') or '',
+            'lead': (f'{lead.get("herdr_session")} · pane {lead.get("pane_id")}' if lead else ''),
+            'card_rev': qstore.geti(rec, 'card_rev'), 'confirmed_rev': qstore.geti(rec, 'confirmed_rev'),
+            'thread': thread, 'sealed': rec.get('status') in qstore.SEALED, 'ws': rec.get('ws') or '',
+            'why': rec.get('why') or '', 'created': rec.get('created'), 'updated': rec.get('updated'),
+            'issues': [u for u in rec.get('issues') or [] if isinstance(u, str) and qstore.ISSUE_URL_RE.match(u)],
+            'notes': [{'at': n.get('at'), 'by': n.get('by'), 'text': n.get('text')} for n in rec.get('notes') or []],
+            'pending_notes': len(qstore.pending_notes(rec)), 'delivery': label,
+            'dispatch': (f'{(rec.get("dispatch") or {}).get("lead")} · pane {(rec.get("dispatch") or {}).get("pane_id")}'
+                         if rec.get('dispatch') else ''), 'delivery_detail': why,
+            'renotify': renot, 'log': (rec.get('log') or [])[-8:]}
+
+
+def needs_view():
+    recs = sorted(qstore.all_needs().values(), key=lambda r: r['id'], reverse=True)
+    return {'needs': [need_summary(r) for r in recs], 'router': router_health()}
+
+
 def delivery_loop(stop):
     interval = float(os.environ.get('QI_SCAN_INTERVAL') or 5)
     while not stop.is_set():
@@ -96,6 +286,10 @@ def delivery_loop(stop):
             scan_once()
         except Exception:  # 循环不能死；错误进日志
             log.exception('scan failed')
+        try:
+            scan_needs()
+        except Exception:
+            log.exception('need scan failed')
         stop.wait(interval)
 
 
@@ -183,7 +377,7 @@ def md(text, fold=False):
 # ---------- 视图数据 ----------
 
 CARD_SECTIONS = ('问题', '选项', '建议')  # 拆进 Qn 卡片
-SHOWN_SECTIONS = CARD_SECTIONS + ('背景', '证据', '答完之后')
+SHOWN_SECTIONS = CARD_SECTIONS + ('背景', '证据', '答完之后') + qstore.APPROVAL_SECTIONS  # 审批的动作 / 对象 / 后果单独醒目显示
 
 
 def lead_view(lead):
@@ -222,6 +416,7 @@ def lead_view(lead):
     extra += [f'### {k}\n\n{v}' for k, v in secs.items() if k not in SHOWN_SECTIONS]
     return {'background_html': md(secs.get('背景', '')), 'evidence_html': md(secs.get('证据', ''), fold=True),
             'after_html': md(secs.get('答完之后', '')), 'extra_html': md('\n\n'.join(x for x in extra if x)),
+            'approval_html': [[k, md(secs[k])] for k in qstore.APPROVAL_SECTIONS if secs.get(k)],
             'option_notes': {q: md('\n'.join(v).strip()) for q, v in notes.items() if '\n'.join(v).strip()}}
 
 
@@ -229,7 +424,8 @@ def summary(meta, allq):
     label, why, renot = qstore.delivery_view(meta)
     lead, sp = qstore.split_body(allq[meta['id']][1]) if meta.get('id') in allq else ('', {})
     dropped = set(q for q in (meta.get('withdrawn_qs') or '').split(',') if q)
-    return {'id': meta['id'], 'title': meta.get('title'), 'ws': meta.get('ws'), 'blocking': meta.get('blocking'),
+    return {'id': meta['id'], 'kind': qstore.kind_of(meta), 'title': meta.get('title'), 'ws': meta.get('ws'),
+            'blocking': meta.get('blocking'),
             'status': meta.get('status'), 'created': meta.get('created'), 'updated': meta.get('updated'),
             'answer_rev': qstore.geti(meta, 'answer_rev'), 'delivery': label, 'delivery_detail': why,
             'renotify': renot, 'invalid': qstore.invalid_reason(meta, allq),
@@ -242,6 +438,10 @@ def summary(meta, allq):
 
 def list_view():
     allq = qstore.all_questions()
+    talk = [{'id': r['id'], 'text': (r.get('text') or '').split('\n')[0][:120], 'ws': r.get('ws') or '',
+             'card_rev': qstore.geti(r, 'card_rev'), 'updated': r.get('updated')}
+            for r in sorted(qstore.all_needs().values(), key=lambda r: r['id'])
+            if r.get('status') == 'discussing' and r.get('discuss') == 'waiting_owner']
     groups = {'todo': [], 'waiting': [], 'received': [], 'closed': []}
     for qid, (m, _) in allq.items():
         s = summary(m, allq)
@@ -258,7 +458,7 @@ def list_view():
     groups['waiting'].sort(key=lambda s: s['updated'] or '')
     groups['received'].sort(key=lambda s: s['updated'] or '')
     groups['closed'] = sorted(groups['closed'], key=lambda s: s['updated'] or '', reverse=True)[:20]
-    return {'open_count': len(groups['todo']), 'groups': groups}
+    return {'open_count': len(groups['todo']) + len(talk), 'groups': groups, 'needs_talk': talk}
 
 
 def detail_view(qid):
@@ -349,6 +549,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(200, page.encode(), 'text/html; charset=utf-8', {'Content-Security-Policy': csp})
             if path == '/api/list':
                 return self.send(200, list_view())
+            if path == '/api/needs':
+                return self.send(200, needs_view())
             if path == '/api/tasks':  # 只读；refresh=1 只是跳过 60 秒缓存，不写任何东西
                 try:
                     return self.send(200, tasks.view(refresh='refresh=1' in query.split('&')))
@@ -368,7 +570,8 @@ class Handler(BaseHTTPRequestHandler):
             log.warning('rejected write %s: %s', self.path, bad)
             return self.send(403, {'error': bad})
         m = re.fullmatch(r'/api/q/([A-Za-z0-9_.-]+)/(save|submit|renotify|close)', self.path)
-        if not m:
+        other = re.fullmatch(r'/api/(need)|/api/need/(need-\d{4,})/(reply|confirm|renotify)|/api/router/(pause|retry|reregister)', self.path)
+        if not m and not other:
             return self.send(404, {'error': 'not found'})
         try:
             length = int(self.headers.get('Content-Length') or 0)
@@ -379,6 +582,8 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError
         except ValueError:
             return self.send(400, {'error': '请求体不是合法 JSON 对象'})
+        if other:
+            return self.post_need(other, req)
         qid, action = m.groups()
         try:
             if action == 'save':
@@ -405,6 +610,47 @@ class Handler(BaseHTTPRequestHandler):
         except (TypeError, ValueError):
             return self.send(400, {'error': '参数不合法'})
 
+    def post_need(self, m, req):
+        """需求 / Router 的写接口：和答题一样过 JSON、Host、Origin、token 四项校验（do_POST 里已做）。"""
+        create, nid, action, ctl = m.groups()
+        text = req.get('text') if isinstance(req.get('text'), str) else ''
+        rid = req.get('request_id') if isinstance(req.get('request_id'), str) else ''
+        try:
+            if create:
+                rec, new = qstore.create_need(text, rid)
+                res = {'ok': True, 'id': rec['id'], 'created': new}
+            elif action == 'reply':
+                rec, new = qstore.owner_reply(nid, text, rid)
+                res = {'ok': True, 'id': nid, 'created': new, 'to': 'lead' if rec.get('lead') else 'router'}
+            elif action == 'confirm':
+                if not isinstance(req.get('card_rev'), int) or isinstance(req.get('card_rev'), bool):
+                    return self.send(400, {'error': 'card_rev 必须是整数'})
+                rec, new = qstore.owner_confirm(nid, req['card_rev'], rid)
+                res = {'ok': True, 'id': nid, 'created': new, 'card_rev': rec.get('confirmed_rev')}
+            elif action == 'renotify':
+                qstore.need_renotify(nid)
+                res = {'ok': True, 'note': '已重新排队；这条可能已经在 Router 的队列里'}
+            elif ctl == 'pause':
+                if not isinstance(req.get('paused'), bool):
+                    return self.send(400, {'error': 'paused 必须是 true / false'})
+                qstore.set_paused(req['paused'])
+                res = {'ok': True, 'paused': req['paused']}
+            elif ctl == 'reregister':  # 不重启 Router 的会话，只请那个名为 router 的 agent 重新登记一次
+                if qstore.paused():
+                    return self.send(409, {'error': '全局暂停中'})
+                qstore.ensure_note('reregister', None)
+                res = {'ok': True, 'note': kick_ensure()}
+            else:
+                qstore.ensure_retry()
+                res = {'ok': True, 'note': '已清除「起不来」标记，下次有需求要投递时会重新拉起'}
+            with HEALTH_LOCK:
+                HEALTH['data'] = None
+            log.info('%s ok', self.path)
+            return self.send(200, res)
+        except qstore.QError as e:
+            log.info('%s rejected %s', self.path, e.code)
+            return self.send(e.code, {'error': e.message})
+
     def do_PUT(self):
         self.send(405, {'error': 'method not allowed'})
 
@@ -425,7 +671,7 @@ def main():
     except OSError:
         print('已有一个 question-inbox 服务在运行', file=sys.stderr)
         return 1
-    for c in qstore.repair():  # 开放写入和投递之前
+    for c in qstore.repair() + qstore.repair_needs():  # 开放写入和投递之前
         log.info('repair %s', c)
     token = secrets.token_hex(24)
     tp = sd / 'token'
@@ -472,8 +718,25 @@ a{color:var(--accent)}
 #modes a{padding:6px 12px;border-radius:8px;text-decoration:none;color:var(--muted);font-size:14px;font-weight:600}
 #modes a[aria-current]{background:var(--accent-weak);color:var(--accent)}
 #app{display:grid;grid-template-columns:280px minmax(0,1fr);height:calc(100vh - 44px)}
-#app[data-view=tasks]{grid-template-columns:minmax(0,1fr)}
-#app[data-view=tasks] #side{display:none}
+#app[data-view=tasks],#app[data-view=needs]{grid-template-columns:minmax(0,1fr)}
+#app[data-view=tasks] #side,#app[data-view=needs] #side{display:none}
+.needs{max-width:1040px}
+.nform{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:12px 16px;margin:12px 0}
+.nform h2{font-size:15px;margin:0}.nform .acts{margin-top:8px}
+.rcard{border:1px solid var(--border);border-radius:10px;padding:10px 16px;margin:12px 0;background:var(--surface)}
+.rcard.bad{border:2px solid var(--bad-text)}
+.nrow{padding:10px 14px;border-radius:10px;border:1px solid var(--border);background:var(--surface);margin:10px 0;font-size:14px;line-height:1.55}
+.nrow .t1{display:flex;flex-wrap:wrap;gap:6px 10px;align-items:center;color:var(--muted);font-size:13px}
+.nrow .ntext{font-weight:600;margin:4px 0;white-space:pre-wrap;word-break:break-word}
+.nrow .iss{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:4px 0}
+.nrow .nt{margin:2px 0;font-size:13px;white-space:pre-wrap;word-break:break-word}
+.nrow .nt.owner{color:var(--text)}.nrow .nt.router{color:var(--muted)}
+.plain{white-space:pre-wrap;word-break:break-word}
+.nrow.focus{outline:2px solid var(--accent)}
+.thread{border-left:3px solid var(--border);padding-left:10px;margin:6px 0}
+.ncard{border:1px solid var(--border);border-radius:8px;padding:8px 10px;margin:6px 0;background:var(--bg)}
+.ncard.cur{border:2px solid var(--accent)}.ncard .csec{margin:4px 0}.ncard .csec strong{font-size:13px;color:var(--muted)}
+.nbox{display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap}.nbox textarea{flex:1 1 280px;min-height:44px}
 .tasks{max-width:1040px}
 .tgrp h2{font-size:15px;margin:24px 0 6px;display:flex;gap:8px;align-items:baseline}
 .tgrp.you h2{color:var(--warn-text)}.tgrp.stuck h2{color:var(--bad-text)}.tgrp.closed{opacity:.8}
@@ -534,6 +797,7 @@ h1{font-size:24px;line-height:1.3;margin:4px 0 6px}
 .sec>h2,.sec>summary{font-size:13px;font-weight:600;color:var(--muted);margin:0 0 4px;cursor:default}
 .sec>summary{cursor:pointer}
 .sec p{margin:0 0 8px}.sec ul,.sec ol{margin:0 0 8px;padding-left:22px}
+.sec.appr{border-left:3px solid var(--warn-text);padding-left:12px}.sec.appr>h2{color:var(--warn-text)}
 .after{border-left:3px solid var(--border);padding:2px 12px;margin:18px 0;display:flex;gap:8px;align-items:baseline}
 .after .mute{flex:none}.after p{margin:0}
 .errata>summary{color:var(--warn-text)}
@@ -689,7 +953,8 @@ function listItem(s, g) {
   const sub = g === 'todo' ? '' : g === 'closed' ? closedAs + (s.renotify ? ' · ' + s.delivery : '') : (s.invalid || s.delivery || s.status);
   return el('a', {class: 'item' + (s.id === cur ? ' cur' : ''), href: '#' + s.id},
     el('div', {class: 'l1'}, unseen ? [el('span', {class: 'dot', title: '有没看过的内容'}), el('span', {class: 'sr'}, '未看')] : null,
-      (where(s) || s.id) + (s.n_questions ? ` · ${s.n_questions} 问` : ''), s.has_draft ? el('span', {class: 'tag'}, '草稿') : null),
+      (where(s) || s.id) + (s.n_questions ? ` · ${s.n_questions} 问` : ''), s.kind === 'approval' ? el('span', {class: 'tag'}, '审批') : null,
+      s.has_draft ? el('span', {class: 'tag'}, '草稿') : null),
     el('div', {class: 'l2'}, el('span', {class: 'tt', title: s.title || ''}, s.title || s.id), when(g === 'todo' ? s.created : s.updated)),
     sub ? el('div', {class: 'l3'}, sub) : null);
 }
@@ -716,9 +981,16 @@ async function refreshList() {
   renderModes();
   document.title = (j.open_count ? `(${j.open_count}) ` : '') + '问题收件箱';
   const side = document.getElementById('side'), top = side.scrollTop, todo = j.groups.todo;
+  const qs = todo.filter(s => s.kind !== 'approval');  // 审批一栏排在问题前面
+  const talk = j.needs_talk || [];  // 需求讨论：等你回复或确认理解卡，和审批同级、排最前
   const parts = [
-    listGroup('lead 正在等', todo.filter(s => s.blocking === 'yes'), 'hot', 'todo'),
-    listGroup('可稍后', todo.filter(s => s.blocking !== 'yes'), '', 'todo'),
+    talk.length ? el('section', {class: 'grp hot'}, el('h2', {}, '需求讨论', el('span', {class: 'n'}, `${talk.length} 条`)),
+      talk.map(t => el('a', {class: 'item', href: '#' + NEEDS + ':' + t.id},
+        el('div', {class: 'l1'}, [t.ws, t.id].filter(Boolean).join(' · '), el('span', {class: 'tag'}, `理解卡 v${t.card_rev}`)),
+        el('div', {class: 'l2'}, el('span', {class: 'tt', title: t.text}, t.text), when(t.updated))))) : null,
+    listGroup('审批', todo.filter(s => s.kind === 'approval'), 'hot', 'todo'),
+    listGroup('lead 正在等', qs.filter(s => s.blocking === 'yes'), 'hot', 'todo'),
+    listGroup('可稍后', qs.filter(s => s.blocking !== 'yes'), '', 'todo'),
     listGroup('已答，lead 未接收', j.groups.waiting, 'dim', 'waiting'),
     listGroup('lead 已接收，未闭环', j.groups.received, 'dim', 'received'),
     listGroup('最近已闭环 / 撤回', j.groups.closed, 'dim', 'closed')].filter(Boolean);
@@ -735,12 +1007,14 @@ function markDirty() { dirty = true; formGen++; updateProgress(); }
 function checkedValue(q) { const r = document.querySelector(`input[name="t_${q}"]:checked`); return r ? r.value : null; }
 function textOf(q) { const t = document.getElementById('x_' + q); return t ? t.value : ''; }
 function liveQs(d) { return d.questions.filter(q => !q.withdrawn); }
+function isApproval(d) { return !!d && d.kind === 'approval'; }
+const APPROVE_FIX = 'C. 需要先改';
 
 // 「已填」只在这里判定：选了类型，或者没选类型但写了非空文字（算自由回答）。按钮和提交共用
 function slotFor(q) {
   if (q.withdrawn) return null;
   const v = checkedValue(q.q), text = textOf(q.q);
-  if (!v) return text.trim() ? {type: 'free', text} : null;
+  if (!v) return text.trim() && !isApproval(detail) ? {type: 'free', text} : null;  // 审批只认三个选项
   if (v.startsWith('opt:')) return {type: 'option', choice: q.options[+v.slice(4)], text};
   return {type: v, text};
 }
@@ -796,7 +1070,7 @@ function decision(q, s) {
   const si = suggestIndex(q), extra = s.type !== 'free' && (s.text || '').trim() ? s.text : '';
   if (s.type === 'option') {
     const same = si >= 0 && q.options[si] === s.choice;
-    return {main: s.choice || '', tag: same ? '与建议一致' : '不是建议', follows: same, extra};
+    return {main: s.choice || '', tag: same ? '与建议一致' : (q.suggestion ? '不是建议' : ''), follows: same, extra};
   }
   if (s.type === 'suggested') {
     const sugg = s.choice || q.suggestion || '';
@@ -907,6 +1181,10 @@ function revKey(d) { return `${d.id}/${d.content_rev}/${d.answer_rev}`; }
 function startSubmit(d) {
   if (d !== detail || posting) return;
   const slots = slotsFromForm(d);
+  if (isApproval(d) && !slots.Q1) { msg = {cls: 'bad', text: '审批要选一项：批准 / 不批准 / 需要先改'}; renderMsg(); return; }
+  if (isApproval(d) && slots.Q1.choice === APPROVE_FIX && !(slots.Q1.text || '').trim()) {
+    msg = {cls: 'bad', text: `选「${APPROVE_FIX}」要写清楚改什么（写在选项下面的框里）`}; renderMsg(); return;
+  }
   if (liveQs(d).length < 2) return submitNow(d, slots);
   sheet = {key: revKey(d), fg: formGen, slots};
   renderSheet();
@@ -1011,6 +1289,7 @@ function stateLine(d) {
   else if (d.status === 'answered') head = d.received ? el('span', {class: 'chip ok'}, `lead 已接收 Rev ${d.answer_rev}`) : `已提交 Rev ${d.answer_rev}，等 lead 接收`;
   else if (d.status === 'resolved') head = el('span', {class: 'chip ok'}, d.closed_by === 'owner' ? '已由你关闭' : 'lead 已闭环');
   else head = '已撤回';
+  if (isApproval(d)) return [el('span', {class: 'chip hot'}, '审批'), ' ', head, ' · ', when(d.created)];
   return [head, ` · ${live} 个问题${gone ? `（另有 ${gone} 个已撤回）` : ''} · `, when(d.created)];
 }
 
@@ -1085,6 +1364,10 @@ function card(d, q, latest) {
       el('span', {class: 'ot'}, 'lead 建议：' + q.suggestion), el('span', {class: 'badge'}, '按此建议'))));
   }
   if (note) c.append(el('div', {class: 'note'}, html(note)));
+  if (isApproval(d)) {  // 审批：三个固定选项，不预选、没有「按建议」和「其他回答」；补充框常开
+    c.append(el('textarea', {id: 'x_' + q.q, rows: 2, placeholder: `补充（选「${APPROVE_FIX}」时必填：要改什么）`, oninput: markDirty}));
+    return c;
+  }
   c.append(fold('add_' + q.q, 'fold', '＋补充', false,
       el('textarea', {id: 'x_' + q.q, rows: 2, placeholder: '补充 / 原话（不选上面的类型直接写，就算自由回答）', oninput: markDirty})),
     fold('oth_' + q.q, 'fold', '其他回答 ▾', false,
@@ -1112,6 +1395,7 @@ function render() {
   wrap.append(deliveryBar(d) || '');
   if (d.resolution) wrap.append(el('div', {class: 'msgbar ok'}, (d.closed_by === 'owner' ? '由你在页面上关闭（不是 lead 闭环）：' : 'lead 已闭环：') + d.resolution));
   const prose = (title, h, cls) => h ? el('section', {class: 'sec prose ' + (cls || '')}, el('h2', {}, title), html(h)) : null;
+  for (const [k, h] of d.approval_html || []) wrap.append(prose(k, h, 'appr'));  // 审批：批什么、对谁、后果
   wrap.append(prose('背景', d.background_html) || '', prose('证据', d.evidence_html) || '');
   if (d.errata_html) wrap.append(fold('errata', 'sec prose errata', '勘误（lead 改过问题，作答前请看）', false, html(d.errata_html)));
   if (d.after_html) wrap.append(el('div', {class: 'after prose'}, el('span', {class: 'mute small'}, '答完之后：'), html(d.after_html)));
@@ -1149,12 +1433,13 @@ function render() {
           editing = false; dirty = false; msg = null; render();
         }}, '放弃更正') : null,
         el('button', {onclick: () => post(d, 'save', {content_rev: d.content_rev, slots: slotsFromForm(d)})}, '保存草稿'),
-        live.some(q => q.suggestion) ? el('button', {onclick: () => {
+        !isApproval(d) && live.some(q => q.suggestion) ? el('button', {onclick: () => {
           const todo = empty(), n = fillSuggested(d);
           msg = {cls: 'info', text: n ? `已按建议填入 ${todo.join('、')}，还没提交，可以再改。` : '没有能按建议填的空题。'}; renderMsg();
         }}, '其余按建议') : null,
         el('button', {class: 'pri', id: 'go', disabled: posting, onclick: () => startSubmit(d)}, goLabel(d), posting ? null : el('kbd', {}, '⌘↵')))),
-      el('p', {class: 'mute small'}, '「其余按建议」只填还空着的题，你可以再改；只有提交才算回答。')));
+      el('p', {class: 'mute small'}, isApproval(d) ? '只有提交的「A. 批准」才算授权；lead 执行前会重新核对 HEAD 和环境。'
+        : '「其余按建议」只填还空着的题，你可以再改；只有提交才算回答。')));
   }
   main.replaceChildren(wrap);
   if (formShown) {
@@ -1191,14 +1476,15 @@ async function load(force) {
 
 // ---------- 任务视图（只读：除了刷新、链接、跳到题，没有任何输入控件，也不发写请求） ----------
 
-const TASKS = 'tasks';
-let mode = 'inbox', tasksData = null, tasksErr = '', tasksSeq = 0, tasksLoading = false, tasksAt = 0;
+const TASKS = 'tasks', NEEDS = 'needs';
+let mode = 'inbox', tasksData = null, tasksErr = '', tasksSeq = 0, tasksLoading = false, tasksAt = 0, taskFilter = '';
 const STAGE_CLS = {answer: 'hot', merge: 'hot', accept: 'hot', stuck: 'bad', doing: 'info', todo: 'mute', hold: 'mute', done: 'ok', dropped: 'mute'};
 
 function renderModes() {
   const box = document.getElementById('modes'); if (!box) return;
   const link = (href, label, on) => el('a', {href, 'aria-current': on ? 'page' : null}, label);
-  box.replaceChildren(link('#', `待我决定（${openCount}）`, mode === 'inbox'), link('#' + TASKS, '任务', mode === 'tasks'));
+  box.replaceChildren(link('#' + NEEDS, '需求', mode === 'needs'), link('#', `待我决定（${openCount}）`, mode === 'inbox'),
+    link('#' + TASKS, '任务', mode === 'tasks'));
 }
 
 // 只放行 https://github.com/ 的链接；别的一律当文字
@@ -1216,6 +1502,7 @@ async function loadTasks(refresh) {
   tasksLoading = false; tasksAt = Date.now();
   if (status === 200) { tasksData = j; tasksErr = ''; } else tasksErr = j.error || ('错误 ' + status);  // 失败时保留上一次的数据
   if (mode === 'tasks') renderTasks();
+  if (mode === 'needs') renderNeedsSoon();  // 需求页的 Issue 进度复用任务数据
 }
 
 function taskRow(t) {
@@ -1230,6 +1517,7 @@ function taskRow(t) {
     el('div', {class: 't1'}, el('span', {}, t.ws), '·', ghLink(t.url, `${t.repo}#${t.number}`),
       el('span', {class: 'chip ' + (STAGE_CLS[t.stage.key] || 'mute'), title: why[0] || ''}, t.stage.label),
       (t.tags || []).map(x => el('span', {class: 'tag', title: x.why}, x.label)),
+      t.need ? el('a', {class: 'tag', href: '#' + TASKS + ':' + t.need, title: '只看这个需求的任务'}, t.need) : null,
       t.sub ? el('span', {class: 'tag', title: '子 Issue 全关不等于父 Issue 完成'}, `子 Issue ${t.sub.completed}/${t.sub.total} 已关`) : null),
     el('div', {class: 't2'}, t.title),
     el('div', {class: 't3'}, el('span', {}, '依据：' + (why[0] || '—')),
@@ -1255,9 +1543,28 @@ function renderTasks() {
     for (const m of s.more || []) wrap.append(el('div', {class: 'msgbar warn'}, `${s.name}：${m}`));
   }
   if (!v) { wrap.append(el('p', {class: 'mute'}, tasksErr ? '还没有拿到过数据。' : '加载中…')); main.replaceChildren(wrap); return; }
+  const needs = v.needs || {};
+  if (taskFilter) {
+    wrap.append(el('div', {class: 'msgbar info'}, `只看需求 ${taskFilter} 的任务（按根 Issue 正文第一行「需求：${taskFilter}」归组）· `,
+      el('a', {href: '#' + TASKS}, '显示全部'), ' · ', el('a', {href: '#' + NEEDS}, '回需求')));
+    if (!(needs[taskFilter] || []).length) wrap.append(el('p', {class: 'mute'}, '任务里还没有正文第一行写着这个需求号的 Issue（可能还没建、或 repo 不在 tasks.json 里）。'));
+  } else if (Object.keys(needs).length) {
+    const box = el('section', {class: 'tgrp'}, el('h2', {}, '按需求', el('span', {class: 'n mute small'}, `${Object.keys(needs).length} 个需求`)));
+    for (const [nid, list] of Object.entries(needs).sort((a, b) => b[0].localeCompare(a[0]))) {
+      box.append(el('h3', {}, el('a', {href: '#' + TASKS + ':' + nid}, nid)),
+        ...list.map(t => el('div', {class: 'trow d' + t.depth}, el('div', {class: 't1'}, ghLink(t.url, `${t.repo}#${t.number}`),
+          el('span', {class: 'chip ' + (STAGE_CLS[t.stage.key] || 'mute')}, t.stage.label),
+          t.sub ? el('span', {class: 'tag'}, `子 Issue ${t.sub.completed}/${t.sub.total} 已关`) : null, t.title))));
+    }
+    wrap.append(box);
+  }
   for (const g of v.groups) {
-    const box = el('section', {class: 'tgrp ' + g.key}, el('h2', {}, g.title, el('span', {class: 'n mute small'}, `${g.count} 个`)));
-    for (const w of g.ws) box.append(el('h3', {}, w.ws), ...w.tasks.map(taskRow));
+    const ws = g.ws.map(w => ({ws: w.ws, tasks: taskFilter ? w.tasks.filter(t => t.kind === 'task' && t.need === taskFilter) : w.tasks}))
+      .filter(w => w.tasks.length);
+    if (!ws.length) continue;
+    const n = taskFilter ? ws.reduce((a, w) => a + w.tasks.length, 0) : g.count;
+    const box = el('section', {class: 'tgrp ' + g.key}, el('h2', {}, g.title, el('span', {class: 'n mute small'}, `${n} 个`)));
+    for (const w of ws) box.append(el('h3', {}, w.ws), ...w.tasks.map(taskRow));
     wrap.append(box);
   }
   if ((v.unlinked || []).length) {
@@ -1271,6 +1578,169 @@ function renderTasks() {
   main.scrollTop = top;
 }
 
+// ---------- 需求（提交一句话、补充 / 纠正、Router 健康与全局暂停）----------
+// 输入只存在内存里（needDraft），轮询重建时填回；有输入框正在聚焦就推迟重建，不打断输入
+let needsData = null, needsErr = '', needsSeq = 0, needsStale = false, needMsg = null;
+const needDraft = {}, needReq = {}, needBusy = {};
+const NEED_ST = {new: ['新', 'info'], routing: ['Router 分派中', 'info'], assigned: ['已分到 ws', 'info'], discussing: ['讨论中', 'info'],
+  confirmed: ['理解已确认', 'ok'], filed: ['已立项', 'ok'], dropped: ['不做', 'mute'], held: ['卡住', 'bad']};
+let needFocus = '', needFocused = '';
+
+function rid() {  // 客户端生成的幂等键：同一段文字重试用同一个
+  try { return crypto.randomUUID(); } catch (e) { return Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 14); }
+}
+
+async function loadNeeds() {
+  const seq = ++needsSeq;
+  let status = 0, j = {};
+  try { ({status, j} = await api('/api/needs')); } catch (e) { j = {error: String(e)}; }
+  if (seq !== needsSeq) return;
+  if (status === 200) {
+    const same = JSON.stringify(j) === JSON.stringify(needsData);
+    needsData = j; if (same && !needsErr) return; needsErr = '';
+  } else needsErr = j.error || ('错误 ' + status);
+  if (mode === 'needs') renderNeedsSoon();
+}
+
+function typingNow() { const a = document.activeElement; return !!a && String(a.tagName || '').toUpperCase() === 'TEXTAREA'; }
+function renderNeedsSoon() { if (mode !== 'needs') return; if (typingNow()) { needsStale = true; return; } renderNeeds(); }
+
+async function needPost(key, path, body, done) {
+  if (needBusy[key]) return;
+  needBusy[key] = true; renderNeeds();
+  let status = 0, j = {};
+  try { ({status, j} = await api(path, body)); } catch (e) { j = {error: String(e)}; }
+  needBusy[key] = false;
+  if (status === 200) done(j); else needMsg = {cls: 'bad', text: (j.error || ('错误 ' + status)) + '（输入还在，可以重试）'};
+  loadNeeds(); renderNeedsSoon();
+}
+
+function sendText(key, path, okText) {
+  const text = needDraft[key] || '';
+  if (!text.trim()) {  // 刚提交成功又点了一下：不盖掉「已提交」
+    if (!(needMsg && needMsg.cls === 'ok' && Date.now() - needMsg.at < 5000)) needMsg = {cls: 'bad', text: '先写内容'};
+    renderNeeds(); return;
+  }
+  if (!needReq[key] || needReq[key].text !== text) needReq[key] = {text, id: rid()};
+  needPost(key, path, {text, request_id: needReq[key].id}, j => {
+    if (needDraft[key] === text) needDraft[key] = '';
+    delete needReq[key];
+    needMsg = {cls: 'ok', text: okText(j), at: Date.now()};
+  });
+}
+
+function draftBox(key, placeholder, rows) {
+  const t = el('textarea', {id: 'nd_' + key, rows, placeholder, oninput: e => { needDraft[key] = e.target.value; }});
+  t.value = needDraft[key] || '';
+  return t;
+}
+
+function routerCard(h) {
+  const st = h.paused ? ['暂停中', 'mute'] : h.gave_up ? ['Router 起不来', 'bad'] : h.present ? ['在线', 'ok'] : !h.socket ? ['session 不在', 'bad'] : ['不在', 'hot'];
+  const rows = [['登记', h.registered ? `已登记（session ${h.session} · pane ${h.pane_id} · ${h.registered_at}）` : '未登记'],
+    ['现在', h.present ? '在' : (h.why || '不在')],
+    ['被拉起', `${h.ensure_total} 次` + (h.ensure_last_at ? `（最近 ${h.ensure_last_at} · ${h.ensure_last_result || '进行中'}）` : '')],
+    ['最近一次投递', h.last_delivery_at || '—']];
+  return el('section', {class: 'rcard' + (h.gave_up ? ' bad' : ''), id: 'router_card'},
+    el('div', {class: 'thead'}, el('strong', {}, 'Router'), el('span', {class: 'chip ' + st[1]}, st[0]),
+      el('button', {id: 'pause_btn', disabled: !!needBusy._pause, onclick: () => needPost('_pause', '/api/router/pause', {paused: !h.paused},
+        j => { needMsg = {cls: 'ok', text: j.paused ? '已全局暂停' : '已恢复'}; })},
+        needBusy._pause ? (h.paused ? '恢复中…' : '暂停中…等当前动作做完') : (h.paused ? '恢复' : '全局暂停')),
+      !h.present && h.socket && !h.paused && !h.gave_up ? el('button', {id: 'rereg_btn', disabled: !!needBusy._rereg,
+        onclick: () => needPost('_rereg', '/api/router/reregister', {}, j => { needMsg = {cls: 'ok', text: '已请 Router 重新登记：' + j.note, at: Date.now()}; })},
+        '让 Router 重新登记') : null,
+      h.gave_up ? el('button', {id: 'retry_btn', disabled: !!needBusy._retry, onclick: () => needPost('_retry', '/api/router/retry', {},
+        j => { needMsg = {cls: 'ok', text: j.note}; })}, '重新尝试拉起') : null),
+    h.gave_up ? el('div', {class: 'msgbar bad'}, 'Router 起不来：1 小时内自动拉起 3 次仍不在，已停止自动拉起。' + (h.last_error ? '原因：' + h.last_error : '')) : null,
+    h.paused ? el('div', {class: 'msgbar warn'}, '全局暂停：不向 Router 投递、不自动拉起 Router，Router 不分派、不派工、不新起 lead。已经在跑的 lead 不受影响：你在讨论线程里的回复和确认照常投给负责 lead。') : null,
+    el('div', {class: 'kv small'}, rows.map(([k, v]) => [el('span', {class: 'mute'}, k), el('span', {}, v)])));
+}
+
+function taskByUrl() {
+  const m = {};
+  for (const g of (tasksData && tasksData.groups) || []) for (const w of g.ws) for (const t of w.tasks) if (t.kind === 'task' && t.url) m[t.url] = t;
+  return m;
+}
+
+function cardView(x, latest) {
+  return el('div', {class: 'ncard' + (latest ? ' cur' : '')}, el('div', {class: 'small mute'}, `lead · 理解卡 v${x.rev} · ${x.at}`),
+    x.card.map(([k, v]) => el('div', {class: 'csec'}, el('strong', {}, k), el('div', {class: 'plain'}, v || '（空）'))));
+}
+
+function threadView(n) {
+  if (!n.thread.length) return null;
+  const items = [];
+  for (const x of n.thread) {
+    if (x.kind === 'card') {
+      const latest = x.rev === n.card_rev;
+      items.push(latest ? cardView(x, true) : fold(`card_${n.id}_${x.rev}`, 'fold', `理解卡 v${x.rev}（旧版）`, false, cardView(x, false)));
+    } else if (x.kind === 'confirm') items.push(el('div', {class: 'nt owner'}, `Owner · ${x.at}：确认理解卡 v${x.rev}`));
+    else items.push(el('div', {class: 'nt ' + (x.by === 'owner' ? 'owner' : 'router')}, `${x.by === 'owner' ? 'Owner' : 'lead'} · ${x.at}：${x.text}`));
+  }
+  return el('div', {class: 'thread'}, el('div', {class: 'small mute'}, '讨论线程' + (n.sealed ? '（已封存，只读）' : '')), items);
+}
+
+function needRow(n, idx) {
+  let st = NEED_ST[n.status] || [n.status, 'mute'];
+  if (n.status === 'discussing') st = n.discuss === 'waiting_owner' ? ['讨论中 · 等你', 'hot'] : ['讨论中 · 等 lead', 'info'];
+  const first = n.text.split('\n')[0];
+  const issues = n.issues.map((u, i) => {
+    const m = /github\.com\/([^/]+\/[^/]+)\/issues\/(\d+)$/.exec(u), t = idx[u];
+    return el('span', {class: 'iss'}, i === 0 ? el('span', {class: 'tag'}, '根') : null, ghLink(u, m ? `${m[1]}#${m[2]}` : u),
+      t ? el('span', {class: 'chip ' + (STAGE_CLS[t.stage.key] || 'mute'), title: (t.why || [])[0] || ''}, t.stage.label) : null,
+      t && t.sub ? el('span', {class: 'tag'}, `子 Issue ${t.sub.completed}/${t.sub.total} 已关`) : null);
+  });
+  const busy = !!needBusy[n.id], cf = '_cf' + n.id + '_' + n.card_rev;
+  const confirm = n.status === 'discussing' && n.discuss === 'waiting_owner' && n.card_rev
+    ? el('button', {class: 'pri', id: 'confirm_' + n.id, disabled: !!needBusy[cf], onclick: () => {
+        needReq[cf] = needReq[cf] || rid();
+        needPost(cf, `/api/need/${encodeURIComponent(n.id)}/confirm`, {card_rev: n.card_rev, request_id: needReq[cf]},
+          () => { needMsg = {cls: 'ok', text: `已确认 ${n.id} 的理解卡 v${n.card_rev}，会通知负责 lead 建 Issue`, at: Date.now()}; });
+      }}, `确认理解卡 v${n.card_rev}`) : null;
+  const hint = n.lead ? '回复负责 lead（进讨论线程，投递给它）' : '补充 / 纠正（还没有负责 lead：记成 note，Router 处理时会看到）';
+  return el('section', {class: 'nrow' + (n.id === needFocus ? ' focus' : ''), id: 'need_' + n.id},
+    el('div', {class: 't1'}, el('strong', {}, n.id), el('span', {class: 'chip ' + st[1]}, st[0]), n.ws ? el('span', {}, 'ws ' + n.ws) : null,
+      n.lead ? el('span', {}, '负责 lead：' + n.lead) : n.dispatch ? el('span', {}, '已派给 ' + n.dispatch + '，等它 claim') : null,
+      when(n.created), n.delivery ? el('span', {title: n.delivery_detail || ''}, '投递：' + n.delivery) : null,
+      n.renotify ? el('button', {onclick: () => needPost('_rn' + n.id, `/api/need/${encodeURIComponent(n.id)}/renotify`, {},
+        j => { needMsg = {cls: 'ok', text: j.note, at: Date.now()}; })}, '重新通知') : null,
+      n.pending_notes ? el('span', {class: 'chip hot'}, `${n.pending_notes} 条补充待 Router 处理`) : null,
+      el('a', {href: '#' + TASKS + ':' + n.id}, '看任务 →')),
+    el('div', {class: 'ntext', title: n.text}, first.length > 160 ? first.slice(0, 160) + '…' : first),
+    n.text !== first ? fold('nfull_' + n.id, 'fold', '原话全文', false, el('div', {class: 'plain'}, n.text)) : null,
+    n.why ? el('div', {class: 'small'}, '分配理由：' + n.why) : null,
+    issues.length ? el('div', {class: 'iss'}, issues) : null,
+    n.notes.map(x => el('div', {class: 'nt ' + (x.by === 'owner' ? 'owner' : 'router')}, `${{owner: 'Owner', router: 'Router', lead: 'lead'}[x.by] || x.by} · ${x.at}：${x.text}`)),
+    threadView(n),
+    n.sealed ? null : el('div', {class: 'nbox'}, draftBox(n.id, hint, 1),
+      el('button', {disabled: busy, onclick: () => sendText(n.id, `/api/need/${encodeURIComponent(n.id)}/reply`,
+        j => `已发到 ${n.id}` + (j.to === 'lead' ? '，会投递给负责 lead' : ''))}, busy ? '提交中…' : (n.lead ? '回复' : '补充 / 纠正')), confirm));
+}
+
+function renderNeeds() {
+  needsStale = false;
+  const main = document.getElementById('main'), v = needsData, top = main.scrollTop, busy = !!needBusy._new;
+  const wrap = el('div', {class: 'wrap needs'});
+  wrap.append(el('header', {}, el('h1', {}, '需求')),
+    el('section', {class: 'nform'}, el('h2', {}, '提交需求'),
+      el('p', {class: 'mute small'}, '一句话说要做什么，不用选 ws。Router 会查重、判断归属、交给对应 ws 的 lead；进度在下面和「任务」里看。'),
+      draftBox('_new', '例如：给 demo 的导出加一个 CSV 格式', 3),
+      el('div', {class: 'acts'}, el('button', {class: 'pri', id: 'need_go', disabled: busy,
+        onclick: () => sendText('_new', '/api/need', j => `已提交 ${j.id}` + (j.created ? '' : '（重复提交，返回的是原记录）'))}, busy ? '提交中…' : '提交'))),
+    el('div', {id: 'need_msg'}, needMsg ? el('div', {class: 'msgbar ' + needMsg.cls}, needMsg.text) : ''));
+  if (needsErr) wrap.append(el('div', {class: 'msgbar bad'}, '无法刷新：' + needsErr));
+  if (v && v.router && Array.isArray(v.needs)) {
+    wrap.append(routerCard(v.router));
+    const idx = taskByUrl();
+    if (!v.needs.length) wrap.append(el('p', {class: 'mute'}, '还没有需求。'));
+    for (const n of v.needs) wrap.append(needRow(n, idx));
+  } else if (!needsErr) wrap.append(el('p', {class: 'mute'}, '加载中…'));
+  main.replaceChildren(wrap);
+  main.scrollTop = top;
+  const f = needFocus && document.getElementById('need_' + needFocus);
+  if (f && needFocused !== needFocus) { needFocused = needFocus; if (f.scrollIntoView) f.scrollIntoView({block: 'start'}); }
+}
+
 const LEAVE_MSG = '当前问题有未保存的输入，离开会丢失。确定离开？';
 
 // 切题前有未保存的输入：先确认，取消就留在原题并恢复 hash。前端不在后台发任何写请求
@@ -1278,23 +1748,30 @@ function route() {
   const next = decodeURIComponent(location.hash.slice(1)) || null;
   if (detail && next === cur) return;  // 取消离开时恢复 hash 触发的那次 hashchange
   if (dirty && detail && detail.editable && !confirm(LEAVE_MSG)) { location.hash = '#' + cur; return; }
-  const toTasks = next === TASKS;  // 题号形如 <ws>-NNNN，不会和 #tasks 撞
-  gen++; cur = toTasks ? null : next; detail = null; dirty = false; msg = null;
+  // 题号形如 <ws>-NNNN（不含冒号），不会和 #tasks、#tasks:need-0007、#needs 撞
+  const toTasks = next === TASKS || (next || '').startsWith(TASKS + ':'), toNeeds = next === NEEDS || (next || '').startsWith(NEEDS + ':');
+  gen++; cur = toTasks || toNeeds ? null : next; detail = null; dirty = false; msg = null;
   curQ = null; editing = false; sheet = null; openState = {}; shownId = null; formShown = false;
-  mode = toTasks ? 'tasks' : 'inbox';
+  mode = toTasks ? 'tasks' : toNeeds ? 'needs' : 'inbox';
+  taskFilter = toTasks ? next.slice(TASKS.length + 1) : '';
+  needFocus = toNeeds ? next.slice(NEEDS.length + 1) : ''; needFocused = '';
   renderSheet(); renderModes();
-  document.getElementById('app').setAttribute('data-view', toTasks ? 'tasks' : cur ? 'detail' : 'list');
+  document.getElementById('app').setAttribute('data-view', toTasks ? 'tasks' : toNeeds ? 'needs' : cur ? 'detail' : 'list');
   if (toTasks) { renderTasks(); loadTasks(false); refreshList(); return; }
+  if (toNeeds) { needMsg = null; renderNeeds(); loadNeeds(); if (!tasksData && !tasksLoading) loadTasks(false); refreshList(); return; }
   document.getElementById('main').replaceChildren(el('div', {class: 'wrap'}, el('p', {class: 'mute'}, cur ? '加载中…' : '选择左边的问题。')));
   load(true); refreshList();
 }
 window.addEventListener('hashchange', route);
-window.addEventListener('beforeunload', e => { if (dirty) { e.preventDefault(); e.returnValue = LEAVE_MSG; } });
+window.addEventListener('beforeunload', e => {
+  if (dirty || Object.values(needDraft).some(v => (v || '').trim())) { e.preventDefault(); e.returnValue = LEAVE_MSG; }
+});
 window.addEventListener('keydown', onKey);
 route();
 setInterval(() => {
   refreshList(); load(false);
-  if (mode === 'tasks' && !tasksLoading && Date.now() - tasksAt > 60000) loadTasks(false);  // 服务端也有 60 秒缓存
+  if ((mode === 'tasks' || mode === 'needs') && !tasksLoading && Date.now() - tasksAt > 60000) loadTasks(false);  // 服务端也有 60 秒缓存
+  if (mode === 'needs') { loadNeeds(); if (needsStale) renderNeedsSoon(); }
 }, 3000);
 </script></body></html>
 '''
