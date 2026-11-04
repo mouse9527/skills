@@ -56,6 +56,14 @@ def screen(session, pane):
     return res.stdout if res.returncode == 0 else ''
 
 
+class LeadBlocked(qstore.QError):
+    """上一个 lead 已退出，但它的 workspace 里还有别的 pane（worker、人工 pane、shell），关不掉：
+    不在旁边另起新 lead，记录保留，需求应当 hold 交给 Owner。"""
+
+    def __init__(self, message):
+        super().__init__(409, message)
+
+
 class Paused(Exception):
     """动作链途中发现全局暂停：停在安全状态（刚建的 workspace 已关），不算失败。
     agent_started：暂停前是否已经执行过 agent start（执行过的那次拉起要照样计数，不能退还）。"""
@@ -275,10 +283,11 @@ def ensure_lead(ws):
     if qstore.paused():
         raise qstore.QError(409, '全局暂停中：不新起 lead')
     try:
-        if rec and rec.get('workspace_id'):  # 上一个 lead 已退出：它的 workspace 只剩根 pane 空壳时关掉
+        if rec and rec.get('workspace_id'):  # 上一个 lead 已退出：它的 workspace 只剩根 pane 空壳时才关，关了才起新的
             closed, cwhy = close_if_dead(s, rec['workspace_id'], rec.get('pane_id'))
-            if not closed:
-                qstore.record_lead(ws, None)  # 关不掉就不再认领它（里面可能有别人的东西），只清自己的记录
+            if not closed:  # 记录保留（close-lead / 下次 ensure_lead 还能报出原因），不在旁边另起
+                raise LeadBlocked(f'lead-{ws} 已退出，但旧 workspace {rec["workspace_id"]} 关不掉：{cwhy}。'
+                                  f'没有另起新 lead，记录保留；需求 hold，出题交给 Owner 处理')
         info, err = start_in_new_workspace(s, f'L·{ws}', cwd, f'lead-{ws}', lead_prompt(ws))
     except Paused:
         raise qstore.QError(409, '途中全局暂停：没有起 lead（刚建的 workspace 已关）')

@@ -1640,7 +1640,8 @@ def workspace_tree(session, wsid, root_pane, root='agent', ws=None):
             continue
         if a and ws and is_worker_of(dict(p, **a), ws):
             continue
-        label = (a or {}).get('name') or (f'无名 {p.get("agent")}' if has_agent else '普通 shell')
+        name = (a or {}).get('name') or ''
+        label = (f'worker {name}' if WORKER_NAME_RE.match(name) else name) or (f'无名 {p.get("agent")}' if has_agent else '普通 shell')
         bad.append(f'{pid}（{label}）')
     if bad:
         return False, f'workspace {wsid} 里有不归 Router 管的 pane：{"、".join(bad)}'

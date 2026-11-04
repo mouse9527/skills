@@ -1281,6 +1281,63 @@ class R2TreeTest(RouterBase):
         self.assertTrue(ok, why)
 
 
+class R3BlockedOldWorkspaceTest(RouterBase):
+    """第 3 轮 DS I1：旧 lead 退出、旧 workspace 里还有 worker 时，不清记录、不另起新 lead，需求 hold。"""
+
+    def setUp(self):
+        super().setUp()
+        self.set_herdr(panes={'demo': [base.pane()], RT: [router_pane()]}, prompt_working=True)
+        os.environ['QI_DISPATCH_WAIT'] = '2'
+        self.addCleanup(os.environ.pop, 'QI_DISPATCH_WAIT', None)
+        self.register()
+        server.routerctl.ensure_lead('demo')
+        self.rec = qstore.router_leads()['demo']
+        st = self.herdr_state()
+        root = next(x for x in st['panes'][RT] if x['pane_id'] == self.rec['pane_id'])
+        for k in ('agent', 'name', 'agent_session', 'interactive_ready'):
+            root.pop(k, None)  # lead 的 agent 退出，pane 留成 shell
+        st['panes'][RT].append(dict(base.pane('w:p9', lead='sess-w42'), name='w-42', workspace_id=self.rec['workspace_id'],
+                                    cwd=str(self.tmp / 'ws' / 'demo' / 'issues' / '42')))
+        (self.tmp / 'herdr.json').write_text(json.dumps(st))
+        self.calls0 = len(self.all_calls())
+
+    def new_calls(self, *sub):
+        return [c for c in self.all_calls()[self.calls0:] if c[2:4] == list(sub)]
+
+    def test_worker_left_blocks_new_lead_keeps_record_and_holds(self):
+        self.assertEqual(qstore.lead_record_presence('demo')[0], 'absent')
+        with self.assertRaises(server.routerctl.LeadBlocked) as e:
+            server.routerctl.ensure_lead('demo')
+        self.assertEqual(e.exception.code, 409)
+        self.assertIn('worker w-42', e.exception.message)
+        self.assertEqual((self.new_calls('agent', 'start'), self.new_calls('workspace', 'close'), self.new_calls('workspace', 'create')), ([], [], []))
+        self.assertEqual(qstore.router_leads()['demo']['workspace_id'], self.rec['workspace_id'])  # 记录保留
+        # dispatch：需求自动 hold，原因上页面
+        nid = self.assigned()
+        r = self.as_router('router', 'dispatch', nid)
+        self.assertEqual(r.returncode, 3, r.stderr)
+        self.assertIn('关不掉', r.stderr)
+        rec = self.need(nid)
+        self.assertEqual(rec['status'], 'held')
+        self.assertIn('worker w-42', rec['notes'][-1]['text'])
+        self.assertEqual(self.new_calls('agent', 'start'), [])
+        # close-lead 报出里面还有 worker，不关、记录保留
+        r = self.as_router('router', 'close-lead', 'demo')
+        self.assertIn('worker w-42', r.stdout + r.stderr)
+        self.assertEqual(self.new_calls('workspace', 'close'), [])
+        self.assertEqual(qstore.router_leads()['demo']['workspace_id'], self.rec['workspace_id'])
+
+    def test_only_empty_root_shell_left_cleans_up_and_starts_new(self):
+        st = self.herdr_state()
+        st['panes'][RT] = [x for x in st['panes'][RT] if x['pane_id'] != 'w:p9']  # worker 已回收，只剩空根 shell
+        (self.tmp / 'herdr.json').write_text(json.dumps(st))
+        pane, new = server.routerctl.ensure_lead('demo')
+        self.assertTrue(new)
+        self.assertEqual([c[4] for c in self.new_calls('workspace', 'close')], [self.rec['workspace_id']])
+        self.assertEqual(len(self.new_calls('agent', 'start')), 1)
+        self.assertNotEqual(qstore.router_leads()['demo']['workspace_id'], self.rec['workspace_id'])
+
+
 class R2CountTest(RouterBase):
     """K：启动计数只能退还本次自己预占、且还没执行 agent start 的那一次。"""
 

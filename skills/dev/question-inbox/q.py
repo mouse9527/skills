@@ -319,8 +319,13 @@ def cmd_router_close_lead(args):
 
 
 def cmd_router_dispatch(args):
-    qstore.check_router(privileged(args))
-    path, pane, new = routerctl.dispatch(args.id)
+    ident = privileged(args)
+    qstore.check_router(ident)
+    try:
+        path, pane, new = routerctl.dispatch(args.id)
+    except routerctl.LeadBlocked as e:  # 旧 lead 的 workspace 关不掉：需求 hold，原因上页面
+        qstore.hold(args.id, e.message, ident)
+        raise qstore.QError(409, e.message + f'（{args.id} 已 hold）')
     print(f'{args.id} 已交给 lead-{qstore.read_need(args.id)["ws"]}（pane {pane}，{"新起" if new else "续派"}）；任务书 {path}')
 
 
