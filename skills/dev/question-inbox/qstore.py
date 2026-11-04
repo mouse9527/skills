@@ -1747,12 +1747,26 @@ def router_note(nid, text, ident):
 
 
 def hold(nid, why, ident):
-    """Router（routing，或 assigned 但还没 lead claim 时）或负责 lead（assigned / discussing / confirmed 时）找不到路、卡住 → held，页面显示原因。"""
+    """Router（routing，或 assigned 但还没 lead claim 时）或负责 lead（assigned / discussing / confirmed 时）找不到路、卡住 → held，页面显示原因。
+    另：assigned 且已有负责 lead、但现场核对那个 lead **确认不在**（presence == absent，和 takeover 同一规则）时，Router 也可以 hold；
+    unknown / present 不放宽。查 herdr 不持锁，写之前在锁内核对负责 lead 没变。"""
     why = one_line(_clean_text(why, '原因'))[:500]
+    pre = read_need(nid)
+    old = pre.get('lead') or {}
+    lead_gone = False
+    if pre.get('status') == 'assigned' and old:
+        try:
+            check_router(ident)
+            lead_gone = presence(old.get('herdr_session'), old.get('lead_session'))[0] == 'absent'
+        except QError:
+            lead_gone = False
     with locked():
         rec = read_need(nid)
         st = rec.get('status')
         if st == 'routing' or (st == 'assigned' and not rec['lead']):  # 还没 lead claim：Router 仍是负责人
+            check_router(ident)
+            by = 'router'
+        elif lead_gone and st == 'assigned' and rec['lead'] == old:  # 负责 lead 确认不在：Router 接过卡住的需求
             check_router(ident)
             by = 'router'
         elif st in LEAD_STATES and st != 'held' and rec['lead']:

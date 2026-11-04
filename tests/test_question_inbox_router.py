@@ -1281,8 +1281,8 @@ class R2TreeTest(RouterBase):
         self.assertTrue(ok, why)
 
 
-class R3BlockedOldWorkspaceTest(RouterBase):
-    """第 3 轮 DS I1：旧 lead 退出、旧 workspace 里还有 worker 时，不清记录、不另起新 lead，需求 hold。"""
+class OldWorkspaceBase(RouterBase):
+    """Router 建的 lead-demo 已退出（根 pane 留成 shell），旧 workspace 里还有 worker w-42。"""
 
     def setUp(self):
         super().setUp()
@@ -1303,6 +1303,11 @@ class R3BlockedOldWorkspaceTest(RouterBase):
 
     def new_calls(self, *sub):
         return [c for c in self.all_calls()[self.calls0:] if c[2:4] == list(sub)]
+
+
+
+class R3BlockedOldWorkspaceTest(OldWorkspaceBase):
+    """第 3 轮 DS I1：旧 lead 退出、旧 workspace 里还有 worker 时，不清记录、不另起新 lead，需求 hold。"""
 
     def test_worker_left_blocks_new_lead_keeps_record_and_holds(self):
         self.assertEqual(qstore.lead_record_presence('demo')[0], 'absent')
@@ -1336,6 +1341,60 @@ class R3BlockedOldWorkspaceTest(RouterBase):
         self.assertEqual([c[4] for c in self.new_calls('workspace', 'close')], [self.rec['workspace_id']])
         self.assertEqual(len(self.new_calls('agent', 'start')), 1)
         self.assertNotEqual(qstore.router_leads()['demo']['workspace_id'], self.rec['workspace_id'])
+
+
+class R4ClaimedLeadGoneTest(OldWorkspaceBase):
+    """补完 DS R3 I1：需求已有负责 lead 时，LeadBlocked 也要能 hold（负责 lead 确认不在），否则记 note、不吞原话。"""
+
+    def claimed_need(self):
+        nid = self.assigned()
+        lead_pane = dict(base.pane('w1:p1', lead='lead-a'), cwd=str(self.tmp / 'ws' / 'demo'), name='lead-demo')
+        st = self.herdr_state()
+        st['panes']['demo'] = [lead_pane]
+        (self.tmp / 'herdr.json').write_text(json.dumps(st))
+        r = self.as_lead('need', 'claim', nid)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return nid
+
+    def drop_lead(self):
+        st = self.herdr_state()
+        st['panes']['demo'] = []
+        (self.tmp / 'herdr.json').write_text(json.dumps(st))
+
+    def test_claimed_lead_gone_dispatch_holds(self):
+        nid = self.claimed_need()
+        self.drop_lead()
+        r = self.as_router('router', 'dispatch', nid)
+        self.assertEqual(r.returncode, 3, r.stderr)
+        self.assertIn('关不掉', r.stderr)
+        self.assertIn('已 hold', r.stderr)
+        rec = self.need(nid)
+        self.assertEqual(rec['status'], 'held')
+        self.assertIn('worker w-42', rec['notes'][-1]['text'])
+        self.assertEqual(rec['notes'][-1]['by'], 'router')
+
+    def test_lead_unknown_keeps_status_records_note(self):
+        nid = self.claimed_need()
+        self.patch_herdr(pane_list_fail={'demo': 'error:internal'})
+        r = self.as_router('router', 'dispatch', nid)
+        self.assertEqual(r.returncode, 3, r.stderr)
+        self.assertIn('worker w-42', r.stderr)            # 原话保留
+        self.assertIn('已记 note', r.stderr)
+        self.assertIn('需求状态未变', r.stderr)
+        rec = self.need(nid)
+        self.assertEqual(rec['status'], 'assigned')
+        self.assertIn('worker w-42', rec['notes'][-1]['text'])
+        self.assertEqual(rec['notes'][-1]['by'], 'router')
+
+    def test_lead_present_hold_still_refused(self):
+        nid = self.claimed_need()
+        r = self.as_router('need', 'hold', nid, '--why', 'x')
+        self.assertEqual(r.returncode, 4, r.stderr)
+        self.assertEqual(self.need(nid)['status'], 'assigned')
+        r = self.as_router('router', 'dispatch', nid)  # dispatch 也一样：记 note，不 hold
+        self.assertEqual(r.returncode, 3, r.stderr)
+        self.assertIn('需求状态未变', r.stderr)
+        self.assertEqual(self.need(nid)['status'], 'assigned')
 
 
 class R2CountTest(RouterBase):

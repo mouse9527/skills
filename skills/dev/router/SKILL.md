@@ -43,7 +43,7 @@ Q="python3 $HOME/.claude/skills/question-inbox/q.py"   # 和 skill question-inbo
    报「lead-<ws> 冲突 / 状态查不清」：session router 里有不是你建的同名 agent，或同名的不止一个，或 herdr 查询失败。
    **不要去 prompt / 关掉它们**：`$Q need hold <id> --why "<原文>"`，页面会显示原因，由 Owner 处理。
    报「lead-<ws> 已退出，但旧 workspace 关不掉」（里面还有 worker、人工 pane 或普通 shell）：命令不会在旁边另起新 lead，
-   归属记录保留，需求已经自动 hold（原因在页面上）。不要自己去关那个 workspace，出一题交给 Owner：
+   归属记录保留，需求已经自动 hold（原因在页面上；已有负责 lead 的，只有它确认不在时才 hold 得了，否则会记成一条 note、需求状态不变，报错里会写明）。不要自己去关那个 workspace，出一题交给 Owner：
    说明是哪个 workspace、里面剩下哪些 pane（原文照抄），选项给「Owner 自己清理后我再派」/「先不做这条需求」，带推荐。
    Owner 清理到只剩空根 shell 后，再 `router dispatch` 即可正常收掉旧的、起新的。
 6. 分到 ws 后如果一直没人 claim（默认 30 分钟），服务会再唤醒你一次（「一直没有 lead claim」）；Owner 在页面补充或点「重新通知」也会投给你。

@@ -324,7 +324,11 @@ def cmd_router_dispatch(args):
     try:
         path, pane, new = routerctl.dispatch(args.id)
     except routerctl.LeadBlocked as e:  # 旧 lead 的 workspace 关不掉：需求 hold，原因上页面
-        qstore.hold(args.id, e.message, ident)
+        try:
+            qstore.hold(args.id, e.message, ident)
+        except qstore.QError as he:  # hold 不了（如负责 lead 状态查不清）：不吞原话，记成 Router note，状态不动
+            qstore.router_note(args.id, f'卡住：{e.message}', ident)
+            raise qstore.QError(409, e.message + f'（没能 hold：{he.message}；已记 note，{args.id} 需求状态未变）')
         raise qstore.QError(409, e.message + f'（{args.id} 已 hold）')
     print(f'{args.id} 已交给 lead-{qstore.read_need(args.id)["ws"]}（pane {pane}，{"新起" if new else "续派"}）；任务书 {path}')
 
