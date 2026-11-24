@@ -9,6 +9,7 @@ ws 是**工作台**，不是事实源。一个 ws 对应一条交付线，放在
 **每项工作都以一个 GitHub Issue 为锚点**：Issue 记目标和验收，PR 链回 Issue，本地目录按 Issue 号命名 ——
 三者用同一个号对上，任何时候都能从 Issue 找到代码和工作区，反过来也一样。
 本 skill 只讲通用骨架和纪律；某个 ws 的仓库、权限、部署写在它自己的 `README.md`。
+ws 的 `README.md` **不会自动加载**进会话（ws 根目录不放 `CLAUDE.md` / `AGENTS.md`），由 lead 开工时读、派 worker 时指过去（第 3 节）。
 下文路径都相对 ws 根目录。
 
 ## 1. 骨架
@@ -16,7 +17,6 @@ ws 是**工作台**，不是事实源。一个 ws 对应一条交付线，放在
 ```
 ~/workspaces/<名>/
 ├── README.md              本 ws 的规则（唯一规则文件）
-├── CLAUDE.md -> README.md 软链接；需要时 AGENTS.md 也链到它
 ├── NOW.md                 当前在做什么，便签，可丢弃，不进 git
 ├── .gitignore             至少 NOW.md、repos/、issues/
 ├── .templates/
@@ -94,6 +94,9 @@ Owner 直接对任何 lead 说一句也照旧有效，不用他选 ws、找仓�
 4. 回复 Owner 一行：`<owner>/<repo>#<号> · 做 / 不做 · 下一步`。
 
 以上「做不做、怎么拆」的判断本身不出题；其余要 Owner 决定的事照第 8 节走问题收件箱。
+
+**lead 开工先读本 ws 的 `README.md` 全文**，尤其 ⛔ 标出的限制（环境、集群、只读范围）——它不会自动注入会话，不读就不知道。
+派 worker 时任务书开头写明 `README.md` 的绝对路径并要求先读；不把 README 的规则抄进任务书（规则只写一处）。
 
 开工前先看 README 第 8 项：没有接入检查记录、或仓库表里有 repo 不在记录里，先按第 11 节查一遍。
 
@@ -246,8 +249,9 @@ git -C repos/<repo> worktree prune
    W=~/workspaces/<名>
    mkdir -p "$W"/{repos,issues,.templates}
    printf 'NOW.md\nrepos/\nissues/\n' > "$W/.gitignore"
-   ln -s README.md "$W/CLAUDE.md"
    ```
+
+   不建 `CLAUDE.md` / `AGENTS.md`，也不链到 README：放了就会在 ws 下每个会话（含 `issues/` 里的 worker）自动注入整份 README，按需读即可。
 
 3. 按第 2 节写 `README.md`，按第 3 节写 `.templates/issue.md`，建空的 `NOW.md`。
 4. repo clone 好之后按第 11 节做接入检查，结果写进 README 第 8 项。
