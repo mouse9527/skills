@@ -11,22 +11,10 @@
       "strict": false,
       "skills": [
         "./skills/assistant/browser-general",
-        "./skills/assistant/dianping",
         "./skills/assistant/food-delivery",
         "./skills/assistant/icloud-assistant",
-        "./skills/assistant/jd",
-        "./skills/assistant/jd-miaosong",
         "./skills/assistant/location",
-        "./skills/assistant/meituan",
-        "./skills/assistant/meituan-waimai",
-        "./skills/assistant/meituan-xiaoxiang",
-        "./skills/assistant/phone-general",
-        "./skills/assistant/pinduoduo",
         "./skills/assistant/shopping",
-        "./skills/assistant/taobao",
-        "./skills/assistant/taobao-flash",
-        "./skills/assistant/weibo",
-        "./skills/assistant/xianyu",
         "./skills/assistant/xiaohongshu"
       ]
     },

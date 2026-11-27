@@ -45,22 +45,10 @@ CI 只能跑公开规则：`agentskills validate`、`scripts/validate.py`、`tes
 | group | skill | |
 |---|---|---|
 | assistant | [browser-general](skills/assistant/browser-general/SKILL.md) | 浏览器通用规则 |
-| assistant | [dianping](skills/assistant/dianping/SKILL.md) | 大众点评（手机） |
 | assistant | [food-delivery](skills/assistant/food-delivery/SKILL.md) | 外卖（手机） |
 | assistant | [icloud-assistant](skills/assistant/icloud-assistant/SKILL.md) | iCloud 日程与提醒 |
-| assistant | [jd](skills/assistant/jd/SKILL.md) | 京东（手机 App） |
-| assistant | [jd-miaosong](skills/assistant/jd-miaosong/SKILL.md) | 京东秒送（手机） |
 | assistant | [location](skills/assistant/location/SKILL.md) | 用户位置 |
-| assistant | [meituan](skills/assistant/meituan/SKILL.md) | 美团（手机 |
-| assistant | [meituan-waimai](skills/assistant/meituan-waimai/SKILL.md) | 美团外卖（手机） |
-| assistant | [meituan-xiaoxiang](skills/assistant/meituan-xiaoxiang/SKILL.md) | 美团小象超市（手机） |
-| assistant | [phone-general](skills/assistant/phone-general/SKILL.md) | 手机通用规则 |
-| assistant | [pinduoduo](skills/assistant/pinduoduo/SKILL.md) | 拼多多（手机 App） |
 | assistant | [shopping](skills/assistant/shopping/SKILL.md) | 购物通用 |
-| assistant | [taobao](skills/assistant/taobao/SKILL.md) | 淘宝（手机 App） |
-| assistant | [taobao-flash](skills/assistant/taobao-flash/SKILL.md) | 淘宝闪购（手机） |
-| assistant | [weibo](skills/assistant/weibo/SKILL.md) | 微博（手机 App） |
-| assistant | [xianyu](skills/assistant/xianyu/SKILL.md) | 闲鱼（手机 App） |
 | assistant | [xiaohongshu](skills/assistant/xiaohongshu/SKILL.md) | 小红书 |
 | dev | [herdr-workers](skills/dev/herdr-workers/SKILL.md) | 用 herdr 把任务交给另一个 agent（worker）时的布局、启动、派发… |
 | dev | [question-inbox](skills/dev/question-inbox/SKILL.md) | 问题收件箱 |
